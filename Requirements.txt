@@ -1,0 +1,7 @@
+requests==2.31.0
+streamlit==1.32.0
+google-generativeai==0.4.1
+groq==0.4.2
+ruff==0.2.1
+pytest==8.0.0
+python-dotenv==1.0.1
