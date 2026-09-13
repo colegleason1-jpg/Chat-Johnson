@@ -60,11 +60,13 @@ code block (versioned save to SQLite), output token budget slider, per-project s
 
 ## Setup
 
-1. Put any subset of these keys in your environment or `.env`:
-   `GEMINI_API_KEY`, `GROQ_API_KEY`, `HUGGINGFACE_API_KEY` (or `HF_TOKEN`), `NVIDIA_API_KEY`,
-   `OPENROUTER_API_KEY`, `CEREBRAS_API_KEY`, `MISTRAL_API_KEY`.
-2. `pip install -r Requirements.txt`
-3. `python cli.py status`
+1. `pip install -r Requirements.txt`
+2. Supply keys either way:
+   - **In the app:** open the sidebar "API keys" panel, paste any subset, click **Apply keys**.
+     They live in process memory for the session only and override environment variables.
+   - **In the environment / `.env`:** `GEMINI_API_KEY`, `GROQ_API_KEY`, `HUGGINGFACE_API_KEY`
+     (or `HF_TOKEN`), `NVIDIA_API_KEY`, `OPENROUTER_API_KEY`, `CEREBRAS_API_KEY`, `MISTRAL_API_KEY`.
+3. `python cli.py status` (reads environment keys; the CLI has no key panel)
 4. Run:
    - Studio: `streamlit run app.py`
    - CLI chat: `python cli.py chat`

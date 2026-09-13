@@ -22,6 +22,35 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
+# ---------------------------------------------------------------------------
+# Session key overlay (BYOK entered in the UI)
+# ---------------------------------------------------------------------------
+# Keys pasted into the app sidebar live here, in process memory only. They take
+# precedence over the environment, are never written to disk, and are cleared
+# when the operator clicks "Clear" or the process exits. This is designed for a
+# single-operator local studio; every Streamlit session in the same process
+# shares the overlay.
+SESSION_KEYS: Dict[str, str] = {}
+
+
+def set_session_key(env_name: str, value: str) -> None:
+    """Store or remove one session-only secret under its environment name."""
+    cleaned = (value or "").strip()
+    if cleaned:
+        SESSION_KEYS[env_name] = cleaned
+    else:
+        SESSION_KEYS.pop(env_name, None)
+
+
+def clear_session_keys() -> None:
+    SESSION_KEYS.clear()
+
+
+def resolve_secret(env_name: str) -> str:
+    """Session overlay first, then the process environment. Never logs the value."""
+    return SESSION_KEYS.get(env_name, "") or _env(env_name)
+
+
 @dataclass
 class ProviderConfig:
     name: str                      # registry id, e.g. "groq"
@@ -122,7 +151,7 @@ PROVIDERS: Dict[str, ProviderConfig] = {
 
 
 def provider_api_key(cfg: ProviderConfig) -> str:
-    return _env(cfg.env_key)
+    return resolve_secret(cfg.env_key)
 
 
 def provider_model(cfg: ProviderConfig) -> str:

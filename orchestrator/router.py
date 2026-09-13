@@ -40,7 +40,7 @@ except ModuleNotFoundError as exc:  # Keep pure routing/math helpers importable 
     def legacy_chat(*args: Any, **kwargs: Any) -> Tuple[str, int]:
         raise ProviderError("requests is required for provider HTTP execution")
 
-from .config import PROVIDERS, Settings, get_settings, provider_model
+from .config import PROVIDERS, Settings, get_settings, provider_model, resolve_secret
 from .quota import QuotaLedger
 
 # Preserve the original module-level import surface for callers/tests that
@@ -85,7 +85,7 @@ def refresh_byok_vault() -> Dict[str, Dict[str, Any]]:
         selected_name = ""
         selected_value = ""
         for env_name in env_names:
-            value = os.environ.get(env_name, "").strip()
+            value = resolve_secret(env_name)
             if value:
                 selected_name = env_name
                 selected_value = value
@@ -454,7 +454,7 @@ def _ensure_cortex_ledger(ledger: Optional[QuotaLedger]) -> None:
 
 def _endpoint_key(endpoint: CortexEndpoint) -> str:
     for env_name in endpoint.env_keys:
-        value = os.environ.get(env_name, "").strip()
+        value = resolve_secret(env_name)
         if value:
             return value
     return ""

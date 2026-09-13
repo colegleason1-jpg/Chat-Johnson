@@ -52,7 +52,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Chat Johnson · Master Studio", page_icon="🧠", layout="wide")
 
-from orchestrator.config import PROVIDERS, provider_model
+from orchestrator.config import PROVIDERS, clear_session_keys, provider_model, resolve_secret, set_session_key
 from orchestrator.executor import Orchestrator
 from orchestrator.quota import QuotaLedger
 from orchestrator.router import (
@@ -145,7 +145,7 @@ def provider_status_rows() -> List[Tuple[str, str, str, bool]]:
     for name, cfg in PROVIDERS.items():
         if name in {"gemini", "groq"}:
             continue
-        configured = bool(os.environ.get(cfg.env_key, "").strip())
+        configured = bool(resolve_secret(cfg.env_key))
         rows.append((name, cfg.label, f"{provider_model(cfg)} · {cfg.env_key}", configured))
     return rows
 
@@ -573,7 +573,7 @@ def render_normal_chat(project_scope: str, ledger: QuotaLedger) -> None:
         submitted = st.form_submit_button("Send normal request", type="primary")
     if submitted:
         if not configured_provider_names():
-            st.warning("Add at least one BYOK provider key in the Keys/API keys tab before sending a request.")
+            st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
         else:
             run_generation(project_scope, prompt, classify(prompt), ledger)
     render_history(project_scope, "Project conversation")
@@ -600,7 +600,7 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger) -> None:
         submitted = st.form_submit_button("Send to Chat Bot", type="primary")
     if submitted:
         if not configured_provider_names():
-            st.warning("Add at least one BYOK provider key in the Keys/API keys tab before sending a request.")
+            st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
         else:
             run_generation(project_scope, prompt, classify(prompt), ledger, injected)
     render_history(project_scope, "Developer conversation")
@@ -727,6 +727,44 @@ ledger = get_quota_ledger()
 with st.sidebar:
     st.markdown("<div class='eyebrow'>Chat Johnson · Gen 2</div>", unsafe_allow_html=True)
     st.title("Control deck")
+    with st.expander("🔑 API keys (BYOK, session only)", expanded=not configured_provider_names()):
+        st.caption(
+            "Paste free-tier keys here to use the studio like a normal user. They stay in this "
+            "process's memory for the session, override environment variables, and are never "
+            "written to SQLite, logs, artifacts, or git."
+        )
+        key_fields = (
+            ("GEMINI_API_KEY", "Google AI Studio (Gemini)"),
+            ("GROQ_API_KEY", "Groq Cloud"),
+            ("HF_TOKEN", "Hugging Face"),
+            ("NVIDIA_API_KEY", "NVIDIA NIM"),
+            ("OPENROUTER_API_KEY", "OpenRouter"),
+            ("CEREBRAS_API_KEY", "Cerebras"),
+            ("MISTRAL_API_KEY", "Mistral"),
+        )
+        with st.form("byok_form", clear_on_submit=False):
+            entered: Dict[str, str] = {}
+            for env_name, label in key_fields:
+                entered[env_name] = st.text_input(label, type="password", key=f"byok_{env_name}", placeholder=env_name)
+            apply_col, clear_col = st.columns(2)
+            apply_clicked = apply_col.form_submit_button("Apply keys", type="primary", use_container_width=True)
+            clear_clicked = clear_col.form_submit_button("Clear all", use_container_width=True)
+        if apply_clicked:
+            applied = 0
+            for env_name, value in entered.items():
+                if value.strip():
+                    set_session_key(env_name, value)
+                    applied += 1
+            if applied:
+                st.success(f"{applied} key(s) applied for this session.")
+            else:
+                st.info("No key values entered.")
+        if clear_clicked:
+            clear_session_keys()
+            for env_name, _ in key_fields:
+                st.session_state.pop(f"byok_{env_name}", None)
+            st.info("Session keys cleared. Environment variables, if any, remain in effect.")
+            st.rerun()
     project_input = st.text_input("Active project scope", value=st.session_state.project_scope, key="project_scope_input")
     st.session_state.project_scope = project_input.strip() or "chat-johnson"
     st.checkbox(
@@ -763,7 +801,7 @@ with st.sidebar:
         st.markdown(f"<span class='{css_class}'>{marker}</span> **{label}**", unsafe_allow_html=True)
         st.caption(detail)
     if not configured_provider_names():
-        st.warning("No provider keys detected. Add keys through the Keys/API keys tab; this app never stores them in SQLite.")
+        st.warning("No provider keys detected. Paste them in the API keys panel above or set environment variables; this app never stores them in SQLite.")
     st.divider()
     st.subheader("Locked artifacts")
     artifact_query = st.text_input("Search artifacts", key="artifact_query", placeholder="name, path, or summary")
