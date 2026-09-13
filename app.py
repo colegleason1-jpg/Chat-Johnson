@@ -96,7 +96,18 @@ from orchestrator.connectors import ROADMAP_FEATURES, connector_status
 from orchestrator.deploykit import CLOUDS, LANGUAGES, TARGETS, KitSpec, generate_kit, kit_zip, summarize, validate_kit
 from orchestrator.github_auth import mint_state, verify_state
 from orchestrator.github_push import GitHubPushError, GitHubWriter, PushRecord, branch_name_for
-from orchestrator.missions import MISSION_TEMPLATES, classify_mission, task_plan
+from orchestrator.missions import (
+    MAX_SECTIONS,
+    MISSION_TEMPLATES,
+    assemble_deliverable,
+    classify_mission,
+    deliverable_slug,
+    mission_hints,
+    parse_length_target,
+    task_plan,
+    text_measure,
+    writing_sections,
+)
 from orchestrator.preview import extract_preview_source, safe_preview_document
 from orchestrator.vault import (
     MESSAGE_WINDOW,
@@ -1180,6 +1191,7 @@ def execute_mission(
     paid_slot = session_paid_slot() if task_mode == "heavy" else None
     succeeded = failed = truncated = 0
     failures: List[Tuple[str, str]] = []
+    outputs: List[Tuple[str, str]] = []
     for finished, step in enumerate(plan, start=1):
         started = time.perf_counter()
         step_type = str(step["type"])
@@ -1209,6 +1221,7 @@ def execute_mission(
             )
             log_route("task_finder", step_type, f"{decision.provider}/{decision.model}", task_mode, started, decision.reason, decision.finish)
             st.session_state.last_decision = decision
+            outputs.append((str(step["title"]), answer))
             succeeded += 1
             truncated += int(decision.finish == "length")
         except Exception as exc:
@@ -1219,23 +1232,54 @@ def execute_mission(
     if succeeded:
         # Pinned only once there is something to continue from; an all-failed launch leaves the next message free to be a new mission.
         set_thread_mission(thread_id, goal)
-    return {
+    summary: Dict[str, Any] = {
         "thread_id": thread_id, "goal": goal, "steps": len(plan), "succeeded": succeeded, "failed": failed,
         "truncated": truncated, "failures": failures,
     }
+    sections = [answer for title, answer in outputs if title.lower().startswith("draft section")]
+    if plan and plan[0].get("kind") == "writing" and sections:
+        # The deliverable is assembled deterministically and locked; the chat keeps the per-section record.
+        deliverable = assemble_deliverable(goal, sections)
+        slug = deliverable_slug(goal)
+        artifact_id, version = save_artifact(
+            project_scope, f"mission-{thread_id}-{slug}.md", f"missions/mission-{thread_id}-{slug}.md", deliverable, "markdown"
+        )
+        target = parse_length_target(goal)
+        summary.update({
+            "deliverable_artifact": int(artifact_id), "deliverable_version": int(version), "sections": len(sections),
+            "measure": text_measure(deliverable), "target_words": target["words"] if target else None,
+            "target_label": f"{target['amount']} {target['unit']}(s)" if target else "",
+        })
+    return summary
 
 
 def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, pending: Dict[int, str]) -> None:
     kind = classify_mission(goal)
-    max_steps = len(MISSION_TEMPLATES[kind][1])
+    budget = int(st.session_state.get("max_tokens", 2048))
     with st.container(border=True):
         st.markdown(
             f"**Proposed mission** · type `{kind}` · edit the workstreams, then launch. "
             "Typing another message replaces this mission until it is launched."
         )
         st.markdown("> " + goal.replace("\n", "\n> "))
-        count = st.slider("Workstreams", min_value=1, max_value=max_steps, value=min(3, max_steps), key=f"task_count_{thread_id}_{kind}")
-        plan = task_plan(goal, count)
+        if kind == "writing":
+            target = parse_length_target(goal)
+            target_words = target["words"] if target else None
+            suggested = writing_sections(target_words or 800, budget)
+            count = int(st.number_input(
+                "Sections to draft", min_value=1, max_value=MAX_SECTIONS, value=suggested, key=f"task_sections_{thread_id}",
+                help="One drafting call per section, sized to the output token budget; a brief step and editor's notes are added around them.",
+            ))
+            st.caption(
+                (f"Length target: {target['amount']} {target['unit']}(s) ≈ {target_words} words. " if target else "No length named; about 800 words assumed. ")
+                + f"At a {budget}-token budget each section holds roughly {max(150, int(budget * 0.55))} words, so {suggested} section(s) are suggested."
+            )
+        else:
+            max_steps = len(MISSION_TEMPLATES[kind][1])
+            count = st.slider("Workstreams", min_value=1, max_value=max_steps, value=min(3, max_steps), key=f"task_count_{thread_id}_{kind}")
+        for hint in mission_hints(goal, kind, count):
+            st.caption(f"Note · {hint}")
+        plan = task_plan(goal, count, max_tokens=budget)
         edited = st.data_editor(
             [{"#": step["id"], "workstream": step["title"], "type": step["type"], "instruction": step["description"]} for step in plan],
             hide_index=True,
@@ -1255,7 +1299,6 @@ def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int
         heavy = active_mode() == "heavy"
         passes = 3 if heavy else 1
         calls = len(plan) * passes
-        budget = int(st.session_state.get("max_tokens", 2048))
         per_step = heavy_pass_tokens(budget) if heavy else budget
         upto = "up to " if heavy else ""
         st.caption(
@@ -1313,6 +1356,17 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
             st.error(f"All {launch['failed']} workstream(s) failed. Each error is below; fix keys or adjust the mission and send it again.")
         else:
             st.warning(f"{launch['succeeded']} workstream(s) succeeded, {launch['failed']} failed. The failed steps are below.")
+        if launch.get("deliverable_artifact"):
+            measure = launch.get("measure", {})
+            target_note = f" against a target of {launch['target_label']} (≈{launch['target_words']} words)" if launch.get("target_words") else ""
+            st.info(
+                f"Deliverable assembled from {launch['sections']} section(s): {measure.get('lines', 0)} lines, "
+                f"{measure.get('words', 0)} words{target_note}. Locked as artifact v{launch['deliverable_version']}; "
+                "it is also under Locked artifacts in the sidebar."
+            )
+            filename, body = export_artifact(int(launch["deliverable_artifact"]))
+            st.download_button("⬇ Download deliverable (.md)", data=body, file_name=filename, mime="text/markdown",
+                               key=f"deliverable_{thread_id}_{launch['deliverable_artifact']}")
         if launch.get("truncated"):
             st.caption(f"{launch['truncated']} workstream(s) stopped at the output budget; raise it in the sidebar for fuller results.")
         for title, error in launch["failures"]:
