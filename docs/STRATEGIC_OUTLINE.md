@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-13
 **Branch:** `claude/ai-nonlinear-logic-arch-jakbpm` (currently identical to `main`)
-**Status:** awaiting operator approval before engine work begins
+**Status:** approved 2026-09-13 (decisions A–D). Phase 0 executed in this branch.
 
 ---
 
@@ -124,14 +124,17 @@ throw away working, tested code. The right move is to harden, clean, and extend.
 
 ## 5. Decisions I need from you
 
-- **A. Stale modules.** Delete `App.py`, `Router.py`, `Sandbox.py`, `Ledger.py`, `Guardrails.py`,
+- **A. Stale modules.** *Approved.* Delete `App.py`, `Router.py`, `Sandbox.py`, `Ledger.py`, `Guardrails.py`,
   `Config.py` from git and keep the runtime sanitizer? *Recommended: yes.*
 - **B. Heavy Mode reasoning slot.** Keep free-only (NVIDIA NIM DeepSeek-R1, Gemini, Groq in a
   draft → critique → synthesis chain), with an optional, default-off `OPENAI_API_KEY` paid slot you can
   flip on later? *Recommended: free-only default, optional slot.*
-- **C. README split.** Approve moving the Bible to `docs/` and the Phase 3 engine to `research/` with
+  **Approved with a hard constraint:** everything in the backend is free-only. The paid slot must be
+  toggled on *and* have its key entered fresh every session; it is never persisted, never read from a
+  stored environment variable, and never on by default, so money cannot be spent by accident.
+- **C. README split.** *Approved.* Approve moving the Bible to `docs/` and the Phase 3 engine to `research/` with
   a clean README? *Recommended: yes, verbatim moves.*
-- **D. Execute Phase 0 now.** On approval I commit and push Phase 0 immediately, then start Phase 1.
+- **D. Execute Phase 0 now.** *Approved.* On approval I commit and push Phase 0 immediately, then start Phase 1.
 
 ## 6. Ground rules I will follow
 

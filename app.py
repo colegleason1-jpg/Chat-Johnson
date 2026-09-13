@@ -18,7 +18,6 @@ import ast
 import hashlib
 import hmac
 import html
-import json
 import os
 import re
 import secrets
@@ -27,7 +26,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlencode
 
 
@@ -60,7 +59,6 @@ from orchestrator.config import PROVIDERS, provider_model
 from orchestrator.executor import Orchestrator
 from orchestrator.quota import QuotaLedger
 from orchestrator.router import (
-    ProviderError,
     byok_status,
     classify,
     generate_mode,
