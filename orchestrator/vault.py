@@ -145,6 +145,7 @@ def initialize_database() -> None:
         _ensure_column(connection, "threads", "workspace", "TEXT NOT NULL DEFAULT 'normal_chat'")
         _ensure_column(connection, "message_history", "task_type", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "threads", "mission", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "message_archive", "task_type", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_message_thread ON message_history(thread_id, timestamp ASC, id ASC)"
         )
@@ -297,13 +298,14 @@ def clear_thread(thread_id: int) -> int:
         connection.executemany(
             """
             INSERT OR REPLACE INTO message_archive
-                (id, role, content, timestamp, token_count, project_scope, provider, mode, archived_at, thread_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, role, content, timestamp, token_count, project_scope, provider, mode, archived_at, thread_id, task_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     int(row["id"]), row["role"], row["content"], row["timestamp"], row["token_count"],
                     row["project_scope"], row["provider"], row["mode"], now, int(thread_id),
+                    row["task_type"] if "task_type" in row.keys() else "",
                 )
                 for row in rows
             ],
@@ -480,13 +482,14 @@ def enforce_window(project_scope: str, thread_id: Optional[int] = None, workspac
         connection.executemany(
             """
             INSERT OR REPLACE INTO message_archive
-                (id, role, content, timestamp, token_count, project_scope, provider, mode, archived_at, thread_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, role, content, timestamp, token_count, project_scope, provider, mode, archived_at, thread_id, task_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     int(row["id"]), row["role"], row["content"], row["timestamp"], row["token_count"],
                     row["project_scope"], row["provider"], row["mode"], now, resolved_thread,
+                    row["task_type"] if "task_type" in row.keys() else "",
                 )
                 for row in rows
             ],

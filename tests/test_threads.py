@@ -237,3 +237,27 @@ def test_mission_is_pinned_to_the_chat_and_survives_migration_but_not_clear(db):
     assert successor["mission"] == "Ship the free-tier router"
     db.clear_thread(int(successor["id"]))
     assert db.thread_by_id(int(successor["id"]))["mission"] == ""
+
+
+def test_locked_artifacts_survive_delete_thread(db):
+    scope = "art"
+    thread_id = db.active_thread(scope)["id"]
+    message_id = db.append_message(scope, "assistant", "```python\nprint(1)\n```")
+    artifact_id, _ = db.save_artifact(scope, "keep.py", "keep.py", "print(1)\n", "python", source_message_id=message_id)
+    db.delete_thread(thread_id)
+    row = db.artifact_by_id(artifact_id)
+    assert row is not None
+    assert row["source_message_id"] is None  # ON DELETE SET NULL keeps the artifact, drops the dangling link
+    assert row["code_body"] == "print(1)\n"
+
+
+def test_task_type_survives_archiving_by_clear_and_by_window_eviction(db):
+    scope = "tt"
+    thread_id = db.active_thread(scope)["id"]
+    db.append_message(scope, "user", "first", task_type="research")
+    db.clear_thread(thread_id)
+    assert [r["task_type"] for r in db.archived_messages(scope, 10, thread_id=thread_id)] == ["research"]
+    for index in range(db.MESSAGE_WINDOW + 1):
+        db.append_message(scope, "user", f"m{index}", task_type="code_patch")
+    evicted = db.archived_messages(scope, 5000, thread_id=thread_id)
+    assert len(evicted) > 1 and all(r["task_type"] == "code_patch" for r in evicted[1:])

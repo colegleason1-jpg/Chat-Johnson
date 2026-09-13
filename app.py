@@ -987,6 +987,9 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger, submission: Optiona
             st.caption(f"{len(staged)} file(s) staged in memory only; they go with your next message. Use Artifact Lock to persist an output.")
     render_history(project_scope, "Developer conversation", workspace="chat_bot")
     files = list(submission.files) if submission and submission.files else list(staged)
+    if submission is not None and files and not submission.text.strip():
+        # The paperclip lets a send go out with files only; give that send an explicit request.
+        submission = ChatSubmission("Review the attached file(s): explain what they do and flag any problems.", files)
     injected, injection_notes = uploaded_file_context(files)
     dispatch_chat(project_scope, "chat_bot", submission, ledger, injected, injection_notes)
 
