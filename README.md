@@ -84,6 +84,7 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | Repository Work hub connector: fetch a GitHub repository through the API (public, or private with the armed token) into a temporary sandbox, run the pipeline, download the patch, push the change as a branch plus pull request; four tabs (Work, Deploy Kit, GitHub, Directions) | Implemented · tests of the fetched repository run only when ticked |
 | Deploy Kit (Repository Work): CI/CD workflow, Dockerfile, Helm chart, Terraform skeleton, serverless template, observability, rollback script, runbook; offline validation; zip download; lock as artifacts | Implemented · generation only, nothing is pushed or applied |
 | Post-deploy checks for this app: `?health=1` JSON view, `scripts/smoke_drive.py`, `post-deploy-smoke` workflow, `docs/RUNBOOK.md` | Implemented · set the `DEPLOY_URL` repository variable to arm the workflow |
+| Mission nodes (sub-agents, connectors, APIs per workstream) and chat → Task Finder handoff | Planned · `docs/MISSION_NODES_DESIGN.md` |
 | Session-only GitHub push: token and repo armed per session, one commit on a new branch plus an opened pull request, revert PR for any push from the session | Implemented · never the default branch |
 | App observability: every send persisted to `route_log`, Ops view (sends, share, p50/p95, truncations) and CSV export under the routing expander | Implemented |
 

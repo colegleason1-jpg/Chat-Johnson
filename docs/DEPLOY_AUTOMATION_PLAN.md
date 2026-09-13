@@ -40,3 +40,5 @@ push only on a button press); the automation lives **inside Repository Work**; t
 
 Out of scope on the free tier: running `terraform apply`, `helm install`, or `docker build`
 from the app. Those run in the target repository's CI after the operator adds secrets.
+
+Next: `docs/MISSION_NODES_DESIGN.md` (mission nodes as sub-agents, connectors, and APIs; chat → Task Finder handoff).
