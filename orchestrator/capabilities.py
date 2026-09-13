@@ -27,7 +27,9 @@ IMPLEMENTED: Tuple[Tuple[str, str], ...] = (
 BOUNDARIES: Tuple[str, ...] = (
     "deployed on Streamlit Community Cloud from the GitHub main branch; no CI/CD pipeline, Kubernetes, Terraform, Helm, "
     "cloud account, or cloud credentials are attached to the app",
-    "never commits, pushes, or opens pull requests; the GitHub connection is a profile-only OAuth check",
+    "never writes to GitHub on its own; the only write path is the session-only GitHub push slot (a token pasted per "
+    "session, never stored), which pushes one commit to a new branch and opens a pull request when the operator presses "
+    "the button; the default branch is never written to and a revert pull request can undo any push from the session",
     "cannot execute Docker, Terraform, Helm, kubectl, or cloud CLIs; it can write such files and check their syntax offline",
     "free-tier only: every provider call is metered against per-vendor RPM and TPM ceilings",
 )

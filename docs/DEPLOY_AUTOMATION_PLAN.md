@@ -32,7 +32,7 @@ push only on a button press); the automation lives **inside Repository Work**; t
   file locked as an artifact; "Download kit (.zip)". Zero provider calls unless refinement is on.
 - **Phase 2 · Post-deploy checks for this app (shipped)**: health view, smoke drive, post-deploy CI job,
   runbook (`docs/RUNBOOK.md`: deploy, verify, rollback, key rotation).
-- **Phase 3 · GitHub push, session-only**: toggle + token, branch + PR via the GitHub REST API
+- **Phase 3 · GitHub push, session-only (shipped)**: toggle + token, branch + PR via the GitHub REST API
   with `requests`, revert PR; boundary text in README, sidebar, and the capability card updated
   the day it ships.
 - **Phase 4 · Observability for the app**: routing telemetry persisted to the vault, an Ops

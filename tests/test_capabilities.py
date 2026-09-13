@@ -15,6 +15,6 @@ def test_capability_card_names_every_feature_boundary_and_roadmap_item():
         assert boundary in card
     for name, status, _ in connectors.ROADMAP_FEATURES:
         assert f"- {name} ({status})" in card
-    assert "never commits, pushes, or opens pull requests" in card
+    assert "never writes to GitHub on its own" in card and "session-only GitHub push slot" in card
     assert "never invent executors" in card
     assert len(card) < 3000  # a few hundred tokens per request, not a document
