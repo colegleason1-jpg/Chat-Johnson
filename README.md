@@ -58,7 +58,7 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 - **Task Finder**: a mission is classified (research, code, analysis, plan, general) with no provider
   call and expanded into typed workstreams you can edit before launch. Steps run one at a time through
   the router to respect free-tier limits; every result lands in the tab's thread, and a
-  "Continue the mission" box keeps the conversation going with the results in context.
+  chat bar keeps the conversation going with the results in context.
 - **Repository Work**: least-privilege GitHub OAuth skeleton, the local sandboxed patch pipeline, and a
   discussion thread for the change.
 - **Chat Bot**: long-form developer chat with file uploads injected as context.
@@ -152,6 +152,16 @@ HTTP status, key fingerprint, and any auto-switch. Probes count toward the vendo
   latency (noise gate), seeded by the endpoint name so it is reproducible, and the penalty is the
   entropy gained over the undriven baseline. An endpoint with no observations gets no penalty. This
   is a routing signal, not a physical claim.
+- **Legacy providers** (NVIDIA NIM, OpenRouter, Cerebras, Mistral) are a fallback only: they serve a
+  request when no Cortex key (Gemini, Groq, Hugging Face) is set or when every Cortex endpoint fails
+  it. Their retries, sibling-model attempts, and rediscovery calls are metered like everything else.
+- **Prompt context sizing**: the project-memory block is sized so the request fits every keyed
+  endpoint's TPM ceiling at the current output budget (4 chars per token, 500-token reserve, never
+  below 8k or above 24k characters), so a long thread does not silently lock out the fastest
+  endpoint. The live window fills newest-first, so a follow-up always sees the latest results.
+- **Free-tier pacing in Task Finder**: before each workstream the ledger is consulted; if every keyed
+  vendor is inside its RPM/TPM window the step waits (up to 65 s) instead of failing. Missions are
+  pinned to the chat, so they survive window eviction and thread migration.
 - **Quota ledger**: one bucket per vendor credential; every HTTP attempt (retries, rediscovery,
   probes) counts toward RPM; tokens are charged on success. A visitor's ledger is keyed by a
   non-reversible fingerprint of their applied keys, so visitors never throttle each other.

@@ -129,3 +129,20 @@ def test_redaction_covers_every_supported_key_shape(db):
         for secret in samples.values():
             assert secret not in row["content"]
         assert "[REDACTED_SECRET]" in row["content"]
+
+
+def test_context_block_keeps_the_newest_rows_when_the_window_is_over_budget(db):
+    for index in range(30):
+        db.append_message("scope", "assistant", f"row {index:02d} " + "x" * 400)
+    block = db.context_block("scope", max_characters=3000)
+    assert len(block) <= 3000
+    assert "row 29" in block and "row 00" not in block
+    kept = [line for line in block.split("\n") if line.startswith("ASSISTANT: row")]
+    assert kept == sorted(kept)  # chronological order is preserved
+
+
+def test_context_block_truncates_a_single_oversized_newest_row(db):
+    db.append_message("scope", "assistant", "y" * 10_000)
+    block = db.context_block("scope", max_characters=2000)
+    assert 0 < len(block) <= 2000
+    assert block.startswith("ASSISTANT: yyy") and block.endswith("[TRUNCATED]")

@@ -8,7 +8,9 @@ This keeps one code path for all free tiers and avoids heavyweight SDKs.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import requests
 
@@ -33,6 +35,27 @@ class ProviderError(RuntimeError):
         self.body = body
 
 
+_ATTEMPT_HOOK: ContextVar[Optional[Callable[[], None]]] = ContextVar("chat_johnson_attempt_hook", default=None)
+
+
+@contextmanager
+def metered(hook: Optional[Callable[[], None]]) -> Iterator[None]:
+    """Run ``hook`` before every real POST inside the block: retries, sibling models, rediscovery included."""
+    token = _ATTEMPT_HOOK.set(hook)
+    try:
+        yield
+    finally:
+        _ATTEMPT_HOOK.reset(token)
+
+
+def body_text(response: object, limit: int = 400) -> str:
+    """Error bodies as UTF-8 whatever the vendor's charset header (requests guesses ISO-8859-1 for text/*)."""
+    content = getattr(response, "content", None)
+    if isinstance(content, (bytes, bytearray)):
+        return bytes(content[: limit * 4]).decode("utf-8", errors="replace")[:limit]
+    return str(getattr(response, "text", "") or "")[:limit]
+
+
 def _post_with_retry(
     url: str,
     headers: Dict[str, str],
@@ -47,6 +70,9 @@ def _post_with_retry(
     """
     last_err: Optional[str] = None
     for attempt in range(1, max_retries + 1):
+        hook = _ATTEMPT_HOOK.get()
+        if hook is not None:
+            hook()
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
         except requests.RequestException as exc:  # network hiccup
@@ -55,7 +81,7 @@ def _post_with_retry(
             continue
         if resp.status_code == 200:
             return resp.json()
-        body = resp.text[:400]
+        body = body_text(resp)
         if discovery.is_transient(resp.status_code) and attempt < max_retries:
             last_err = f"HTTP {resp.status_code}: {body[:200]}"
             discovery.sleep(discovery.retry_delay(attempt, resp.headers.get("Retry-After")))

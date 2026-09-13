@@ -833,3 +833,91 @@ def test_legacy_error_text_never_contains_the_key(monkeypatch):
         providers.chat("groq", [{"role": "user", "content": "x"}], settings=config.get_settings())
     assert "gsk_legacysecret" not in str(excinfo.value)
     assert "[REDACTED_SECRET]" in str(excinfo.value)
+
+
+def test_stream_hides_reasoning_while_it_streams(all_keys, monkeypatch):
+    chunks = ["Hello <thi", "nk>secret plan</th", "ink>  world", " end"]
+    monkeypatch.setattr(router, "cortex_stream", lambda *a, **k: iter(chunks))
+    stream = router.CortexStream("chat", [{"role": "user", "content": "x"}], max_tokens=16)
+    visible = "".join(stream)
+    assert "secret" not in visible and visible == "Hello world end"
+    assert stream.text == "Hello world end"
+
+
+def test_visible_chunks_handles_unterminated_and_absent_tags():
+    assert "".join(router._visible_chunks(iter(["<think>never ", "finished"]))) == ""
+    assert "".join(router._visible_chunks(iter(["plain ", "text <b>ok</b>"]))) == "plain text <b>ok</b>"
+    assert "".join(router._visible_chunks(iter(["a <", "b"]))) == "a <b"
+    assert "".join(router._visible_chunks(iter(["<THINK>x</THINK>\nAnswer"]))) == "Answer"
+
+
+def test_prompt_context_chars_keeps_every_keyed_endpoint_feasible(monkeypatch):
+    for name in ("GEMINI_API_KEY", "GROQ_API_KEY", "HF_TOKEN", "HUGGINGFACE_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    assert router.prompt_context_chars(2048) == 4 * (8_000 - 2048 - 500)
+    assert router.prompt_context_chars(8192) == 8_000
+    monkeypatch.delenv("GROQ_API_KEY")
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    assert router.prompt_context_chars(2048) == 24_000
+    monkeypatch.delenv("GEMINI_API_KEY")
+    assert router.prompt_context_chars(2048) == 24_000
+
+
+def test_cortex_wait_seconds_reports_the_soonest_free_window(monkeypatch):
+    for name in ("GEMINI_API_KEY", "GROQ_API_KEY", "HF_TOKEN", "HUGGINGFACE_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    ledger = QuotaLedger({})
+    messages = [{"role": "user", "content": "x"}]
+    assert router.cortex_wait_seconds(ledger, messages, 16) == 0.0
+    ledger.record_attempt("gemini")
+    ledger.record_attempt("gemini")  # Gemini's Cortex ceiling is 2 RPM
+    assert 0 < router.cortex_wait_seconds(ledger, messages, 16) <= 60.0
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    assert router.cortex_wait_seconds(ledger, messages, 16) == 0.0
+    assert router.cortex_wait_seconds(None, messages, 16) == 0.0
+
+
+def test_legacy_retries_are_metered_as_requests(monkeypatch):
+    from orchestrator import providers
+    for name in ("GEMINI_API_KEY", "GROQ_API_KEY", "HF_TOKEN", "HUGGINGFACE_API_KEY", "OPENROUTER_API_KEY", "CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test")
+    posts = {"n": 0}
+
+    class Resp:
+        def __init__(self, status, payload=None):
+            self.status_code, self.headers, self.content = status, {}, "d\u00e9j\u00e0 busy".encode("utf-8")
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, headers=None, json=None, timeout=None, **kw):
+        posts["n"] += 1
+        if posts["n"] < 3:
+            return Resp(503)
+        return Resp(200, {"choices": [{"message": {"content": "ok"}}], "usage": {"total_tokens": 5}})
+
+    monkeypatch.setattr(providers.requests, "post", fake_post)
+    ledger = QuotaLedger({n: (30, 100000) for n in router.PROVIDERS})
+    ledger.tighten("nvidia", 3, 100000)
+    text, decision = router.generate("chat", [{"role": "user", "content": "hi"}], ledger, max_tokens=16)
+    assert text == "ok" and posts["n"] == 3 and decision.provider == "nvidia"
+    assert not ledger.has_headroom("nvidia", 1)  # three real POSTs, three requests counted
+
+
+def test_error_bodies_are_decoded_as_utf8():
+    from orchestrator import providers
+
+    class Resp:
+        content = "caf\u00e9 \u2014 busy".encode("utf-8")
+        text = "caf\u00c3\u00a9 \u00e2\u0080\u0094 busy"  # what requests would guess for text/* without charset
+
+    assert providers.body_text(Resp()) == "caf\u00e9 \u2014 busy"
+
+    class TextOnly:
+        text = "plain"
+
+    assert providers.body_text(TextOnly()) == "plain"

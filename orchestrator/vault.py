@@ -144,6 +144,7 @@ def initialize_database() -> None:
             _ensure_column(connection, table, "thread_id", "INTEGER")
         _ensure_column(connection, "threads", "workspace", "TEXT NOT NULL DEFAULT 'normal_chat'")
         _ensure_column(connection, "message_history", "task_type", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "threads", "mission", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_message_thread ON message_history(thread_id, timestamp ASC, id ASC)"
         )
@@ -270,6 +271,12 @@ def rename_thread(thread_id: int, title: str) -> None:
         connection.execute("UPDATE threads SET title = ? WHERE id = ?", ((title.strip() or "Untitled")[:120], int(thread_id)))
 
 
+def set_thread_mission(thread_id: int, goal: str) -> None:
+    """Pin the Task Finder mission to the thread so it outlives window eviction and migration."""
+    with _open_database() as connection:
+        connection.execute("UPDATE threads SET mission = ? WHERE id = ?", ((goal or "").strip()[:2000], int(thread_id)))
+
+
 def set_thread_status(thread_id: int, status: str) -> None:
     if status not in {"active", "migrated", "archived"}:
         raise ValueError("invalid thread status")
@@ -302,6 +309,7 @@ def clear_thread(thread_id: int) -> int:
             ],
         )
         connection.execute("DELETE FROM message_history WHERE thread_id = ?", (int(thread_id),))
+        connection.execute("UPDATE threads SET mission = '' WHERE id = ?", (int(thread_id),))  # a cleared chat starts over
         _touch_thread(connection, int(thread_id))
         connection.commit()
         return len(rows)
@@ -601,12 +609,20 @@ def context_block(
         lines.append(line)
         summary_used += len(line) + 1
     used += summary_used
-    for row in rows:
+    # The live window fills newest-first so a follow-up always sees the latest results;
+    # the kept rows are emitted in chronological order.
+    remaining = max_characters - used
+    window: List[str] = []
+    for row in reversed(rows):
         line = f"{row['role'].upper()}: {row['content']}"
-        if used + len(line) + 1 > max_characters:
+        if len(line) + 1 > remaining:
+            marker = " [TRUNCATED]"
+            if not window and remaining > 200 + len(marker):
+                window.append(line[: remaining - 1 - len(marker)] + marker)
             break
-        lines.append(line)
-        used += len(line) + 1
+        window.append(line)
+        remaining -= len(line) + 1
+    lines.extend(reversed(window))
     return "\n".join(lines)
 
 
@@ -949,6 +965,8 @@ def migrate_thread(
     new_id = create_thread(scope, new_title, parent_thread_id=old_id, workspace=thread["workspace"])
     with _open_database() as connection:
         connection.execute("UPDATE threads SET digest_artifact_id = ? WHERE id = ?", (artifact_id, new_id))
+        mission = str(thread["mission"]) if "mission" in thread.keys() and thread["mission"] else ""
+        connection.execute("UPDATE threads SET mission = ? WHERE id = ?", (mission, new_id))
         connection.execute("UPDATE threads SET status = 'migrated', updated_at = ? WHERE id = ?", (time.time(), old_id))
         connection.commit()
     append_message(

@@ -43,6 +43,7 @@ except ModuleNotFoundError as exc:  # Keep pure routing/math helpers importable 
         raise ProviderError("requests is required for provider HTTP execution")
 
 from . import discovery
+from . import providers as _providers
 from .config import PROVIDERS, Settings, get_settings, provider_model, resolve_secret
 from .quota import QuotaLedger
 
@@ -556,6 +557,36 @@ def _endpoint_key(endpoint: CortexEndpoint) -> str:
     return ""
 
 
+DEFAULT_CONTEXT_CHARS = 24_000
+MIN_CONTEXT_CHARS = 8_000
+CONTEXT_RESERVE_TOKENS = 500
+
+
+def prompt_context_chars(max_tokens: int) -> int:
+    """Characters of project memory that keep a request inside every keyed endpoint's TPM ceiling.
+
+    4 chars per token as in _estimate_tokens, a 500-token reserve for the system prompt and
+    the request itself, never below 8k (context matters more than one fast endpoint) and never
+    above the 24k default. At the default 2,048-token budget this keeps Groq's 8,000 TPM feasible.
+    """
+    cap = DEFAULT_CONTEXT_CHARS
+    for endpoint in CORTEX_ENDPOINTS.values():
+        if endpoint.tpm_limit is None or not _endpoint_key(endpoint):
+            continue
+        cap = min(cap, 4 * (int(endpoint.tpm_limit) - int(max_tokens) - CONTEXT_RESERVE_TOKENS))
+    return max(MIN_CONTEXT_CHARS, min(DEFAULT_CONTEXT_CHARS, cap))
+
+
+def cortex_wait_seconds(ledger: Optional[QuotaLedger], messages: Sequence[Mapping[str, str]], max_tokens: int) -> float:
+    """Seconds until some keyed Cortex endpoint has RPM/TPM headroom for this request; 0 when one has it now."""
+    if ledger is None:
+        return 0.0
+    _ensure_cortex_ledger(ledger)
+    estimated = _estimate_tokens(messages) + int(max_tokens)
+    waits = [ledger.wait_seconds(_vendor(endpoint), estimated) for endpoint in CORTEX_ENDPOINTS.values() if _endpoint_key(endpoint)]
+    return float(min(waits)) if waits else 0.0
+
+
 def _endpoint_usage(
     endpoint: CortexEndpoint,
     ledger: Optional[QuotaLedger],
@@ -793,7 +824,7 @@ def _model_is_usable(selected: CortexEndpoint, model_id: str, timeout: int = 20,
     except (ProviderError, requests.RequestException):
         return False
     status = int(response.status_code)
-    body = response.text[:400] if hasattr(response, "text") else ""
+    body = _providers.body_text(response)
     try:
         response.close()
     except AttributeError:
@@ -877,8 +908,7 @@ def _resilient_post(
                 record_telemetry(selected.name, latency, True)
                 return response, model_id
             record_telemetry(selected.name, latency, False)
-            response.encoding = "utf-8"
-            detail = response.text[:400]
+            detail = _providers.body_text(response)
             retry_after = response.headers.get("Retry-After") if hasattr(response, "headers") else None
             response.close()
             if secret:
@@ -1062,6 +1092,51 @@ def strip_reasoning_tags(text: str) -> str:
     return cleaned.strip() if cleaned != text else text
 
 
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+
+
+def _partial_tag_suffix(text: str, tag: str) -> int:
+    """Length of the longest suffix of ``text`` that is a proper prefix of ``tag`` (case-insensitive)."""
+    lowered = text.lower()
+    for length in range(min(len(tag) - 1, len(lowered)), 0, -1):
+        if lowered.endswith(tag[:length]):
+            return length
+    return 0
+
+
+def _visible_chunks(chunks: Iterable[str]) -> Iterator[str]:
+    """Stream only the text outside <think>…</think>; a tag split across chunks is held back until it resolves."""
+    buffer = ""
+    hidden = False
+    for chunk in chunks:
+        buffer += chunk
+        while buffer:
+            lowered = buffer.lower()
+            if hidden:
+                end = lowered.find(_THINK_CLOSE_TAG)
+                if end < 0:
+                    keep = _partial_tag_suffix(buffer, _THINK_CLOSE_TAG)
+                    buffer = buffer[len(buffer) - keep:] if keep else ""
+                    break
+                buffer = buffer[end + len(_THINK_CLOSE_TAG):].lstrip()
+                hidden = False
+                continue
+            start = lowered.find(_THINK_OPEN_TAG)
+            if start < 0:
+                safe = len(buffer) - _partial_tag_suffix(buffer, _THINK_OPEN_TAG)
+                if safe:
+                    yield buffer[:safe]
+                buffer = buffer[safe:]
+                break
+            if start:
+                yield buffer[:start]
+            buffer = buffer[start + len(_THINK_OPEN_TAG):]
+            hidden = True
+    if buffer and not hidden:
+        yield buffer
+
+
 def _estimate_tokens(messages: Sequence[Mapping[str, str]], output: str = "") -> int:
     characters = sum(len(str(message.get("content", ""))) for message in messages) + len(output)
     return max(1, characters // 4)
@@ -1162,7 +1237,7 @@ class CortexStream:
         )
         self.text = ""
 
-    def __iter__(self) -> Iterator[str]:
+    def _raw(self) -> Iterator[str]:
         for chunk in cortex_stream(
             self.milp.endpoint,
             self.messages,
@@ -1173,6 +1248,10 @@ class CortexStream:
         ):
             self.text += chunk
             yield chunk
+
+    def __iter__(self) -> Iterator[str]:
+        # Hidden reasoning is filtered live, not only after the stream ends.
+        yield from _visible_chunks(self._raw())
         self.text = strip_reasoning_tags(self.text)
         if self.ledger is not None:
             self.ledger.record(_vendor(self.milp.endpoint), _estimate_tokens(self.messages, self.text), count_request=False)
@@ -1268,10 +1347,11 @@ def probe_legacy_provider(name: str, timeout: int = 20, ledger: Optional[QuotaLe
     settings = get_settings()
     settings.request_timeout = timeout
     settings.max_retries_per_call = 1
-    if ledger is not None:
-        ledger.record_attempt(discovery.vendor_for(name))
+    vendor = discovery.vendor_for(name)
+    hook = (lambda: ledger.record_attempt(vendor)) if ledger is not None else None
     try:
-        chat(name, [{"role": "user", "content": "ping"}], 8, 0.0, settings)
+        with _providers.metered(hook):
+            chat(name, [{"role": "user", "content": "ping"}], 8, 0.0, settings)
     except ProviderError as exc:
         text = str(exc).replace(key, "[REDACTED_SECRET]")
         status = getattr(exc, "status_code", None)
@@ -1370,7 +1450,7 @@ def paid_slot_generate(
     except requests.RequestException as exc:
         raise ProviderError(f"paid slot network error: {exc}") from exc
     if response.status_code >= 400:
-        detail = response.text[:400].replace(slot.api_key, "[REDACTED_SECRET]")
+        detail = _providers.body_text(response).replace(slot.api_key, "[REDACTED_SECRET]")
         raise ProviderError(f"paid slot HTTP {response.status_code}: {detail}")
     try:
         body = response.json()
@@ -1472,12 +1552,15 @@ def generate(
             failures[name] = "skipped: no quota headroom or context too small"
             continue
         tried.append(name)
+        vendor = discovery.vendor_for(name)
         try:
-            text, tokens = chat(name, messages, max_tokens, temperature, settings_value)
+            # Every real POST (retries, sibling models, rediscovery) counts toward the vendor's RPM.
+            with _providers.metered(lambda: ledger.record_attempt(vendor)):
+                text, tokens = chat(name, messages, max_tokens, temperature, settings_value)
         except ProviderError as exc:
             failures[name] = str(exc)
             continue
-        ledger.record(discovery.vendor_for(name), tokens)
+        ledger.record(vendor, tokens, count_request=False)
         config = PROVIDERS[name]
         return text, RouteDecision(
             name,

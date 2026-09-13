@@ -76,9 +76,11 @@ from orchestrator.router import (
     byok_status,
     classify,
     cortex_available,
+    cortex_wait_seconds,
     endpoint_model,
     generate_mode,
     probe_all_endpoints,
+    prompt_context_chars,
     strip_reasoning_tags,
 )
 
@@ -111,6 +113,7 @@ from orchestrator.vault import (
     rename_thread,
     save_artifact,
     search_artifacts,
+    set_thread_mission,
     switch_thread,
     thread_health,
 )
@@ -225,7 +228,12 @@ def provider_status_rows() -> List[Tuple[str, str, str, bool]]:
         if name in {"gemini", "groq"}:
             continue
         configured = bool(resolve_secret(cfg.env_key))
-        rows.append((name, cfg.label, f"{provider_model(cfg)} · {cfg.env_key}", configured))
+        rows.append((
+            name, cfg.label,
+            f"{provider_model(cfg)} · {cfg.env_key} · fallback only: used when no Cortex key (Gemini, Groq, Hugging Face) "
+            "is set or every Cortex endpoint fails a request",
+            configured,
+        ))
     return rows
 
 
@@ -241,7 +249,9 @@ def build_prompt_messages(
         "that generated code is flawless or that a scientific simulation proves "
         "physical propulsion. Do not reveal private chain-of-thought."
     )
-    context = context_block(project_scope, workspace=workspace)
+    # Sized so the request fits every keyed endpoint's TPM ceiling at the current output budget.
+    context_chars = prompt_context_chars(int(st.session_state.get("max_tokens", 2048)))
+    context = context_block(project_scope, max_characters=context_chars, workspace=workspace)
     parts = [f"ACTIVE PROJECT: {project_scope}", "PROJECT MEMORY:\n" + context]
     if injected_context.strip():
         parts.append("USER-CONSENTED FILE INJECTIONS:\n" + injected_context)  # already budgeted per file
@@ -571,6 +581,12 @@ CHAT_INPUT_ACCEPTS_FILES = "accept_file" in inspect.signature(st.chat_input).par
 INJECTION_BUDGET_CHARS = 120_000
 ROUTING_LOG_LIMIT = 40
 MISSION_PREFIX = "MISSION: "
+MISSION_MAX_WAIT_SECONDS = 65  # one free-tier window; longer waits surface as a failed step instead
+
+
+def heavy_pass_tokens(budget: int) -> int:
+    """Output tokens one Heavy Mode send can use: draft b/2, critique b/3, synthesis b (256 floor each)."""
+    return max(256, budget // 2) + max(256, budget // 3) + budget
 
 
 @dataclass
@@ -603,8 +619,9 @@ def uploaded_file_context(files: Sequence[Any], budget: int = INJECTION_BUDGET_C
     return "\n\n".join(chunks), notes
 
 
-def thread_has_mission(rows: Sequence[sqlite3.Row]) -> bool:
-    return any(row["role"] == "user" and str(row["content"]).startswith(MISSION_PREFIX) for row in rows)
+def thread_mission(thread: sqlite3.Row) -> str:
+    """The mission pinned to a Task Finder chat; survives window eviction, migration, and a reload."""
+    return str(thread["mission"]).strip() if "mission" in thread.keys() and thread["mission"] else ""
 
 
 def log_route(workspace: Optional[str], task_type: str, route: str, mode: str, started: float, reason: str) -> None:
@@ -872,22 +889,22 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
 
 def send_label(base: str) -> str:
     """Buttons say what they will do: Heavy Mode turns any send into three passes."""
-    return f"{base} · Heavy Mode (3 passes)" if active_mode() == "heavy" else base
+    return f"{base} · Heavy Mode (up to 3 passes)" if active_mode() == "heavy" else base
 
 
 def chat_placeholder(workspace: str, project_scope: str, ready: bool) -> str:
     if not ready:
         return "Paste an API key in the sidebar (🔑 API keys) to start chatting"
     if workspace == "task_finder":
-        rows = recent_messages(project_scope, MESSAGE_WINDOW, workspace="task_finder")
-        base = "Continue the mission…" if thread_has_mission(rows) else "Describe a mission to decompose into workstreams…"
+        mission = thread_mission(active_thread(project_scope, "task_finder"))
+        base = "Continue the mission…" if mission else "Describe a mission to decompose into workstreams…"
     elif workspace == "chat_bot":
         base = "Ask the developer bot" + (" · attach files with the paperclip" if CHAT_INPUT_ACCEPTS_FILES else "") + "…"
     elif workspace == "repository":
         base = "Discuss the repository work: the diff, the next change, a review…"
     else:
         base = "Message Normal Chat…"
-    return base + (" · Heavy Mode (3 passes)" if active_mode() == "heavy" else "")
+    return base + (" · Heavy Mode (up to 3 passes)" if active_mode() == "heavy" else "")
 
 
 def render_chat_bar(workspace: str, project_scope: str) -> Optional[ChatSubmission]:
@@ -984,6 +1001,7 @@ def execute_mission(
         thread_id = int(migration["new_thread_id"])
     task_mode = active_mode()
     append_message(project_scope, "user", f"{MISSION_PREFIX}{goal}", mode=task_mode, workspace="task_finder", task_type="plan")
+    set_thread_mission(thread_id, goal)
     progress = st.progress(0.0, text="Starting workstreams…")
     request_lock = get_task_request_lock()
     token_budget = int(st.session_state.get("max_tokens", 2048))
@@ -996,6 +1014,11 @@ def execute_mission(
         try:
             # The prompt is built right before the call so this step sees every result before it.
             messages = build_prompt_messages(project_scope, str(step["description"]), workspace="task_finder")
+            wait = cortex_wait_seconds(ledger, messages, token_budget)
+            if 0 < wait <= MISSION_MAX_WAIT_SECONDS:
+                # Free-tier RPM windows (Gemini: 2 per minute) are paced, not tripped.
+                progress.progress((finished - 1) / len(plan), text=f"Waiting {int(wait) + 1}s for a free-tier window before step {finished}…")
+                time.sleep(wait + 0.5)
             # The lock covers the full selection/request/ledger-record cycle so a
             # concurrent send from another tab cannot overspend one free-tier key.
             with request_lock:
@@ -1050,12 +1073,16 @@ def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int
             step["title"] = str(row.get("workstream") or step["title"])
             step["type"] = str(row.get("type") or step["type"])
             step["description"] = str(row.get("instruction") or step["description"])
-        passes = 3 if active_mode() == "heavy" else 1
+        heavy = active_mode() == "heavy"
+        passes = 3 if heavy else 1
         calls = len(plan) * passes
         budget = int(st.session_state.get("max_tokens", 2048))
+        per_step = heavy_pass_tokens(budget) if heavy else budget
+        upto = "up to " if heavy else ""
         st.caption(
-            f"Cost preview: {len(plan)} workstream(s) × {passes} pass(es) = {calls} provider call(s), "
-            f"up to ~{calls * budget} output tokens" + (" · Heavy Mode is on" if passes == 3 else "")
+            f"Cost preview: {len(plan)} workstream(s) × {upto}{passes} pass(es) = {upto}{calls} provider call(s), "
+            f"up to ~{len(plan) * per_step} output tokens"
+            + (" · Heavy Mode: draft b/2 + critique b/3 + synthesis b per workstream" if heavy else "")
         )
         launch_col, discard_col = st.columns([0.7, 0.3], gap="small")
         if launch_col.button(
@@ -1081,7 +1108,10 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
     )
     thread = render_thread_bar(project_scope, "task_finder", ledger)
     thread_id = int(thread["id"])
-    has_mission = thread_has_mission(recent_messages(project_scope, MESSAGE_WINDOW, workspace="task_finder"))
+    mission = thread_mission(thread)
+    has_mission = bool(mission)
+    if mission:
+        st.caption(f"Mission · {mission[:240]}")
     pending: Dict[int, str] = st.session_state.setdefault("pending_missions", {})
     continuing: Optional[ChatSubmission] = None
     if submission and submission.text.strip():
@@ -1223,7 +1253,7 @@ with st.sidebar:
                 st.session_state.pop(f"byok_{env_name}", None)
             st.info("Session keys cleared. Environment variables, if any, remain in effect.")
             st.rerun()
-        if st.button("Test keys (1 small call per configured provider; metered)", key="probe_keys", use_container_width=True):
+        if st.button("Test keys (1 small call per configured provider; every retry is metered)", key="probe_keys", use_container_width=True):
             with st.spinner("Probing endpoints…"):
                 probe_rows = probe_all_endpoints(ledger=get_quota_ledger())
             for row in probe_rows:

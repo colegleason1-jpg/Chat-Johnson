@@ -223,3 +223,17 @@ def test_messages_record_their_task_type(db):
     db.append_message("t", "user", "thanks")
     rows = db.recent_messages("t")
     assert [r["task_type"] for r in rows] == ["research", "research", ""]
+
+
+def test_mission_is_pinned_to_the_chat_and_survives_migration_but_not_clear(db):
+    scope = "m"
+    thread_id = db.active_thread(scope, "task_finder")["id"]
+    db.set_thread_mission(thread_id, "  Ship the free-tier router  ")
+    assert db.thread_by_id(thread_id)["mission"] == "Ship the free-tier router"
+    fill(db, scope, 8, thread_id=thread_id, text="we decided step {i} must stay free-tier")
+    result = db.migrate_thread(scope, workspace="task_finder")
+    successor = db.active_thread(scope, "task_finder")
+    assert successor["id"] == result["new_thread_id"]
+    assert successor["mission"] == "Ship the free-tier router"
+    db.clear_thread(int(successor["id"]))
+    assert db.thread_by_id(int(successor["id"]))["mission"] == ""
