@@ -400,6 +400,9 @@ def test_probe_reports_status_without_leaking_key(all_keys, monkeypatch):
     assert "CORTEX_GEMINI_MODEL" in results["google_ai_studio"]["detail"]
     assert "gemini-secret-key" not in str(results)
     assert "key rejected" in results["huggingface"]["detail"]
+    assert results["groq"]["key"] == "groq…(15 chars)"
+    assert router.key_fingerprint("") == "none"
+    assert router.key_fingerprint("gsk_abcdefghijklmnopqrstuvwxyz") == "gsk_…(30 chars)"
 
 
 def test_probe_without_key_does_not_call_network(monkeypatch):

@@ -1031,14 +1031,31 @@ def stream_generation(
 # Connection probe (for the sidebar "Test keys" button)
 # =============================================================================
 
+def key_fingerprint(secret: str) -> str:
+    """Non-reversible hint that lets an operator recognise which key is in use."""
+    cleaned = (secret or "").strip()
+    if not cleaned:
+        return "none"
+    prefix = cleaned[:4] if len(cleaned) > 12 else cleaned[:2]
+    return f"{prefix}…({len(cleaned)} chars)"
+
+
 def probe_endpoint(endpoint: str | CortexEndpoint, timeout: int = 20) -> Dict[str, Any]:
     """Send a one-token request to an endpoint and report the real HTTP outcome.
 
-    Returns a redacted dict: {"endpoint", "model", "ok", "status", "detail"}.
-    The key never appears in the result.
+    Returns a redacted dict: {"endpoint", "model", "ok", "status", "detail", "key"}.
+    ``key`` is only a fingerprint (first few characters + length); the secret
+    itself never appears in the result.
     """
     selected = _as_endpoint(endpoint)
-    result: Dict[str, Any] = {"endpoint": selected.name, "model": endpoint_model(selected), "ok": False, "status": None, "detail": ""}
+    result: Dict[str, Any] = {
+        "endpoint": selected.name,
+        "model": endpoint_model(selected),
+        "ok": False,
+        "status": None,
+        "detail": "",
+        "key": key_fingerprint(_endpoint_key(selected)),
+    }
     if requests is None:
         result["detail"] = "requests library missing"
         return result

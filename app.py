@@ -120,6 +120,24 @@ def get_task_request_lock() -> threading.Lock:
     return threading.Lock()
 
 
+@st.cache_resource
+def build_marker() -> str:
+    """Short git commit of the running checkout, so a deploy can be verified at a glance."""
+    try:
+        import subprocess
+
+        sha = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        return sha or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def configured_provider_names() -> List[str]:
     status = byok_status()
     return [name for name, row in status.items() if row["configured"]]
@@ -742,7 +760,7 @@ if "heavy_mode" not in st.session_state:
 
 ledger = get_quota_ledger()
 with st.sidebar:
-    st.markdown("<div class='eyebrow'>Chat Johnson · Gen 2</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='eyebrow'>Chat Johnson · Gen 2 · build {build_marker()}</div>", unsafe_allow_html=True)
     st.title("Control deck")
     if "byok_expanded" not in st.session_state:
         st.session_state.byok_expanded = not configured_provider_names()
@@ -792,7 +810,7 @@ with st.sidebar:
             for row in probe_rows:
                 marker = "✅" if row["ok"] else ("⚪" if row["detail"] == "no key configured" else "❌")
                 status = f" · HTTP {row['status']}" if row["status"] else ""
-                st.caption(f"{marker} **{row['endpoint']}** · {row['model']}{status} · {row['detail']}")
+                st.caption(f"{marker} **{row['endpoint']}** · {row['model']} · key {row['key']}{status} · {row['detail']}")
     project_input = st.text_input("Active project scope", value=st.session_state.project_scope, key="project_scope_input")
     st.session_state.project_scope = project_input.strip() or "chat-johnson"
     st.checkbox(
