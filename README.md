@@ -73,6 +73,16 @@ code block (versioned save to SQLite), output token budget slider, per-project s
 Keys are read from the process environment at call time. They are never written to SQLite, logs,
 prompts, artifacts, or git.
 
+Optional model-id overrides for the strict Cortex endpoints (useful when a vendor retires an id):
+`CORTEX_GEMINI_MODEL`, `CORTEX_GROQ_MODEL`, `CORTEX_HF_MODEL`. The RPM/TPM ceilings stay fixed.
+
+### Paid reasoning slot (optional, session-only)
+
+The backend is free-tier only. Heavy Mode can optionally send its *review* pass to a paid
+OpenAI-compatible reasoning model. The slot arms only when, in the current browser session, you
+switch it on **and** paste a key. It is never persisted, never read from an environment variable,
+and Normal mode never uses it. Close the tab and it is gone.
+
 ## Design rules
 
 - **Free-tier only in the backend.** Any paid slot must be toggled on and have its key entered fresh

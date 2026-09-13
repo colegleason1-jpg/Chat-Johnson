@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-13
 **Branch:** `claude/ai-nonlinear-logic-arch-jakbpm` (currently identical to `main`)
-**Status:** approved 2026-09-13 (decisions A–D). Phase 0 executed in this branch.
+**Status:** approved 2026-09-13 (decisions A–D). Phase 0 and Phase 1 executed in this branch.
 
 ---
 
@@ -88,7 +88,12 @@ throw away working, tested code. The right move is to harden, clean, and extend.
   `research/project_seth_phase3.py` (the Phase 3 engine as an importable module with the README's
   recommended smoke configuration as a test). Nothing is discarded, only moved.
 
-### Phase 1 · Test armor for the existing engine
+### Phase 1 · Test armor for the existing engine — DONE
+*Delivered:* `orchestrator/vault.py` (SQLite moved out of app.py, DB path resolved at call time),
+`tests/test_cortex.py` (26 mocked tests), `tests/test_vault.py` (7), `CortexStream` with live
+streaming in Normal Chat / Chat Bot, `CORTEX_*_MODEL` overrides, and the session-only
+`PaidReasoningSlot` used exclusively by the Heavy Mode critique pass.
+
 - Mocked-provider tests for Cortex 1 (payload shape per provider, system prompt append, SSE parsing,
   secret redaction in errors).
 - MILP tests: exclusivity, RPM exhaustion, TPM exclusion, no-key exclusion, entropy penalty ordering,

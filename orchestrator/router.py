@@ -126,6 +126,16 @@ class CortexEndpoint:
     speed_score: float
     context_score: float
     strengths: Tuple[str, ...]
+    model_env: str = ""
+
+
+def endpoint_model(endpoint: "CortexEndpoint") -> str:
+    """Resolve the model id at call time so retired ids can be overridden by env."""
+    if endpoint.model_env:
+        override = os.environ.get(endpoint.model_env, "").strip()
+        if override:
+            return override
+    return endpoint.model
 
 
 # These are deliberate routing ceilings from the Project Seth / Chat Johnson
@@ -143,6 +153,7 @@ CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
         speed_score=0.48,
         context_score=1.00,
         strengths=("context_load", "reasoning", "chat"),
+        model_env="CORTEX_GEMINI_MODEL",
     ),
     "groq": CortexEndpoint(
         name="groq",
@@ -156,6 +167,7 @@ CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
         speed_score=1.00,
         context_score=0.58,
         strengths=("code_patch", "quick_text", "chat"),
+        model_env="CORTEX_GROQ_MODEL",
     ),
     "huggingface": CortexEndpoint(
         name="huggingface",
@@ -169,6 +181,7 @@ CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
         speed_score=0.72,
         context_score=0.70,
         strengths=("code_patch", "test_fix", "reasoning"),
+        model_env="CORTEX_HF_MODEL",
     ),
 }
 
@@ -702,11 +715,16 @@ def build_cortex_request(
         }
         if system_parts:
             payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
-        url = f"{selected.base_url}/models/{selected.model}:streamGenerateContent?alt=sse" if stream else f"{selected.base_url}/models/{selected.model}:generateContent"
+        model_id = endpoint_model(selected)
+        url = (
+            f"{selected.base_url}/models/{model_id}:streamGenerateContent?alt=sse"
+            if stream
+            else f"{selected.base_url}/models/{model_id}:generateContent"
+        )
         return url, {"x-goog-api-key": key, "Content-Type": "application/json"}, payload
 
     payload = {
-        "model": selected.model,
+        "model": endpoint_model(selected),
         "messages": prepared,
         "max_tokens": int(max_tokens),
         "temperature": float(temperature),
@@ -840,7 +858,7 @@ def cortex_generate(
                 ledger.record(endpoint.name, tokens)
             route_decision = RouteDecision(
                 provider=endpoint.name,
-                model=endpoint.model,
+                model=endpoint_model(endpoint),
                 task_type=task_type,
                 reason=f"{decision.reason}; solver={decision.solver}; attempted={attempted}",
                 solver=decision.solver,
@@ -856,6 +874,55 @@ def cortex_generate(
     )
 
 
+class CortexStream:
+    """Iterable live stream that also records the routing decision and final text.
+
+    Cortex 2 selects the endpoint when the object is created, so ``decision``
+    is available before the first chunk.  ``text`` accumulates every chunk and
+    the ledger is charged once the stream is exhausted.
+    """
+
+    def __init__(
+        self,
+        task_type: str,
+        messages: Sequence[Mapping[str, str]],
+        ledger: Optional[QuotaLedger] = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.2,
+        system_prompt: str = "",
+    ) -> None:
+        self.messages = [dict(message) for message in messages]
+        self.ledger = ledger
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.system_prompt = system_prompt
+        estimated_tokens = _estimate_tokens(messages) + max_tokens
+        self.milp = select_milp_endpoint(task_type, estimated_tokens, ledger=ledger)
+        self.decision = RouteDecision(
+            provider=self.milp.endpoint.name,
+            model=endpoint_model(self.milp.endpoint),
+            task_type=task_type,
+            reason=f"{self.milp.reason}; solver={self.milp.solver}; streamed=True",
+            solver=self.milp.solver,
+            decision_vector=self.milp.decision_vector,
+        )
+        self.text = ""
+
+    def __iter__(self) -> Iterator[str]:
+        for chunk in cortex_stream(
+            self.milp.endpoint,
+            self.messages,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            system_prompt=self.system_prompt,
+        ):
+            self.text += chunk
+            yield chunk
+        if self.ledger is not None:
+            _ensure_cortex_ledger(self.ledger)
+            self.ledger.record(self.milp.endpoint.name, _estimate_tokens(self.messages, self.text))
+
+
 def stream_generation(
     task_type: str,
     messages: Sequence[Mapping[str, str]],
@@ -865,21 +932,82 @@ def stream_generation(
     system_prompt: str = "",
 ) -> Iterator[str]:
     """Select one endpoint with MILP and expose its live text stream."""
-    estimated_tokens = _estimate_tokens(messages) + max_tokens
-    decision = select_milp_endpoint(task_type, estimated_tokens, ledger=ledger)
-    emitted: List[str] = []
-    for chunk in cortex_stream(
-        decision.endpoint,
-        messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        system_prompt=system_prompt,
-    ):
-        emitted.append(chunk)
-        yield chunk
-    if ledger is not None:
-        _ensure_cortex_ledger(ledger)
-        ledger.record(decision.endpoint.name, _estimate_tokens(messages, "".join(emitted)))
+    return iter(CortexStream(task_type, messages, ledger, max_tokens, temperature, system_prompt))
+
+
+# =============================================================================
+# Optional paid reasoning slot (Heavy Mode critique pass only)
+# =============================================================================
+
+PAID_SLOT_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+PAID_SLOT_DEFAULT_MODEL = "o3-mini"
+
+
+@dataclass
+class PaidReasoningSlot:
+    """A per-session paid endpoint for the Heavy Mode critique pass.
+
+    Policy (operator decision, 2026-09-13): the backend is free-tier only.  This
+    slot is the single sanctioned exception and it is deliberately awkward to
+    keep on: the key lives only in this object (never in the environment, the
+    vault, or logs), it must be re-entered every session, and ``enabled`` must
+    be set explicitly each time.  Nothing paid is reachable by default.
+    """
+
+    api_key: str = ""
+    model: str = PAID_SLOT_DEFAULT_MODEL
+    base_url: str = PAID_SLOT_DEFAULT_BASE_URL
+    enabled: bool = False
+
+    @property
+    def armed(self) -> bool:
+        return bool(self.enabled and self.api_key.strip() and self.model.strip())
+
+    def status(self) -> Dict[str, Any]:
+        """Redacted view for UI display; never includes the key."""
+        return {"enabled": bool(self.enabled), "armed": self.armed, "model": self.model, "key_present": bool(self.api_key.strip())}
+
+
+def paid_slot_generate(
+    slot: PaidReasoningSlot,
+    messages: Sequence[Mapping[str, str]],
+    max_tokens: int = 2048,
+    system_prompt: str = "",
+    timeout: Optional[int] = None,
+) -> Tuple[str, RouteDecision]:
+    """One non-streaming call to the armed paid slot (OpenAI-compatible)."""
+    if not slot.armed:
+        raise ProviderError("paid reasoning slot is not armed for this session")
+    if requests is None:
+        raise ProviderError("requests is required for provider HTTP execution")
+    prepared = append_system_prompt(messages, system_prompt)
+    # Reasoning-model APIs reject ``temperature`` and use ``max_completion_tokens``.
+    payload = {"model": slot.model, "messages": prepared, "max_completion_tokens": int(max_tokens)}
+    headers = {"Authorization": f"Bearer {slot.api_key}", "Content-Type": "application/json"}
+    try:
+        response = requests.post(
+            f"{slot.base_url.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=timeout or int(os.environ.get("CHAT_JOHNSON_TIMEOUT", "120")),
+        )
+    except requests.RequestException as exc:
+        raise ProviderError(f"paid slot network error: {exc}") from exc
+    if response.status_code >= 400:
+        detail = response.text[:400].replace(slot.api_key, "[REDACTED_SECRET]")
+        raise ProviderError(f"paid slot HTTP {response.status_code}: {detail}")
+    try:
+        body = response.json()
+        text = str(body["choices"][0]["message"]["content"] or "")
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise ProviderError("paid slot returned an unexpected response shape") from exc
+    return text, RouteDecision(
+        provider="paid_slot",
+        model=slot.model,
+        task_type="reasoning",
+        reason="session-armed paid reasoning slot used for the Heavy Mode critique pass",
+        solver="operator-toggle",
+    )
 
 
 # =============================================================================
@@ -989,8 +1117,13 @@ def _heavy_pipeline(
     task_type: str,
     messages: List[dict],
     max_tokens: int,
+    paid_slot: Optional[PaidReasoningSlot] = None,
 ) -> Tuple[str, RouteDecision]:
-    """Bounded plan/critique/synthesis without exposing private chain-of-thought."""
+    """Bounded plan/critique/synthesis without exposing private chain-of-thought.
+
+    The optional paid slot, when armed for this session, handles only the
+    critique pass; the draft and synthesis always run on free endpoints.
+    """
     draft, draft_decision = one_pass(task_type, messages, max(256, max_tokens // 2))
     critique_messages = [
         {
@@ -1004,7 +1137,10 @@ def _heavy_pipeline(
         {"role": "user", "content": json.dumps({"request": messages, "candidate": draft})},
     ]
     try:
-        critique, critique_decision = one_pass("reasoning", critique_messages, max(256, max_tokens // 3))
+        if paid_slot is not None and paid_slot.armed:
+            critique, critique_decision = paid_slot_generate(paid_slot, critique_messages, max(256, max_tokens // 3))
+        else:
+            critique, critique_decision = one_pass("reasoning", critique_messages, max(256, max_tokens // 3))
     except ProviderError:
         return draft, RouteDecision(
             draft_decision.provider,
@@ -1041,7 +1177,10 @@ def _heavy_pipeline(
             critique_decision.decision_vector,
         )
     final_decision.task_type = task_type
-    final_decision.reason = f"bounded heavy mode: draft -> review -> synthesis; final={final_decision.reason}"
+    final_decision.reason = (
+        f"bounded heavy mode: draft -> review({critique_decision.provider}) -> synthesis; "
+        f"final={final_decision.reason}"
+    )
     return final, final_decision
 
 
@@ -1052,6 +1191,7 @@ def generate_heavy(
     max_tokens: int = 4096,
     temperature: float = 0.2,
     settings: Optional[Settings] = None,
+    paid_slot: Optional[PaidReasoningSlot] = None,
 ) -> Tuple[str, RouteDecision]:
     """Run the legacy-provider bounded Heavy Mode pipeline."""
     return _heavy_pipeline(
@@ -1066,6 +1206,7 @@ def generate_heavy(
         task_type,
         messages,
         max_tokens,
+        paid_slot=paid_slot,
     )
 
 
@@ -1076,6 +1217,7 @@ def generate_cortex_heavy(
     max_tokens: int = 4096,
     temperature: float = 0.2,
     system_prompt: str = "",
+    paid_slot: Optional[PaidReasoningSlot] = None,
 ) -> Tuple[str, RouteDecision]:
     """Run bounded Heavy Mode through the strict Cortex endpoint matrix."""
     return _heavy_pipeline(
@@ -1090,7 +1232,13 @@ def generate_cortex_heavy(
         task_type,
         messages,
         max_tokens,
+        paid_slot=paid_slot,
     )
+
+
+def cortex_available() -> bool:
+    """True when at least one strict Cortex endpoint has a BYOK key."""
+    return any(_endpoint_key(endpoint) for endpoint in CORTEX_ENDPOINTS.values())
 
 
 def generate_mode(
@@ -1101,13 +1249,19 @@ def generate_mode(
     max_tokens: int = 4096,
     temperature: float = 0.2,
     settings: Optional[Settings] = None,
+    paid_slot: Optional[PaidReasoningSlot] = None,
 ) -> Tuple[str, RouteDecision]:
-    """Application entry point: Cortex endpoints first, legacy providers second."""
-    cortex_names = [name for name in CORTEX_ENDPOINTS if _endpoint_key(CORTEX_ENDPOINTS[name])]
-    if cortex_names:
+    """Application entry point: Cortex endpoints first, legacy providers second.
+
+    ``paid_slot`` is only consulted in Heavy Mode and only for the critique
+    pass; Normal mode never touches it.
+    """
+    if cortex_available():
         try:
             if mode == "heavy":
-                return generate_cortex_heavy(task_type, messages, ledger, max_tokens, temperature)
+                return generate_cortex_heavy(
+                    task_type, messages, ledger, max_tokens, temperature, paid_slot=paid_slot
+                )
             return cortex_generate(task_type, messages, ledger, max_tokens, temperature)
         except ProviderError as cortex_error:
             # A strict endpoint can be temporarily unavailable or have a
@@ -1115,7 +1269,9 @@ def generate_mode(
             # as an explicit fallback rather than silently dropping the task.
             try:
                 if mode == "heavy":
-                    return generate_heavy(task_type, messages, ledger, max_tokens, temperature, settings)
+                    return generate_heavy(
+                        task_type, messages, ledger, max_tokens, temperature, settings, paid_slot=paid_slot
+                    )
                 return generate(task_type, messages, ledger, max_tokens, temperature, settings)
             except ProviderError as legacy_error:
                 raise ProviderError(
@@ -1123,5 +1279,5 @@ def generate_mode(
                     f"legacy provider fallback failed ({legacy_error})"
                 ) from legacy_error
     if mode == "heavy":
-        return generate_heavy(task_type, messages, ledger, max_tokens, temperature, settings)
+        return generate_heavy(task_type, messages, ledger, max_tokens, temperature, settings, paid_slot=paid_slot)
     return generate(task_type, messages, ledger, max_tokens, temperature, settings)

@@ -14,16 +14,13 @@ The app is intentionally local-first:
 """
 from __future__ import annotations
 
-import ast
 import hashlib
 import hmac
 import html
 import os
 import re
 import secrets
-import sqlite3
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -59,268 +56,29 @@ from orchestrator.config import PROVIDERS, provider_model
 from orchestrator.executor import Orchestrator
 from orchestrator.quota import QuotaLedger
 from orchestrator.router import (
+    CortexStream,
+    PaidReasoningSlot,
+    ProviderError,
     byok_status,
     classify,
+    cortex_available,
     generate_mode,
 )
 
 
 # =============================================================================
-# Initialization and local source of truth
+# Local source of truth (orchestrator/vault.py)
 # =============================================================================
 
-DB_PATH = Path(os.environ.get("CHAT_JOHNSON_DB_PATH", "chat_johnson_vault.db"))
-MESSAGE_WINDOW = 200
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS message_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
-    content TEXT NOT NULL,
-    timestamp REAL NOT NULL,
-    token_count INTEGER NOT NULL CHECK (token_count >= 0),
-    project_scope TEXT NOT NULL,
-    provider TEXT NOT NULL DEFAULT '',
-    mode TEXT NOT NULL DEFAULT 'normal'
-);
-
-CREATE INDEX IF NOT EXISTS idx_message_scope_time
-    ON message_history(project_scope, timestamp DESC, id DESC);
-
-CREATE TABLE IF NOT EXISTS artifact_store (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    file_path TEXT NOT NULL DEFAULT '',
-    code_body TEXT NOT NULL,
-    structural_summary TEXT NOT NULL,
-    project_scope TEXT NOT NULL,
-    content_hash TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    created_at REAL NOT NULL,
-    source_message_id INTEGER,
-    FOREIGN KEY (source_message_id) REFERENCES message_history(id) ON DELETE SET NULL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_artifact_version
-    ON artifact_store(project_scope, name, file_path, version);
-
-CREATE INDEX IF NOT EXISTS idx_artifact_scope_time
-    ON artifact_store(project_scope, created_at DESC, id DESC);
-
-CREATE TRIGGER IF NOT EXISTS message_history_rolling_cap
-AFTER INSERT ON message_history
-BEGIN
-    DELETE FROM message_history
-    WHERE id IN (
-        SELECT id
-        FROM message_history
-        WHERE project_scope = NEW.project_scope
-        ORDER BY timestamp DESC, id DESC
-        LIMIT -1 OFFSET 200
-    );
-END;
-"""
-
-
-def _open_database() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(DB_PATH), timeout=30.0)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 30000")
-    return connection
-
-
-def initialize_database() -> None:
-    """Create the local schema and rolling-window trigger idempotently."""
-    with _open_database() as connection:
-        connection.executescript(SCHEMA_SQL)
-
-
-def estimate_tokens(text: str) -> int:
-    return max(1, len(text.strip()) // 4) if text.strip() else 0
-
-
-_SECRET_SHAPES = (
-    re.compile(r"(?i)(api[_ -]?key|client[_ -]?secret|access[_ -]?token|bearer)\s*[:=]\s*[^\s,;]+"),
-    re.compile(r"\b(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|AIza[A-Za-z0-9_-]{20,})\b"),
+from orchestrator.vault import (
+    MESSAGE_WINDOW,
+    append_message,
+    context_block,
+    initialize_database,
+    recent_artifacts,
+    recent_messages,
+    save_artifact,
 )
-
-
-def redact_secrets(text: str) -> str:
-    """Remove common pasted credential shapes before local persistence."""
-    redacted = str(text)
-    for pattern in _SECRET_SHAPES:
-        redacted = pattern.sub("[REDACTED_SECRET]", redacted)
-    return redacted
-
-
-def append_message(
-    project_scope: str,
-    role: str,
-    content: str,
-    provider: str = "",
-    mode: str = "normal",
-) -> int:
-    """Insert a scoped message; the SQLite trigger retains the newest 200."""
-    safe_role = role if role in {"user", "assistant", "system"} else "user"
-    safe_content = redact_secrets(content)
-    with _open_database() as connection:
-        cursor = connection.execute(
-            """
-            INSERT INTO message_history
-                (role, content, timestamp, token_count, project_scope, provider, mode)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                safe_role,
-                safe_content,
-                time.time(),
-                estimate_tokens(safe_content),
-                project_scope.strip() or "default",
-                provider[:120],
-                mode[:40],
-            ),
-        )
-        return int(cursor.lastrowid)
-
-
-def recent_messages(project_scope: str, limit: int = MESSAGE_WINDOW) -> List[sqlite3.Row]:
-    bounded_limit = max(1, min(int(limit), MESSAGE_WINDOW))
-    with _open_database() as connection:
-        return list(
-            connection.execute(
-                """
-                SELECT * FROM (
-                    SELECT * FROM message_history
-                    WHERE project_scope = ?
-                    ORDER BY timestamp DESC, id DESC
-                    LIMIT ?
-                )
-                ORDER BY timestamp ASC, id ASC
-                """,
-                (project_scope.strip() or "default", bounded_limit),
-            ).fetchall()
-        )
-
-
-def context_block(project_scope: str, max_characters: int = 24_000) -> str:
-    """Build a bounded prompt context from the active project's local window."""
-    rows = recent_messages(project_scope, MESSAGE_WINDOW)
-    if not rows:
-        return "(no prior messages in this project scope)"
-    lines: List[str] = []
-    used = 0
-    for row in rows:
-        line = f"{row['role'].upper()}: {row['content']}"
-        if used + len(line) + 1 > max_characters:
-            break
-        lines.append(line)
-        used += len(line) + 1
-    return "\n".join(lines)
-
-
-def structural_texturization(code_body: str, language: str = "text") -> str:
-    """Produce a deterministic structural summary for artifact retrieval."""
-    body = str(code_body)
-    lines = body.splitlines()
-    non_empty = [line for line in lines if line.strip()]
-    summary = [f"language={language or 'text'}", f"lines={len(lines)}", f"non_empty={len(non_empty)}"]
-    if language.lower() in {"py", "python", "python3", "file: py"}:
-        try:
-            tree = ast.parse(body)
-            functions = [node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
-            classes = [node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
-            imports = []
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    imports.extend(alias.name for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    imports.append(node.module)
-            summary.extend(
-                [
-                    f"functions={','.join(functions[:20]) or '(none)'}",
-                    f"classes={','.join(classes[:20]) or '(none)'}",
-                    f"imports={','.join(imports[:20]) or '(none)'}",
-                    "syntax=valid",
-                ]
-            )
-        except SyntaxError as exc:
-            summary.append(f"syntax=invalid line {exc.lineno}: {exc.msg}")
-    else:
-        definitions = re.findall(r"(?m)^\s*(?:function|class|def)\s+([A-Za-z_][\w-]*)", body)
-        headings = re.findall(r"(?m)^\s*#{1,6}\s+(.+?)\s*$", body)
-        if definitions:
-            summary.append(f"definitions={','.join(definitions[:20])}")
-        if headings:
-            summary.append(f"headings={'; '.join(headings[:10])}")
-    return " | ".join(summary)
-
-
-def save_artifact(
-    project_scope: str,
-    name: str,
-    file_path: str,
-    code_body: str,
-    language: str,
-    source_message_id: Optional[int] = None,
-) -> Tuple[int, int]:
-    """Commit an immutable, versioned artifact in one SQLite transaction."""
-    safe_scope = project_scope.strip() or "default"
-    safe_name = (name.strip() or "untitled-artifact")[:240]
-    safe_path = file_path.strip()[:500]
-    safe_body = redact_secrets(code_body)
-    digest = hashlib.sha256(safe_body.encode("utf-8")).hexdigest()
-    summary = structural_texturization(safe_body, language)
-    with _open_database() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        row = connection.execute(
-            """
-            SELECT COALESCE(MAX(version), 0) + 1 AS next_version
-            FROM artifact_store
-            WHERE project_scope = ? AND name = ? AND file_path = ?
-            """,
-            (safe_scope, safe_name, safe_path),
-        ).fetchone()
-        version = int(row["next_version"])
-        cursor = connection.execute(
-            """
-            INSERT INTO artifact_store
-                (name, file_path, code_body, structural_summary, project_scope,
-                 content_hash, version, created_at, source_message_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                safe_name,
-                safe_path,
-                safe_body,
-                summary,
-                safe_scope,
-                digest,
-                version,
-                time.time(),
-                source_message_id,
-            ),
-        )
-        connection.commit()
-        return int(cursor.lastrowid), version
-
-
-def recent_artifacts(project_scope: str, limit: int = 8) -> List[sqlite3.Row]:
-    with _open_database() as connection:
-        return list(
-            connection.execute(
-                """
-                SELECT id, name, file_path, version, structural_summary, created_at
-                FROM artifact_store
-                WHERE project_scope = ?
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?
-                """,
-                (project_scope.strip() or "default", max(1, min(int(limit), 50))),
-            ).fetchall()
-        )
-
 
 initialize_database()
 
@@ -352,6 +110,20 @@ def configured_provider_names() -> List[str]:
 
 def active_mode() -> str:
     return "heavy" if st.session_state.get("heavy_mode", False) else "normal"
+
+
+def session_paid_slot() -> PaidReasoningSlot:
+    """Build the per-session paid slot from session state only.
+
+    The key is never read from the environment and never persisted. Both the
+    toggle and the key must be supplied in this browser session for the slot
+    to arm, and the slot is consulted only by the Heavy Mode critique pass.
+    """
+    return PaidReasoningSlot(
+        api_key=str(st.session_state.get("paid_slot_key", "") or ""),
+        model=str(st.session_state.get("paid_slot_model", "o3-mini") or "o3-mini").strip() or "o3-mini",
+        enabled=bool(st.session_state.get("paid_slot_enabled", False)),
+    )
 
 
 def provider_status_rows() -> List[Tuple[str, str, str, bool]]:
@@ -720,19 +492,40 @@ def run_generation(
     mode = active_mode()
     user_message_id = append_message(project_scope, "user", clean_prompt, mode=mode)
     messages = build_prompt_messages(project_scope, clean_prompt, injected_context)
+    max_tokens = int(st.session_state.get("max_tokens", 2048))
+    live_box = st.empty()
     try:
-        answer, decision = generate_mode(
-            mode,
-            task_type,
-            messages,
-            ledger,
-            max_tokens=int(st.session_state.get("max_tokens", 2048)),
-            temperature=0.2 if mode == "heavy" else 0.35,
-        )
+        if mode == "normal" and cortex_available():
+            # Normal mode streams token-by-token from the MILP-selected endpoint.
+            try:
+                stream = CortexStream(task_type, messages, ledger, max_tokens=max_tokens, temperature=0.35)
+                with live_box.container():
+                    with st.chat_message("assistant"):
+                        st.caption(f"{stream.decision.provider}/{stream.decision.model} · streaming")
+                        st.write_stream(stream)
+                answer, decision = stream.text, stream.decision
+            except ProviderError:
+                # Strict endpoint failed mid-flight; use the blocking path with fallback.
+                live_box.empty()
+                answer, decision = generate_mode(mode, task_type, messages, ledger, max_tokens=max_tokens, temperature=0.35)
+        else:
+            with live_box.container():
+                st.info("Heavy Mode: draft → review → synthesis in progress…" if mode == "heavy" else "Generating…")
+            answer, decision = generate_mode(
+                mode,
+                task_type,
+                messages,
+                ledger,
+                max_tokens=max_tokens,
+                temperature=0.2 if mode == "heavy" else 0.35,
+                paid_slot=session_paid_slot() if mode == "heavy" else None,
+            )
     except Exception as exc:
+        live_box.empty()
         append_message(project_scope, "assistant", f"Provider error: {exc}", mode=mode)
         st.error(f"Generation failed: {exc}")
         return user_message_id
+    live_box.empty()
     assistant_id = append_message(
         project_scope,
         "assistant",
@@ -857,6 +650,7 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
         request_lock = get_task_request_lock()
         task_mode = active_mode()
         task_token_budget = int(st.session_state.get("max_tokens", 1536))
+        task_paid_slot = session_paid_slot() if task_mode == "heavy" else None
 
         def worker(step: Mapping[str, Any]) -> Tuple[int, str, str, str]:
             messages = build_prompt_messages(project_scope, str(step["description"]))
@@ -870,6 +664,7 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
                     ledger,
                     max_tokens=task_token_budget,
                     temperature=0.2,
+                    paid_slot=task_paid_slot,
                 )
             return int(step["id"]), answer, decision.provider, decision.model
 
@@ -940,6 +735,22 @@ with st.sidebar:
         "Heavy Mode is an auditable multi-pass policy, not an exposed chain-of-thought channel. "
         "It uses only configured BYOK providers."
     )
+    with st.expander("Paid reasoning slot (Heavy Mode critique only)", expanded=False):
+        st.caption(
+            "Backend is free-tier only. This optional slot must be switched on AND given a key "
+            "every session; it is never saved, never read from the environment, and only the "
+            "Heavy Mode review pass uses it."
+        )
+        st.checkbox("Enable paid slot for this session", key="paid_slot_enabled", value=False)
+        st.text_input("Paid slot API key (session memory only)", key="paid_slot_key", type="password", value="")
+        st.text_input("Paid slot model", key="paid_slot_model", value="o3-mini")
+        slot_status = session_paid_slot().status()
+        if slot_status["armed"]:
+            st.warning(f"ARMED: {slot_status['model']} will be billed for Heavy Mode review passes this session.")
+        elif slot_status["enabled"] and not slot_status["key_present"]:
+            st.info("Toggle is on but no key was entered; the slot stays disarmed.")
+        else:
+            st.caption("Disarmed. Nothing paid is reachable.")
     st.divider()
     st.subheader("BYOK channels")
     for name, label, detail, configured in provider_status_rows():
