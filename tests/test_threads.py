@@ -1,4 +1,5 @@
 """Threads, health sweep, vision digest, and optimized migration."""
+import json
 import os
 import sys
 
@@ -261,3 +262,37 @@ def test_task_type_survives_archiving_by_clear_and_by_window_eviction(db):
         db.append_message(scope, "user", f"m{index}", task_type="code_patch")
     evicted = db.archived_messages(scope, 5000, thread_id=thread_id)
     assert len(evicted) > 1 and all(r["task_type"] == "code_patch" for r in evicted[1:])
+
+
+def test_export_thread_orders_archive_then_live_and_keeps_secrets_out(db):
+    scope = "x"
+    thread_id = db.active_thread(scope)["id"]
+    db.append_message(scope, "user", "my key is gsk_abcdefghijklmnopqrstuvwxyz123456 ok", task_type="chat")
+    db.clear_thread(thread_id)
+    fill(db, scope, 3, thread_id=thread_id)
+    payload = db.export_thread(thread_id)
+    ids = [m["id"] for m in payload["messages"]]
+    assert ids == sorted(ids) and len(ids) == 4
+    assert payload["messages"][0]["archived"] is True and payload["messages"][-1]["archived"] is False
+    assert payload["messages"][0]["task_type"] == "chat"
+    name, markdown = db.thread_transcript(thread_id, "markdown")
+    assert name == f"chat-normal_chat-{thread_id}.md"
+    assert "Main thread" in markdown and "### 1. USER" in markdown and "archived" in markdown
+    assert "gsk_abcdefghijklmnopqrstuvwxyz123456" not in markdown
+    name, body = db.thread_transcript(thread_id, "json")
+    data = json.loads(body)
+    assert name.endswith(".json") and data["thread"]["id"] == thread_id and len(data["messages"]) == 4
+    with pytest.raises(ValueError):
+        db.export_thread(999_999)
+
+
+def test_export_thread_includes_summaries_and_inherited_digest(db):
+    scope = "y"
+    fill(db, scope, db.MESSAGE_WINDOW + 5, text="we decided item {i} stays free-tier")
+    thread_id = db.active_thread(scope)["id"]
+    payload = db.export_thread(thread_id)
+    assert payload["summaries"] and payload["summaries"][0]["message_count"] > 0
+    assert len(payload["messages"]) == db.MESSAGE_WINDOW + 5
+    result = db.migrate_thread(scope)
+    successor = db.export_thread(result["new_thread_id"])
+    assert successor["digest"] and "Inherited vision digest" in db.thread_transcript(result["new_thread_id"])[1]

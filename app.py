@@ -116,6 +116,7 @@ from orchestrator.vault import (
     set_thread_mission,
     switch_thread,
     thread_health,
+    thread_transcript,
 )
 
 initialize_database()
@@ -861,6 +862,13 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
                 f"Optimized from #{last_migration['old_thread_id']} · digest artifact "
                 f"{last_migration['digest_artifact_id']} · {last_migration['method']}"
             )
+        st.caption("Download this chat (archive, summaries, and digest included) for review or hand-off.")
+        md_name, md_body = thread_transcript(int(current["id"]), "markdown")
+        js_name, js_body = thread_transcript(int(current["id"]), "json")
+        st.download_button("⬇ Chat (.md)", data=md_body, file_name=md_name, mime="text/markdown",
+                           key=f"download_md_{workspace}_{current['id']}", use_container_width=True)
+        st.download_button("⬇ Chat (.json)", data=js_body, file_name=js_name, mime="application/json",
+                           key=f"download_json_{workspace}_{current['id']}", use_container_width=True)
 
     pending_delete = st.session_state.get(f"confirm_delete_{workspace}")
     if pending_delete == int(current["id"]):

@@ -89,7 +89,9 @@ code block (versioned save to SQLite), output token budget slider, per-project s
 Every workspace holds any number of **chats** (threads). The row at the top of each workspace lets you
 switch, start a new one, **Clear chat** (messages move to the archive and leave the context; keys are
 untouched), or **Delete chat** (the chat, its archive, and its summaries are removed after a
-confirmation; locked artifacts stay). Rename and Migrate now live under More.
+confirmation; locked artifacts stay). Rename, Migrate now, and **Download this chat** (Markdown or JSON,
+with the archive, summaries, and inherited digest) live under More. Commit a download to a `transcripts/`
+folder in the repository to hand a full conversation to the assistant for an audit without pasting it.
 
 Every send is traced in the **Routing log** on the right (workspace, task type, provider/model,
 latency, solver reason) and stored with its task type on the message, so routing can be judged

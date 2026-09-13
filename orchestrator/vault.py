@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -750,6 +751,91 @@ def export_artifact(artifact_id: int) -> Tuple[str, str]:
     stem, dot, ext = filename.rpartition(".")
     filename = f"{stem}.v{row['version']}.{ext}" if dot else f"{filename}.v{row['version']}"
     return filename, str(row["code_body"])
+
+
+def export_thread(thread_id: int) -> Dict[str, Any]:
+    """Everything one chat holds, for review or hand-off: thread row, archived + live messages in order, summaries, digest.
+
+    Nothing is written; content was redacted when it was stored, so an export never carries a key.
+    """
+    thread = thread_by_id(int(thread_id))
+    if thread is None:
+        raise ValueError(f"thread {int(thread_id)} does not exist")
+    scope = str(thread["project_scope"])
+    fields = ("id", "role", "content", "timestamp", "token_count", "provider", "mode", "task_type")
+
+    def message(row: sqlite3.Row, archived: bool) -> Dict[str, Any]:
+        item = {name: (row[name] if name in row.keys() else "") for name in fields}
+        item["archived"] = archived
+        return item
+
+    messages = [message(row, True) for row in archived_messages(scope, 5000, thread_id=int(thread_id))]
+    messages += [message(row, False) for row in recent_messages(scope, MESSAGE_WINDOW, thread_id=int(thread_id))]
+    messages.sort(key=lambda item: int(item["id"]))
+    summaries = [
+        {name: row[name] for name in ("id", "covers_from_id", "covers_to_id", "message_count", "content", "method", "created_at")}
+        for row in reversed(recent_summaries(scope, 50, thread_id=int(thread_id)))
+    ]
+    digest = ""
+    if thread["digest_artifact_id"]:
+        artifact = artifact_by_id(int(thread["digest_artifact_id"]))
+        digest = str(artifact["code_body"]) if artifact is not None else ""
+    return {
+        "thread": {name: thread[name] for name in thread.keys()},
+        "messages": messages,
+        "summaries": summaries,
+        "digest": digest,
+        "exported_at": time.time(),
+    }
+
+
+def _stamp(value: Any) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(float(value)))
+    except (TypeError, ValueError):
+        return "-"
+
+
+def thread_transcript(thread_id: int, fmt: str = "markdown") -> Tuple[str, str]:
+    """Return (filename, body) for a chat download: ``markdown`` for reading, ``json`` for tooling."""
+    payload = export_thread(thread_id)
+    thread = payload["thread"]
+    stem = f"chat-{_workspace(thread.get('workspace'))}-{int(thread['id'])}"
+    if fmt == "json":
+        return f"{stem}.json", json.dumps(payload, indent=2, ensure_ascii=False)
+    lines = [
+        f"# Chat Johnson transcript · {_workspace(thread.get('workspace'))} · #{int(thread['id'])} {thread.get('title', '')}",
+        "",
+        f"- scope: {thread.get('project_scope', '')}",
+        f"- status: {thread.get('status', '')} · generation {thread.get('generation', 1)}",
+        f"- mission: {thread.get('mission') or '(none)'}",
+        f"- exported: {_stamp(payload['exported_at'])}",
+        "",
+    ]
+    if payload["digest"]:
+        lines += ["## Inherited vision digest", "", payload["digest"], ""]
+    if payload["summaries"]:
+        lines += ["## Texturized summaries", ""]
+        for summary in payload["summaries"]:
+            lines += [
+                f"### Summary #{summary['id']} · {summary['message_count']} messages "
+                f"(ids {summary['covers_from_id']}-{summary['covers_to_id']}) · {summary['method']} · {_stamp(summary['created_at'])}",
+                "",
+                str(summary["content"]),
+                "",
+            ]
+    lines += ["## Messages", ""]
+    for index, item in enumerate(payload["messages"], start=1):
+        meta = [str(item["role"]).upper(), _stamp(item["timestamp"])]
+        if item["provider"]:
+            meta.append(str(item["provider"]))
+        if item["task_type"]:
+            meta.append(f"task {item['task_type']}")
+        meta.append(str(item["mode"]))
+        if item["archived"]:
+            meta.append("archived")
+        lines += [f"### {index}. " + " · ".join(meta), "", str(item["content"]), ""]
+    return f"{stem}.md", "\n".join(lines)
 
 
 def recent_artifacts(project_scope: str, limit: int = 8) -> List[sqlite3.Row]:
