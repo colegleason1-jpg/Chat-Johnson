@@ -921,3 +921,36 @@ def test_error_bodies_are_decoded_as_utf8():
         text = "plain"
 
     assert providers.body_text(TextOnly()) == "plain"
+
+
+def test_finish_reason_is_normalized_for_openai_and_gemini_streams(all_keys, monkeypatch):
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        if "generativelanguage" in url:
+            return FakeResponse(lines=sse(
+                {"candidates": [{"content": {"parts": [{"text": "long"}]}}]},
+                {"candidates": [{"content": {"parts": [{"text": " answer"}]}, "finishReason": "MAX_TOKENS"}]},
+            ))
+        return FakeResponse(lines=sse(
+            {"choices": [{"delta": {"content": "cut"}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]},
+        ))
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    text, decision = cortex_generate("quick_text", [{"role": "user", "content": "x"}], max_tokens=16)
+    assert text == "cut" and decision.provider == "groq" and decision.finish == "length"
+    text, decision = cortex_generate("context_load", [{"role": "user", "content": "x"}], max_tokens=16)
+    assert text == "long answer" and decision.provider == "google_ai_studio" and decision.finish == "length"
+    stream = router.CortexStream("quick_text", [{"role": "user", "content": "x"}], max_tokens=16)
+    assert stream.decision.finish == ""
+    assert "".join(stream) == "cut" and stream.decision.finish == "length"
+
+
+def test_finish_reason_stop_and_filter(all_keys, monkeypatch):
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: FakeResponse(lines=sse(
+        {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]})))
+    _, decision = cortex_generate("quick_text", [{"role": "user", "content": "x"}], max_tokens=16)
+    assert decision.finish == "stop"
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: FakeResponse(lines=sse(
+        {"choices": [{"delta": {"content": "partial"}, "finish_reason": "content_filter"}]})))
+    _, decision = cortex_generate("quick_text", [{"role": "user", "content": "x"}], max_tokens=16)
+    assert decision.finish == "filtered"

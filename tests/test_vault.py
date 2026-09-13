@@ -146,3 +146,31 @@ def test_context_block_truncates_a_single_oversized_newest_row(db):
     block = db.context_block("scope", max_characters=2000)
     assert 0 < len(block) <= 2000
     assert block.startswith("ASSISTANT: yyy") and block.endswith("[TRUNCATED]")
+
+
+def test_context_parts_splits_memory_from_live_turns_in_order(db):
+    db.append_message("scope", "user", "first question")
+    db.append_message("scope", "assistant", "first answer", provider="groq/x")
+    db.append_message("scope", "system", "Thread migrated note")
+    db.append_message("scope", "user", "second question")
+    parts = db.context_parts("scope")
+    assert [t["role"] for t in parts["turns"]] == ["user", "assistant", "user"]
+    assert parts["turns"][0]["content"] == "first question" and parts["turns"][-1]["content"] == "second question"
+    assert "[NOTE] Thread migrated note" in parts["memory"]
+    assert parts["empty"] is False
+    assert db.context_parts("nothing-here")["empty"] is True
+
+
+def test_alternating_turns_merges_neighbours_and_hands_back_a_leading_reply():
+    turns = [
+        {"role": "assistant", "content": "older reply"},
+        {"role": "user", "content": "a"},
+        {"role": "user", "content": "b"},
+        {"role": "assistant", "content": "c"},
+        {"role": "user", "content": "unanswered"},
+    ]
+    leading, merged = vault.alternating_turns(turns, "now")
+    assert leading == "older reply"
+    assert [t["role"] for t in merged] == ["user", "assistant", "user"]
+    assert merged[0]["content"] == "a\n\nb" and merged[-1]["content"] == "unanswered\n\nnow"
+    assert vault.alternating_turns([], "solo") == ("", [{"role": "user", "content": "solo"}])

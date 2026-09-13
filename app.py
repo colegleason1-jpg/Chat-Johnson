@@ -89,6 +89,7 @@ from orchestrator.router import (
 # Local source of truth (orchestrator/vault.py)
 # =============================================================================
 
+from orchestrator.capabilities import capability_card
 from orchestrator.connectors import ROADMAP_FEATURES, connector_status
 from orchestrator.github_auth import mint_state, verify_state
 from orchestrator.missions import MISSION_TEMPLATES, classify_mission, task_plan
@@ -97,10 +98,11 @@ from orchestrator.vault import (
     MESSAGE_WINDOW,
     WORKSPACES as VAULT_WORKSPACES,
     active_thread,
+    alternating_turns,
     append_message,
     archived_messages,
     clear_thread,
-    context_block,
+    context_parts,
     delete_thread,
     create_thread,
     export_artifact,
@@ -238,26 +240,39 @@ def provider_status_rows() -> List[Tuple[str, str, str, bool]]:
     return rows
 
 
+SYSTEM_PERSONA = (
+    "You are Chat Johnson, a careful software and strategy assistant. "
+    "Return useful, complete output, state uncertainty, and never claim "
+    "that generated code is flawless or that a scientific simulation proves "
+    "physical propulsion. Do not reveal private chain-of-thought."
+)
+
+
 def build_prompt_messages(
     project_scope: str,
     user_prompt: str,
     injected_context: str = "",
     workspace: Optional[str] = None,
 ) -> List[Dict[str, str]]:
-    system = (
-        "You are Chat Johnson, a careful software and strategy assistant. "
-        "Return useful, complete output, state uncertainty, and never claim "
-        "that generated code is flawless or that a scientific simulation proves "
-        "physical propulsion. Do not reveal private chain-of-thought."
-    )
+    """System prompt (persona, capability card, compressed memory) followed by the live window as real turns.
+
+    Earlier turns go in as user/assistant messages rather than a text dump, so the model treats
+    them as conversation instead of imitating a transcript format.
+    """
     # Sized so the request fits every keyed endpoint's TPM ceiling at the current output budget.
     context_chars = prompt_context_chars(int(st.session_state.get("max_tokens", 2048)))
-    context = context_block(project_scope, max_characters=context_chars, workspace=workspace)
-    parts = [f"ACTIVE PROJECT: {project_scope}", "PROJECT MEMORY:\n" + context]
+    parts = context_parts(project_scope, max_characters=context_chars, workspace=workspace)
+    request = user_prompt.strip()
     if injected_context.strip():
-        parts.append("USER-CONSENTED FILE INJECTIONS:\n" + injected_context)  # already budgeted per file
-    parts.append("CURRENT REQUEST:\n" + user_prompt.strip())
-    return [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}]
+        request = "USER-CONSENTED FILE INJECTIONS:\n" + injected_context + "\n\nCURRENT REQUEST:\n" + request  # budgeted per file
+    leading, turns = alternating_turns(parts["turns"], request)
+    memory = parts["memory"]
+    if leading:
+        memory = (memory + "\n" if memory else "") + "[EARLIER ASSISTANT REPLY]\n" + leading
+    system = f"{SYSTEM_PERSONA}\n\n{capability_card()}\n\nACTIVE PROJECT: {project_scope}"
+    if memory:
+        system += "\n\nPROJECT MEMORY (compressed earlier history, for reference only; never imitate its format):\n" + memory
+    return [{"role": "system", "content": system}, *turns]
 
 
 DIGEST_REFINE_PROMPT = (
@@ -731,10 +746,18 @@ def run_generation(
         workspace=workspace,
         task_type=task_type,
     )
-    log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason)
+    log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started,
+              decision.reason + (f"; finish={decision.finish}" if decision.finish else ""))
     with st.chat_message("assistant"):
         st.caption(f"{decision.provider}/{decision.model} · {task_type} · {mode}")
         render_output_with_artifacts(answer, project_scope, assistant_id, f"message-{assistant_id}")
+    if decision.finish == "length":
+        st.warning(
+            f"This answer stopped at the output budget ({max_tokens} tokens). Raise 'Output token budget' in the "
+            "sidebar for longer answers, or send 'continue'."
+        )
+    elif decision.finish == "filtered":
+        st.info("The provider filtered part of this answer under its content policy.")
     extracted = extract_preview_source(answer)
     if extracted:  # never wipe what the operator typed into the canvas
         st.session_state.preview_source = extracted
@@ -1018,7 +1041,7 @@ def execute_mission(
     request_lock = get_task_request_lock()
     token_budget = int(st.session_state.get("max_tokens", 2048))
     paid_slot = session_paid_slot() if task_mode == "heavy" else None
-    succeeded = failed = 0
+    succeeded = failed = truncated = 0
     failures: List[Tuple[str, str]] = []
     for finished, step in enumerate(plan, start=1):
         started = time.perf_counter()
@@ -1050,6 +1073,7 @@ def execute_mission(
             log_route("task_finder", step_type, f"{decision.provider}/{decision.model}", task_mode, started, decision.reason)
             st.session_state.last_decision = decision
             succeeded += 1
+            truncated += int(decision.finish == "length")
         except Exception as exc:
             failed += 1
             failures.append((str(step["title"]), str(exc)[:600]))
@@ -1058,7 +1082,10 @@ def execute_mission(
     if succeeded:
         # Pinned only once there is something to continue from; an all-failed launch leaves the next message free to be a new mission.
         set_thread_mission(thread_id, goal)
-    return {"thread_id": thread_id, "goal": goal, "steps": len(plan), "succeeded": succeeded, "failed": failed, "failures": failures}
+    return {
+        "thread_id": thread_id, "goal": goal, "steps": len(plan), "succeeded": succeeded, "failed": failed,
+        "truncated": truncated, "failures": failures,
+    }
 
 
 def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, pending: Dict[int, str]) -> None:
@@ -1149,6 +1176,8 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
             st.error(f"All {launch['failed']} workstream(s) failed. Each error is below; fix keys or adjust the mission and send it again.")
         else:
             st.warning(f"{launch['succeeded']} workstream(s) succeeded, {launch['failed']} failed. The failed steps are below.")
+        if launch.get("truncated"):
+            st.caption(f"{launch['truncated']} workstream(s) stopped at the output budget; raise it in the sidebar for fuller results.")
         for title, error in launch["failures"]:
             with st.expander(f"{title} · failed", expanded=False):
                 st.code(error)

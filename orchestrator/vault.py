@@ -17,7 +17,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 DEFAULT_DB_PATH = "chat_johnson_vault.db"
@@ -580,10 +580,16 @@ def recent_messages(
         )
 
 
-def context_block(
+def context_parts(
     project_scope: str, max_characters: int = 24_000, thread_id: Optional[int] = None, workspace: Optional[str] = None
-) -> str:
-    """Bounded prompt context for one thread: inherited digest, then summaries, then the live window."""
+) -> Dict[str, Any]:
+    """Prompt memory for one thread, split for role-based prompting.
+
+    ``memory`` holds the inherited digest, texturized summaries, and system notes (for the
+    system prompt); ``turns`` holds the live window as user/assistant turns in order.
+    Budgets: digest <= 1/4, summaries <= 1/4, the live window gets the rest and fills
+    newest-first; a single oversized newest turn is truncated rather than dropped.
+    """
     scope = project_scope.strip() or "default"
     thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope, workspace)
     resolved_thread = int(thread["id"]) if thread is not None else None
@@ -594,39 +600,77 @@ def context_block(
         parent_digest = artifact_by_id(int(thread["digest_artifact_id"]))
         if parent_digest is not None:
             digest = str(parent_digest["code_body"])
-    if not rows and not summaries and not digest:
-        return "(no prior messages in this project scope)"
-    lines: List[str] = []
+    memory_lines: List[str] = []
     used = 0
-    # Independent budgets: digest <= 1/4, summaries <= 1/4, the live window gets the rest.
     digest_budget = max_characters // 4
     summary_budget = max_characters // 4
     if digest:
         line = "[THREAD VISION DIGEST inherited from the previous thread]\n" + digest[:digest_budget]
-        lines.append(line)
+        memory_lines.append(line)
         used += len(line) + 1
     summary_used = 0
     for summary in summaries:
         line = f"[TEXTURIZED SUMMARY of {summary['message_count']} earlier messages]\n{summary['content']}"
         if summary_used + len(line) + 1 > summary_budget:
             break
-        lines.append(line)
+        memory_lines.append(line)
         summary_used += len(line) + 1
     used += summary_used
-    # The live window fills newest-first so a follow-up always sees the latest results;
-    # the kept rows are emitted in chronological order.
     remaining = max_characters - used
-    window: List[str] = []
+    window: List[Tuple[str, str]] = []
     for row in reversed(rows):
-        line = f"{row['role'].upper()}: {row['content']}"
-        if len(line) + 1 > remaining:
+        role = str(row["role"])
+        content = str(row["content"])
+        prefix = len(role.upper()) + 2
+        if prefix + len(content) + 1 > remaining:
             marker = " [TRUNCATED]"
             if not window and remaining > 200 + len(marker):
-                window.append(line[: remaining - 1 - len(marker)] + marker)
+                window.append((role, content[: remaining - 1 - prefix - len(marker)] + marker))
             break
-        window.append(line)
-        remaining -= len(line) + 1
-    lines.extend(reversed(window))
+        window.append((role, content))
+        remaining -= prefix + len(content) + 1
+    window.reverse()
+    turns: List[Dict[str, str]] = []
+    for role, content in window:
+        if role in ("user", "assistant"):
+            turns.append({"role": role, "content": content})
+        else:
+            memory_lines.append(f"[NOTE] {content}")
+    return {
+        "memory": "\n".join(memory_lines),
+        "turns": turns,
+        "empty": not rows and not summaries and not digest,
+    }
+
+
+def alternating_turns(turns: Sequence[Mapping[str, str]], request: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Strict user/assistant alternation ending with ``request`` as the final user turn.
+
+    Gemini rejects consecutive same-role turns and a leading model turn, so same-role
+    neighbours are joined and a leading assistant reply is handed back for the memory block.
+    """
+    merged: List[Dict[str, str]] = []
+    for turn in list(turns) + [{"role": "user", "content": request}]:
+        item = {"role": str(turn["role"]), "content": str(turn["content"])}
+        if merged and merged[-1]["role"] == item["role"]:
+            merged[-1] = {"role": item["role"], "content": merged[-1]["content"] + "\n\n" + item["content"]}
+        else:
+            merged.append(item)
+    leading = ""
+    if merged and merged[0]["role"] == "assistant":
+        leading = merged.pop(0)["content"]
+    return leading, merged
+
+
+def context_block(
+    project_scope: str, max_characters: int = 24_000, thread_id: Optional[int] = None, workspace: Optional[str] = None
+) -> str:
+    """Bounded prompt context as one text block: memory first, then the live window as ROLE: lines."""
+    parts = context_parts(project_scope, max_characters=max_characters, thread_id=thread_id, workspace=workspace)
+    if parts["empty"]:
+        return "(no prior messages in this project scope)"
+    lines = [parts["memory"]] if parts["memory"] else []
+    lines.extend(f"{turn['role'].upper()}: {turn['content']}" for turn in parts["turns"])
     return "\n".join(lines)
 
 

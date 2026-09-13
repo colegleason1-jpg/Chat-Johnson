@@ -1007,6 +1007,22 @@ def build_cortex_request(
     )
 
 
+def _extract_finish(selected: CortexEndpoint, payload: Mapping[str, Any]) -> str:
+    """Normalize the vendor's finish reason: 'length' for an output-budget cut, 'filtered' for a safety cut."""
+    if selected.kind == "gemini":
+        candidates = payload.get("candidates", [])
+        raw = str(candidates[0].get("finishReason") or "") if candidates else ""
+    else:
+        choices = payload.get("choices", [])
+        raw = str(choices[0].get("finish_reason") or "") if choices else ""
+    raw = raw.strip().lower()
+    if raw in ("length", "max_tokens"):
+        return "length"
+    if raw in ("content_filter", "safety", "recitation", "blocklist", "prohibited_content", "spii"):
+        return "filtered"
+    return raw
+
+
 def _extract_stream_text(selected: CortexEndpoint, payload: Mapping[str, Any]) -> str:
     if selected.kind == "gemini":
         candidates = payload.get("candidates", [])
@@ -1053,8 +1069,11 @@ def cortex_stream(
     system_prompt: str = "",
     timeout: Optional[int] = None,
     ledger: Optional[QuotaLedger] = None,
+    status: Optional[Dict[str, Any]] = None,
 ) -> Iterator[str]:
     """Yield generated text chunks from a MILP-selected provider endpoint.
+
+    ``status`` (when given) receives ``finish`` once the vendor reports why the answer ended.
 
     Transient vendor errors are retried with backoff, a retired model id is
     replaced from the vendor's live list, and an overloaded model falls back
@@ -1071,6 +1090,9 @@ def cortex_stream(
     emitted = False
     try:
         for payload_item in _iter_sse_payloads(response):
+            finish = _extract_finish(selected, payload_item)
+            if finish and status is not None:
+                status["finish"] = finish
             chunk = _extract_stream_text(selected, payload_item)
             if chunk:
                 emitted = True
@@ -1173,6 +1195,7 @@ def cortex_generate(
             raise selection_error
         endpoint = decision.endpoint
         attempted.append(endpoint.name)
+        status: Dict[str, Any] = {}
         try:
             chunks = cortex_stream(
                 endpoint,
@@ -1181,12 +1204,14 @@ def cortex_generate(
                 temperature=temperature,
                 system_prompt=system_prompt,
                 ledger=ledger,
+                status=status,
             )
             text = strip_reasoning_tags("".join(chunks))
             tokens = _estimate_tokens(messages, text)
             if ledger is not None:
                 ledger.record(_vendor(endpoint), tokens, count_request=False)
             route_decision = RouteDecision(
+                finish=str(status.get("finish", "")),
                 provider=endpoint.name,
                 model=endpoint_model(endpoint),
                 task_type=task_type,
@@ -1236,6 +1261,7 @@ class CortexStream:
             decision_vector=self.milp.decision_vector,
         )
         self.text = ""
+        self.status: Dict[str, Any] = {}
 
     def _raw(self) -> Iterator[str]:
         for chunk in cortex_stream(
@@ -1245,6 +1271,7 @@ class CortexStream:
             temperature=self.temperature,
             system_prompt=self.system_prompt,
             ledger=self.ledger,
+            status=self.status,
         ):
             self.text += chunk
             yield chunk
@@ -1253,6 +1280,7 @@ class CortexStream:
         # Hidden reasoning is filtered live, not only after the stream ends.
         yield from _visible_chunks(self._raw())
         self.text = strip_reasoning_tags(self.text)
+        self.decision.finish = str(self.status.get("finish", ""))
         if self.ledger is not None:
             self.ledger.record(_vendor(self.milp.endpoint), _estimate_tokens(self.messages, self.text), count_request=False)
 
@@ -1489,6 +1517,7 @@ class RouteDecision:
     reason: str
     solver: str = "heuristic"
     decision_vector: Dict[str, int] = field(default_factory=dict)
+    finish: str = ""  # "length" when the output budget cut the answer, "filtered" when the vendor did, else vendor value
 
 
 def classify(text: str) -> str:
