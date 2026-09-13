@@ -35,7 +35,7 @@ push only on a button press); the automation lives **inside Repository Work**; t
 - **Phase 3 · GitHub push, session-only (shipped)**: toggle + token, branch + PR via the GitHub REST API
   with `requests`, revert PR; boundary text in README, sidebar, and the capability card updated
   the day it ships.
-- **Phase 4 · Observability for the app**: routing telemetry persisted to the vault, an Ops
+- **Phase 4 · Observability for the app (shipped)**: routing telemetry persisted to the vault, an Ops
   panel (error rate, latency per endpoint), transcript and telemetry export.
 
 Out of scope on the free tier: running `terraform apply`, `helm install`, or `docker build`
