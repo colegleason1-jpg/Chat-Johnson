@@ -21,7 +21,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
@@ -91,6 +91,7 @@ from orchestrator.router import (
 
 from orchestrator.capabilities import capability_card
 from orchestrator.connectors import ROADMAP_FEATURES, connector_status
+from orchestrator.deploykit import CLOUDS, LANGUAGES, TARGETS, KitSpec, generate_kit, kit_zip, summarize, validate_kit
 from orchestrator.github_auth import mint_state, verify_state
 from orchestrator.missions import MISSION_TEMPLATES, classify_mission, task_plan
 from orchestrator.preview import extract_preview_source, safe_preview_document
@@ -571,8 +572,78 @@ def render_repository_work(project_scope: str, ledger: QuotaLedger, submission: 
                     status.update(label="Pipeline stopped", state="error")
                     st.error(f"Repository pipeline failed: {exc}")
     st.divider()
+    render_deploy_kit(project_scope)
+    st.divider()
     render_history(project_scope, "Repository conversation", workspace="repository")
     dispatch_chat(project_scope, "repository", submission, ledger)
+
+
+_KIT_CODE_LANGUAGE = {"dockerfile": "docker", "bash": "bash", "yaml": "yaml", "json": "json", "hcl": "hcl", "markdown": "markdown", "text": "text"}
+
+
+def render_deploy_kit(project_scope: str) -> None:
+    """Generate, validate, download, or lock deployment artefacts. Nothing is pushed or applied here."""
+    kit = st.session_state.get("deploy_kit")
+    with st.container(border=True):
+        st.markdown("**Deploy Kit** · CI/CD, containers, Helm, Terraform, serverless, observability, rollback, runbooks")
+        st.caption(
+            "Generated from templates with zero provider calls and checked offline (YAML, JSON, shell, Dockerfile, HCL). "
+            "Download the zip or lock the files as artifacts; the target repository's CI runs them once the listed "
+            "secrets exist. This app never pushes, builds, or applies anything."
+        )
+        defaults = KitSpec()
+        with st.form("deploy_kit_form"):
+            c1, c2 = st.columns(2)
+            app_name = c1.text_input("App name", value=defaults.app_name)
+            target = c2.selectbox("Target", list(TARGETS), index=list(TARGETS).index(defaults.target), format_func=lambda key: TARGETS[key])
+            c3, c4, c5 = st.columns(3)
+            language = c3.selectbox("Language", LANGUAGES)
+            runtime_version = c4.text_input("Runtime version", value=defaults.runtime_version)
+            port = c5.number_input("Port", min_value=1, max_value=65535, value=defaults.port)
+            c6, c7 = st.columns(2)
+            registry = c6.text_input("Image registry / namespace", value=defaults.registry)
+            cloud = c7.selectbox("Cloud", CLOUDS, index=CLOUDS.index(defaults.cloud), help="Terraform skeleton and the serverless flavour follow this choice.")
+            c8, c9 = st.columns(2)
+            health_path = c8.text_input("Health path", value=defaults.health_path)
+            deploy_url = c9.text_input("Deployed URL (post-deploy smoke test)", value="", placeholder="https://your-app.example")
+            entrypoint = st.text_input("Container entrypoint", value=defaults.entrypoint)
+            c10, c11 = st.columns(2)
+            lint_command = c10.text_input("Lint command", value=defaults.lint_command)
+            test_command = c11.text_input("Test command", value=defaults.test_command)
+            generate = st.form_submit_button("Generate kit", type="primary")
+        if generate:
+            spec = KitSpec(
+                app_name=app_name, target=target, language=language, runtime_version=runtime_version.strip() or defaults.runtime_version,
+                port=int(port), registry=registry, cloud=cloud, health_path=health_path, lint_command=lint_command.strip() or defaults.lint_command,
+                test_command=test_command.strip() or defaults.test_command, entrypoint=entrypoint.strip() or defaults.entrypoint, deploy_url=deploy_url,
+            ).normalized()
+            files = generate_kit(spec)
+            kit = {"spec": spec, "files": files, "findings": validate_kit(files)}
+            st.session_state.deploy_kit = kit
+        if not kit:
+            return
+        spec, files, findings = kit["spec"], kit["files"], kit["findings"]
+        counts = summarize(findings)
+        line = (
+            f"{len(files)} file(s) for {TARGETS[spec.target].split(' (')[0]} · {counts['ok']} ok · {counts['warn']} warning(s) · "
+            f"{counts['error']} error(s) · {counts['skipped']} skipped check(s)"
+        )
+        (st.success if counts["error"] == 0 else st.error)(line)
+        st.dataframe([asdict(finding) for finding in findings], hide_index=True, use_container_width=True)
+        chosen = st.selectbox("Preview a file", [item.path for item in files], key="kit_preview")
+        preview = next(item for item in files if item.path == chosen)
+        st.caption(preview.purpose)
+        st.code(preview.body, language=_KIT_CODE_LANGUAGE.get(preview.language, "text"))
+        d1, d2 = st.columns(2)
+        d1.download_button(
+            "⬇ Download kit (.zip)", data=kit_zip(files), file_name=f"{spec.app_name}-deploy-kit.zip", mime="application/zip",
+            key="kit_zip", use_container_width=True,
+        )
+        if d2.button("Lock all files as artifacts", key="kit_lock", use_container_width=True,
+                     help="Versioned copies in the vault; find them under Locked artifacts in the sidebar."):
+            for item in files:
+                save_artifact(project_scope, item.path.rsplit("/", 1)[-1], item.path, item.body, item.language)
+            st.success(f"{len(files)} file(s) locked as artifacts in scope {project_scope}.")
 
 
 # =============================================================================

@@ -81,7 +81,8 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | Self-Correcting Execution Sandbox for chat output | Roadmap · exists only inside the repository pipeline |
 | Cross-thread semantic search | Roadmap · artifact search is text matching |
 | Capability card in every prompt (what the app can and cannot do) and memory as real chat turns | Implemented |
-| Deploy Kit: CI/CD workflow, Dockerfile, Helm, Terraform, serverless, observability, rollback, runbooks; post-deploy checks; session-only GitHub push | Planned · `docs/DEPLOY_AUTOMATION_PLAN.md` |
+| Deploy Kit (Repository Work): CI/CD workflow, Dockerfile, Helm chart, Terraform skeleton, serverless template, observability, rollback script, runbook; offline validation; zip download; lock as artifacts | Implemented · generation only, nothing is pushed or applied |
+| Post-deploy checks for this app, session-only GitHub push, app observability | Planned · `docs/DEPLOY_AUTOMATION_PLAN.md` |
 
 Controls: **Heavy Mode** toggle (multi-pass, more tokens, longer wait), **Artifact Lock** beside every
 code block (versioned save to SQLite), output token budget slider, per-project scope.

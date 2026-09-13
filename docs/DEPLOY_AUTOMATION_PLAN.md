@@ -23,7 +23,7 @@ push only on a button press); the automation lives **inside Repository Work**; t
 - **Phase 0 · Foundation (shipped)**: capability card in the system prompt; live window passed
   as real user/assistant turns (digest, summaries, notes in the system prompt); vendor finish
   reason surfaced ("stopped at the output budget", "filtered") in chat and mission summaries.
-- **Phase 1 · Deploy Kit generator** (Repository Work): target form (Streamlit Cloud,
+- **Phase 1 · Deploy Kit generator (shipped)** (Repository Work): target form (Streamlit Cloud,
   Docker + Kubernetes, serverless), language, registry, cloud; deterministic templates for
   Dockerfile, `.dockerignore`, GitHub Actions ci-cd.yml (lint, test, build, scan, push,
   deploy hooks), Helm chart skeleton, Terraform skeleton, serverless.yml, OpenTelemetry and
