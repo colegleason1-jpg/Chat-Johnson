@@ -76,7 +76,22 @@ def _with_model_recovery(cfg, call):
     except ProviderError as exc:
         status = exc.status_code
         if status is not None and discovery.looks_like_retired_model(status, exc.body):
-            replacement = discovery.discover(cfg.name, cfg.kind, cfg.base_url, provider_api_key(cfg))
+            produced: dict = {}
+
+            def usable(candidate: str) -> bool:
+                # The validation call is the real call: keep its result so a
+                # usable candidate costs one request, not two.
+                try:
+                    produced[candidate] = call(candidate)
+                    return True
+                except ProviderError as probe_error:
+                    return discovery.is_transient(probe_error.status_code or 0)
+
+            replacement = discovery.discover(
+                cfg.name, cfg.kind, cfg.base_url, provider_api_key(cfg), exclude=(model_id,), validate=usable
+            )
+            if replacement and replacement in produced:
+                return produced[replacement]
             if replacement and replacement != model_id:
                 return call(replacement)
             raise

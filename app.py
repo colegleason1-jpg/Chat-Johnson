@@ -87,16 +87,24 @@ from orchestrator.router import (
 
 from orchestrator.vault import (
     MESSAGE_WINDOW,
+    active_thread,
     append_message,
     archived_messages,
+    clear_thread,
     context_block,
+    create_thread,
     export_artifact,
     initialize_database,
+    list_threads,
+    migrate_thread,
     recent_artifacts,
     recent_messages,
     recent_summaries,
+    rename_thread,
     save_artifact,
     search_artifacts,
+    switch_thread,
+    thread_health,
 )
 
 initialize_database()
@@ -201,6 +209,38 @@ def build_prompt_messages(
         parts.append("USER-CONSENTED FILE INJECTIONS:\n" + injected_context[:120_000])
     parts.append("CURRENT REQUEST:\n" + user_prompt.strip())
     return [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}]
+
+
+DIGEST_REFINE_PROMPT = (
+    "You compress a project conversation digest so a fresh thread can continue the same work "
+    "without the old transcript. Keep every decision, constraint, file name, number, and open item. "
+    "Remove repetition, filler, and errors that were already resolved. Output concise markdown under "
+    "350 words with the sections: Vision, Decisions and constraints, Key facts, Open items. No commentary."
+)
+
+
+def model_refine_digest(digest: str, ledger: QuotaLedger) -> str:
+    """Ask the cheapest available free endpoint to compress the deterministic digest."""
+    messages = [{"role": "system", "content": DIGEST_REFINE_PROMPT}, {"role": "user", "content": digest}]
+    text, _ = generate_mode("normal", "quick_text", messages, ledger, max_tokens=700, temperature=0.1)
+    return text
+
+
+def health_sweep(project_scope: str, ledger: QuotaLedger, force: bool = False) -> Optional[Dict[str, Any]]:
+    """Run the thread-health agent; migrate to an optimized successor when warranted.
+
+    Called before every send (and on demand). The digest is built deterministically
+    at zero quota, then refined by a model when a key is available. Raw history is
+    never deleted; the old thread is marked migrated and stays browsable.
+    """
+    health = thread_health(project_scope)
+    if not force and not (health["recommend_migration"] and st.session_state.get("auto_migrate", True)):
+        return None
+    refine = (lambda digest: model_refine_digest(digest, ledger)) if configured_provider_names() else None
+    result = migrate_thread(project_scope, refine=refine)
+    result["reasons"] = health["reasons"]
+    st.session_state.last_migration = result
+    return result
 
 
 def extract_preview_source(text: str) -> str:
@@ -528,6 +568,13 @@ def run_generation(
     if not clean_prompt:
         return None
     mode = active_mode()
+    migration = health_sweep(project_scope, ledger)
+    if migration:
+        st.info(
+            f"Thread health agent migrated to an optimized thread (#{migration['new_thread_id']}) before sending: "
+            + ", ".join(migration["reasons"])
+            + f". Digest locked as artifact {migration['digest_artifact_id']} ({migration['method']})."
+        )
     user_message_id = append_message(project_scope, "user", clean_prompt, mode=mode)
     messages = build_prompt_messages(project_scope, clean_prompt, injected_context)
     max_tokens = int(st.session_state.get("max_tokens", 2048))
@@ -683,6 +730,9 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
         disabled=not bool(goal.strip() and configured_provider_names()),
     )
     if execute and plan:
+        migration = health_sweep(project_scope, ledger)
+        if migration:
+            st.info(f"Thread health agent migrated to optimized thread #{migration['new_thread_id']} before launching.")
         progress = st.progress(0.0, text="Starting workstreams…")
         results: Dict[int, Tuple[str, str, str]] = {}
         request_lock = get_task_request_lock()
@@ -840,6 +890,72 @@ with st.sidebar:
     )
     project_input = st.text_input("Active project scope", value=st.session_state.project_scope, key="project_scope_input")
     st.session_state.project_scope = project_input.strip() or "chat-johnson"
+
+    st.subheader("Threads")
+    scope_for_threads = st.session_state.project_scope
+    current_thread = active_thread(scope_for_threads)
+    thread_rows = list_threads(scope_for_threads)
+    thread_ids = [int(row["id"]) for row in thread_rows]
+    thread_labels = {
+        int(row["id"]): f"#{row['id']} · {row['title']}" + ("" if row["status"] == "active" else f" · {row['status']}")
+        for row in thread_rows
+    }
+    # The selectbox reflects the vault's current thread; a user change switches the
+    # vault inside the callback so programmatic switches (migration, New thread)
+    # are never undone by stale widget state.
+    st.session_state.thread_select = int(current_thread["id"])
+
+    def _on_thread_select() -> None:
+        switch_thread(int(st.session_state.thread_select))
+
+    st.selectbox(
+        "Active thread",
+        thread_ids,
+        format_func=lambda value: thread_labels.get(value, str(value)),
+        key="thread_select",
+        on_change=_on_thread_select,
+    )
+    new_col, clear_col = st.columns(2)
+    if new_col.button("New thread", use_container_width=True, help="Start a separate chat on this project; keys stay as they are."):
+        create_thread(scope_for_threads)
+        st.rerun()
+    if clear_col.button("Clear thread", use_container_width=True, help="Archive this thread's messages (raw text kept). Keys are untouched."):
+        moved = clear_thread(int(current_thread["id"]))
+        st.session_state.last_clear = moved
+        st.rerun()
+    if st.session_state.pop("last_clear", None) is not None:
+        st.caption("Thread cleared; messages moved to the archive.")
+    with st.expander("Rename thread", expanded=False):
+        new_title = st.text_input("Title", value=current_thread["title"], key=f"thread_title_{current_thread['id']}")
+        if st.button("Save title", key="save_thread_title") and new_title.strip() and new_title.strip() != current_thread["title"]:
+            rename_thread(int(current_thread["id"]), new_title)
+            st.rerun()
+
+    health = thread_health(scope_for_threads)
+    st.progress(min(float(health["pressure"]), 1.0), text=f"Thread health · pressure {health['pressure']:.2f}")
+    st.caption(
+        f"gen {health['generation']} · {health['messages']} msgs · ~{health['tokens']} tokens · "
+        f"{health['summaries']} summaries · {health['archived']} archived"
+    )
+    st.checkbox(
+        "Auto-migrate heavy threads",
+        key="auto_migrate",
+        value=True,
+        help="Before each send the health agent checks load, repetition, and error loops. When a threshold trips, "
+        "it compresses the thread into a locked vision digest and continues in a fresh optimized thread.",
+    )
+    if health["recommend_migration"]:
+        st.warning("Migration recommended: " + ", ".join(health["reasons"]))
+    if st.button("Migrate to optimized thread now", key="migrate_now", use_container_width=True):
+        migration = health_sweep(scope_for_threads, ledger, force=True)
+        if migration:
+            st.rerun()
+    last_migration = st.session_state.get("last_migration")
+    if last_migration and int(last_migration.get("new_thread_id", -1)) == int(current_thread["id"]):
+        st.caption(
+            f"This thread was optimized from #{last_migration['old_thread_id']} · digest artifact "
+            f"{last_migration['digest_artifact_id']} · {last_migration['method']}"
+        )
     st.checkbox(
         "Heavy Mode",
         key="heavy_mode",

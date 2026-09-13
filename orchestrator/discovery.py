@@ -10,7 +10,7 @@ the legacy provider client can use it without import cycles.
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 try:
     import requests
@@ -116,14 +116,55 @@ def rank_models(vendor: str, available: List[str], exclude: Tuple[str, ...] = ()
     return ranked
 
 
-def discover(name: str, kind: str, base_url: str, key: str, timeout: int = 20, exclude: Tuple[str, ...] = ()) -> Optional[str]:
-    """Pick a live model for this vendor, cache it, and return it (or None)."""
+_PERMISSION_MARKERS = ("permission", "oauth", "not enabled", "not authorized", "access", "forbidden", "not allowed", "quota project")
+MAX_VALIDATION_CANDIDATES = 5
+
+
+def looks_like_unusable_model(status_code: int, body: str) -> bool:
+    """A candidate model this key cannot use: retired, missing, or permission-gated."""
+    lowered = (body or "").lower()
+    if status_code in (401, 403):
+        return True
+    if status_code in (400, 404, 410):
+        return True if looks_like_retired_model(status_code, body) else any(m in lowered for m in _PERMISSION_MARKERS)
+    return False
+
+
+def discover(
+    name: str,
+    kind: str,
+    base_url: str,
+    key: str,
+    timeout: int = 20,
+    exclude: Tuple[str, ...] = (),
+    validate: Optional[Callable[[str], bool]] = None,
+) -> Optional[str]:
+    """Pick a live model for this vendor, cache it, and return it (or None).
+
+    Appearing in the vendor's model list does not mean this key may call the
+    model (Gemini lists OAuth-only and allowlisted ids too). When ``validate``
+    is given it is called with each ranked candidate and the first one it
+    accepts is cached; candidates it rejects are skipped.
+    """
     vendor = vendor_for(name)
     ranked = rank_models(vendor, list_models(kind, base_url, key, timeout=timeout), exclude=exclude)
     if not ranked:
         return None
-    DISCOVERED[vendor] = ranked[0]
-    return ranked[0]
+    chosen: Optional[str] = None
+    if validate is not None:
+        for candidate in ranked[:MAX_VALIDATION_CANDIDATES]:
+            try:
+                if validate(candidate):
+                    chosen = candidate
+                    break
+            except Exception:  # a validator failure must never block routing
+                continue
+    if chosen is None and validate is None:
+        chosen = ranked[0]
+    if chosen is None:
+        return None
+    DISCOVERED[vendor] = chosen
+    return chosen
 
 
 def alternates(name: str, kind: str, base_url: str, key: str, current: str, timeout: int = 20, limit: int = 2) -> List[str]:

@@ -58,6 +58,26 @@ approved reconstruction plan.
 Controls: **Heavy Mode** toggle (multi-pass, more tokens, longer wait), **Artifact Lock** beside every
 code block (versioned save to SQLite), output token budget slider, per-project scope.
 
+## Threads and the thread-health agent
+
+Every project scope holds any number of **threads**. The sidebar lets you switch, start a new one,
+rename, or **Clear thread** (messages move to the archive; keys are untouched). Each thread has its
+own 200-message window and its own texturized summaries.
+
+Before every send, a zero-quota **health sweep** measures the active thread: message count, estimated
+tokens in the live window, stacked summaries, repeated prompts, and error loops. When a threshold
+trips (or you press *Migrate now*), the agent:
+
+1. compresses the whole thread, archive included, into a **vision digest**: how it started, decisions
+   and constraints, key facts (files, numbers), open items, locked artifacts, and the summaries;
+2. asks the cheapest available free model to refine that digest when a key is present (the
+   deterministic base is kept underneath for audit);
+3. locks the digest as an immutable artifact, opens a successor thread that injects the digest into
+   every prompt, and marks the old thread *migrated*. Nothing raw is deleted.
+
+The result is a fresh thread that carries the original vision in a re-optimized, token-light form.
+Switch **Auto-migrate heavy threads** off in the sidebar to keep migrations manual.
+
 ## Setup
 
 1. `pip install -r requirements.txt`

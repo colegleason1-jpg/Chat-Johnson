@@ -705,10 +705,42 @@ def list_endpoint_models(endpoint: str | CortexEndpoint, timeout: int = 20) -> L
     return discovery.list_models(selected.kind, selected.base_url, _endpoint_key(selected), timeout=timeout)
 
 
-def discover_endpoint_model(endpoint: str | CortexEndpoint, timeout: int = 20) -> Optional[str]:
-    """Pick a live replacement id from the vendor list and cache it for this process."""
+def _model_is_usable(selected: CortexEndpoint, model_id: str, timeout: int = 20) -> bool:
+    """One-token, non-streaming call: True on 2xx or a transient status, False if this key cannot use the model."""
+    if requests is None:
+        return False
+    try:
+        url, headers, payload = build_cortex_request(
+            selected, [{"role": "user", "content": "ping"}], max_tokens=8, temperature=0.0, stream=False, model_id=model_id
+        )
+        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    except (ProviderError, requests.RequestException):
+        return False
+    status = int(response.status_code)
+    body = response.text[:400] if hasattr(response, "text") else ""
+    try:
+        response.close()
+    except AttributeError:
+        pass
+    if status < 400:
+        return True
+    if discovery.is_transient(status):
+        return True  # exists and is permitted, merely busy right now
+    return not discovery.looks_like_unusable_model(status, body) and status < 500
+
+
+def discover_endpoint_model(endpoint: str | CortexEndpoint, timeout: int = 20, exclude: Tuple[str, ...] = ()) -> Optional[str]:
+    """Pick a live, key-usable replacement id from the vendor list and cache it for this process."""
     selected = _as_endpoint(endpoint)
-    return discovery.discover(selected.name, selected.kind, selected.base_url, _endpoint_key(selected), timeout=timeout)
+    return discovery.discover(
+        selected.name,
+        selected.kind,
+        selected.base_url,
+        _endpoint_key(selected),
+        timeout=timeout,
+        exclude=exclude,
+        validate=lambda candidate: _model_is_usable(selected, candidate, timeout=min(timeout, 20)),
+    )
 
 
 def _resilient_post(
@@ -762,9 +794,18 @@ def _resilient_post(
             break  # permanent error, or transient retries exhausted, for this model
 
         status = int(response.status_code)
+        original = len(tried) == 1
         if not key_override and not rediscovered and discovery.looks_like_retired_model(status, last_error):
             rediscovered = True
-            replacement = discover_endpoint_model(selected, timeout=min(timeout, 20))
+            replacement = discover_endpoint_model(selected, timeout=min(timeout, 20), exclude=tuple(tried))
+            if replacement and replacement not in tried:
+                model_id = replacement
+                continue
+        if not key_override and not original and len(tried) < 4 and discovery.looks_like_unusable_model(status, last_error):
+            # A discovered or sibling id this key cannot use (OAuth-only, allowlisted, gone):
+            # drop it from the cache and move to the next validated candidate.
+            discovery.DISCOVERED.pop(discovery.vendor_for(selected.name), None)
+            replacement = discover_endpoint_model(selected, timeout=min(timeout, 20), exclude=tuple(tried))
             if replacement and replacement not in tried:
                 model_id = replacement
                 continue

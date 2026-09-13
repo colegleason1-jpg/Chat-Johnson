@@ -463,7 +463,8 @@ def test_retired_groq_model_is_discovered_and_retried(all_keys, monkeypatch):
     monkeypatch.setitem(router.CORTEX_ENDPOINTS, "groq", router.CortexEndpoint(**{**stale.__dict__, "model": "llama-3.3-70b-versatile"}))
     text = "".join(router.cortex_stream("groq", [{"role": "user", "content": "x"}]))
     assert text == "alive"
-    assert posts == ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"]
+    # retired id, one-token validation of the candidate, then the real call
+    assert posts == ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-120b"]
     assert endpoint_model(router.CORTEX_ENDPOINTS["groq"]) == "openai/gpt-oss-120b"
 
 
@@ -591,3 +592,57 @@ def test_legacy_gemini_recovers_from_retired_model(monkeypatch):
     assert text == "hi" and tokens == 5
     assert calls == ["gemini-3.6-flash", "gemini-3.7-flash"]
     assert config.provider_model(config.PROVIDERS["gemini"]) == "gemini-3.7-flash"
+
+
+def test_discovery_skips_models_this_key_cannot_use(all_keys, monkeypatch):
+    """gemini-3.7-flash is listed but OAuth-gated for this key; discovery must land on 3.6."""
+    calls: List[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        model = url.split("/models/")[1].split(":")[0]
+        calls.append(model)
+        if model == "gemini-2.5-flash":
+            return FakeResponse(status_code=404, text="This model models/gemini-2.5-flash is no longer available to new users")
+        if model == "gemini-3.7-flash":
+            return FakeResponse(status_code=403, text='{"error":{"status":"PERMISSION_DENIED","message":"requires OAuth"}}')
+        if stream:
+            return FakeResponse(lines=sse({"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}))
+        return FakeResponse(status_code=200, text="{}")
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    monkeypatch.setattr(router.requests, "get", lambda *a, **k: FakeGet(200, {"models": [
+        {"name": "models/gemini-3.7-flash", "supportedGenerationMethods": ["generateContent"]},
+        {"name": "models/gemini-3.6-flash", "supportedGenerationMethods": ["generateContent"]},
+    ]}))
+    stale = router.CORTEX_ENDPOINTS["google_ai_studio"]
+    monkeypatch.setitem(router.CORTEX_ENDPOINTS, "google_ai_studio", router.CortexEndpoint(**{**stale.__dict__, "model": "gemini-2.5-flash"}))
+    text = "".join(router.cortex_stream("google_ai_studio", [{"role": "user", "content": "x"}]))
+    assert text == "ok"
+    assert calls == ["gemini-2.5-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.6-flash"]
+    assert endpoint_model(router.CORTEX_ENDPOINTS["google_ai_studio"]) == "gemini-3.6-flash"
+
+
+def test_switched_model_that_turns_out_gated_cycles_to_next(all_keys, monkeypatch):
+    """Cached discovered id becomes 403 later (like the live 3.7 case): cycle to the next usable one."""
+    router._DISCOVERED_MODELS["gemini"] = "gemini-3.7-flash"
+    calls: List[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        model = url.split("/models/")[1].split(":")[0]
+        calls.append(model)
+        if model == "gemini-3.7-flash":
+            return FakeResponse(status_code=403, text="PERMISSION_DENIED oauth")
+        if stream:
+            return FakeResponse(lines=sse({"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}))
+        return FakeResponse(status_code=200, text="{}")
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    monkeypatch.setattr(router.requests, "get", lambda *a, **k: FakeGet(200, {"models": [
+        {"name": "models/gemini-3.7-flash", "supportedGenerationMethods": ["generateContent"]},
+        {"name": "models/gemini-3.6-flash", "supportedGenerationMethods": ["generateContent"]},
+    ]}))
+    with pytest.raises(ProviderError):
+        # The cached id is the *original* for this call, so a 403 on it is a real key rejection
+        # for that model; we do not cycle from the original, we report it.
+        list(router.cortex_stream("google_ai_studio", [{"role": "user", "content": "x"}]))
+    assert calls == ["gemini-3.7-flash"]
