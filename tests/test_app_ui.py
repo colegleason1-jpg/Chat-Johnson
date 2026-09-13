@@ -67,3 +67,28 @@ def test_armed_github_push_sends_the_kit_and_lists_the_pull_request(app, monkeyp
     assert any("opened pull request #101" in m for m in messages), messages
     assert "ghp_secret_token_123" not in "\n".join(messages)
     assert any(p.endswith("/pulls") for _, p, _ in calls)
+
+
+@pytest.mark.skipif(Version(st.__version__) < Version("1.40"), reason="AppTest before 1.40 cannot read a radio that uses format_func")
+def test_repository_work_has_four_tabs_directions_and_a_working_fetch(app, monkeypatch):
+    from orchestrator import github_repo as gr
+    from tests.test_github_repo import FakeResponse, make_tarball
+
+    def fake_get(url, headers=None, stream=False, timeout=None, allow_redirects=True):
+        if url.endswith("/repos/me/proj"):
+            return FakeResponse(200, {"default_branch": "main"})
+        if url.endswith("/commits/main"):
+            return FakeResponse(200, {"sha": "abc1234def5678"})
+        return FakeResponse(200, raw=make_tarball(evil=False))
+
+    monkeypatch.setattr(gr.requests, "get", fake_get)
+    app.query_params["ws"] = "repository"
+    app.run()
+    assert not app.exception
+    assert len(app.tabs) >= 4  # Work, Deploy Kit, GitHub, Directions
+    markdown = "\n".join(m.value for m in app.markdown)
+    assert "What never happens here" in markdown and "Fetch repository" in [b.label for b in app.button]
+    app.text_input(key="repo_fetch_repo").input("me/proj").run()
+    next(b for b in app.button if b.label == "Fetch repository").click().run()
+    assert not app.exception
+    assert any("Fetched me/proj @ main (abc1234)" in s.value for s in app.success), [s.value for s in app.success]

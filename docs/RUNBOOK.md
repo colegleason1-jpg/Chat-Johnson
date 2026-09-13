@@ -24,6 +24,11 @@
   at persistent storage.
 - Keys are never stored; every visitor pastes their own for the session.
 
+## Repository sandboxes
+- Fetched GitHub trees and pipeline sandboxes live under the temp directory (`chatjohnson-repos`,
+  `chat_johnson_worktrees`) and are ephemeral. Running a fetched repository's tests executes its
+  code in the app's container; the box is off by default for GitHub sources.
+
 ## Key rotation
 1. Create the new key at the vendor.
 2. Paste it in the sidebar (Apply keys) or update the environment secret for self-hosted runs.

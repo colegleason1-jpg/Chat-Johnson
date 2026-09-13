@@ -66,7 +66,7 @@ except ImportError as _import_error:  # pragma: no cover - only reachable on a b
     )
     st.stop()
 
-from orchestrator.config import PROVIDERS, bind_session_keys, provider_model, resolve_secret
+from orchestrator.config import PROVIDERS, bind_session_keys, get_settings, provider_model, resolve_secret
 from orchestrator.executor import Orchestrator
 from orchestrator.quota import QuotaLedger
 from orchestrator.router import (
@@ -96,6 +96,7 @@ from orchestrator.connectors import ROADMAP_FEATURES, connector_status
 from orchestrator.deploykit import CLOUDS, LANGUAGES, TARGETS, KitSpec, generate_kit, kit_zip, summarize, validate_kit
 from orchestrator.github_auth import mint_state, verify_state
 from orchestrator.github_push import GitHubPushError, GitHubWriter, PushRecord, branch_name_for
+from orchestrator.github_repo import GitHubRepoError, collect_changed_files, fetch_tree
 from orchestrator.missions import (
     MAX_SECTIONS,
     MISSION_TEMPLATES,
@@ -515,27 +516,151 @@ def github_api_get(token: str, path: str) -> Any:
 
 def render_repository_work(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
     st.subheader("Repository Work")
-    st.caption("Sandboxed local changes, reviewable diffs, and an explicit human handoff." + mode_caption())
+    st.caption("Sandboxed changes on a GitHub or local repository, reviewable diffs, and an explicit human handoff." + mode_caption())
     render_thread_bar(project_scope, "repository", ledger)
+    work_tab, kit_tab, github_tab, directions_tab = st.tabs(["Work", "Deploy Kit", "GitHub", "Directions"])
+    with work_tab:
+        render_repo_work_tab(project_scope, ledger)
+    with kit_tab:
+        render_deploy_kit(project_scope)
+    with github_tab:
+        render_github_tab()
+    with directions_tab:
+        render_repo_directions()
+    st.divider()
+    render_history(project_scope, "Repository conversation", workspace="repository")
+    dispatch_chat(project_scope, "repository", submission, ledger)
+
+
+def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
+    """Fetch (GitHub) or point at (local) a repository, run the sandbox pipeline, review, push."""
+    push_state = github_push_status()
+    source = st.radio("Source", ["GitHub repository", "Local path"], horizontal=True, key="repo_source_kind")
+    fetched: Optional[Dict[str, Any]] = st.session_state.get("repo_fetched")
+    repo_path = ""
+    if source == "GitHub repository":
+        c1, c2 = st.columns([0.6, 0.4], gap="small")
+        owner_repo = c1.text_input("Repository (owner/name)", value=push_state["repo"], key="repo_fetch_repo", placeholder="owner/repo")
+        ref = c2.text_input("Branch, tag, or commit", value="", key="repo_fetch_ref", placeholder="default branch")
+        st.caption(
+            "Private repositories are readable with the armed GitHub push token." if push_state["armed"]
+            else "Public repositories only until GitHub push is armed in the sidebar (then private ones too)."
+        )
+        if st.button("Fetch repository", key="repo_fetch", disabled=not owner_repo.strip()):
+            try:
+                with st.spinner("Downloading the tree through the GitHub API…"):
+                    tree = fetch_tree(owner_repo, ref, str(st.session_state.get("github_push_token", "")) if push_state["armed"] else "")
+                fetched = tree.as_dict()
+                st.session_state.repo_fetched = fetched
+                st.session_state.pop("repo_last_report", None)
+            except (GitHubRepoError, GitHubPushError) as exc:
+                st.error(f"Fetch failed: {exc}")
+        if fetched:
+            st.success(
+                f"Fetched {fetched['owner']}/{fetched['repo']} @ {fetched['ref']} ({str(fetched['sha'])[:7]}) · "
+                f"{fetched['files']} file(s) · {int(fetched['size_bytes']) // 1024} KB in a temporary sandbox."
+            )
+            repo_path = str(fetched["path"])
+    else:
+        repo_path = st.text_input(
+            "Repository path", value="", key="repo_path",
+            placeholder="Absolute path to a local git repository (never the deployed app's own checkout)",
+        )
+    repo_goal = st.text_area(
+        "Requested repository change", height=100, key="repo_goal",
+        placeholder="Describe a reviewable change; generated edits stay in an isolated sandbox.",
+    )
+    run_tests = st.checkbox(
+        "Run the repository's tests in the repair loop (executes its code in this app's container)",
+        value=(source == "Local path"), key="repo_run_tests",
+    )
+    ready = bool(repo_goal.strip() and repo_path.strip() and configured_provider_names())
+    if st.button("Run sandboxed pipeline", type="primary", key="run_repo_pipeline", disabled=not ready,
+                 help="Needs a fetched or local repository, a requested change, and at least one provider key."):
+        app_root = str(Path(__file__).resolve().parent)
+        if not os.path.isdir(repo_path):
+            st.error("Repository path does not exist.")
+        elif source == "Local path" and os.path.realpath(repo_path) == os.path.realpath(app_root):
+            st.error("Refusing to run the pipeline on the studio's own checkout; point it at another repository.")
+        else:
+            settings = get_settings()
+            if not run_tests:
+                settings.max_test_rounds = 0
+            with st.status("Ingesting, patching, and verifying…", expanded=True) as status:
+                try:
+                    report = Orchestrator(settings=settings, ledger=ledger).run(repo_goal, repo_path=repo_path)
+                    status.update(label="Pipeline completed", state="complete")
+                    st.session_state.repo_last_report = {"report": report, "source": source, "fetched": fetched, "goal": repo_goal.strip()}
+                except Exception as exc:
+                    status.update(label="Pipeline stopped", state="error")
+                    st.error(f"Repository pipeline failed: {exc}")
+    last = st.session_state.get("repo_last_report")
+    if not last:
+        return
+    report = last["report"]
+    st.markdown(f"**Last run** · {last['goal'][:120]}")
+    if report.get("branch") == "(copy-mode)":
+        st.caption("Sandbox is a copied tree under the temp directory (no git worktree); the diff is computed against the source tree. Nothing was committed.")
+    else:
+        st.caption(f"Sandbox branch: {report.get('branch')}")
+    st.json(report.get("ingest", {}), expanded=False)
+    diff = str(report.get("diff") or "")
+    if not diff.strip():
+        st.info("The pipeline produced no file changes. Rephrase the request with the files or behaviour you expect to change.")
+    else:
+        pairs, missing = collect_changed_files(str(report.get("sandbox") or ""), diff)
+        st.caption(f"Changed files: {', '.join(path for path, _ in pairs) or 'none readable'}" + (f" · not pushable: {', '.join(missing)}" if missing else ""))
+        st.code(diff[:20_000], language="diff")
+        st.download_button("⬇ Download patch (.diff)", data=diff, file_name="chat-johnson-change.diff", mime="text/x-diff", key="repo_patch_download")
+        if last["source"] == "GitHub repository" and last.get("fetched") and pairs:
+            if push_state["armed"]:
+                base = str(last["fetched"]["ref"])
+                default_branch = f"chat-johnson/{deliverable_slug(last['goal'])}-{str(last['fetched']['sha'])[:7]}"
+                branch = st.text_input("Branch name", value=default_branch, key="repo_push_branch")
+                if st.button(f"Push {len(pairs)} changed file(s) as a branch and open a pull request", type="primary", key="repo_push"):
+                    title = f"Chat Johnson: {last['goal'][:70]}"
+                    body = (
+                        f"Requested change: {last['goal']}\n\nGenerated in Chat Johnson's sandbox pipeline from "
+                        f"`{last['fetched']['owner']}/{last['fetched']['repo']}@{str(last['fetched']['sha'])[:7]}`. "
+                        "Review the diff; nothing was executed against the default branch."
+                        + (f"\n\nNot included (deleted or binary): {', '.join(missing)}" if missing else "")
+                    )
+                    try:
+                        with st.spinner("Pushing the branch and opening the pull request…"):
+                            record = GitHubWriter(str(st.session_state.get("github_push_token", "")), push_state["repo"]).push_files(
+                                pairs, branch.strip() or default_branch, f"Chat Johnson: {last['goal'][:60]}", title, body, base_branch=base,
+                            )
+                        st.session_state.setdefault("kit_pushes", []).append(record)
+                        st.success(f"Pushed to {record.branch} and opened pull request #{record.pr_number}: {record.pr_url}")
+                    except GitHubPushError as exc:
+                        st.error(f"Push failed: {exc}")
+            else:
+                st.caption("Arm **GitHub push (session only)** in the sidebar to push this change as a branch with a pull request.")
+    with st.expander("Execution memory", expanded=False):
+        st.text(report.get("memory", "") or "(empty)")
+
+
+def render_github_tab() -> None:
+    state = github_push_status()
+    st.markdown("**Session-only push slot**")
+    if state["armed"]:
+        st.success(f"Armed for {state['repo']}: pushes create a new branch and a pull request; the default branch is never written.")
+    else:
+        st.caption("Disarmed. Arm it in the sidebar (toggle + repository + token) to fetch private repositories and to push results.")
+    render_push_ledger()
+    st.divider()
     code = _query_value("code")
     received_state = _query_value("state")
     token = st.session_state.get("github_token", "")
     with st.expander("GitHub identity (optional, profile-only OAuth)", expanded=bool(token or (code and received_state))):
         st.caption(
             "Least-privilege OAuth skeleton: the token lives in session memory only, no SSH keys are collected, "
-            "and nothing is committed or pushed automatically."
+            "and nothing is committed or pushed by it."
         )
-        oauth_ready = all(
-            os.environ.get(key, "").strip()
-            for key in ("GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_REDIRECT_URI")
-        )
+        oauth_ready = all(os.environ.get(key, "").strip() for key in ("GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_REDIRECT_URI"))
         if code and received_state and "github_token" not in st.session_state:
             try:
-                st.session_state.github_token = exchange_github_code(
-                    code,
-                    str(st.session_state.get("github_oauth_state", "")),
-                    received_state,
-                )
+                st.session_state.github_token = exchange_github_code(code, str(st.session_state.get("github_oauth_state", "")), received_state)
                 token = st.session_state.github_token
                 st.success("GitHub authorization completed for this session.")
             except (ValueError, requests.RequestException) as exc:
@@ -546,7 +671,7 @@ def render_repository_work(project_scope: str, ledger: QuotaLedger, submission: 
                 st.link_button("Authorize GitHub identity check (scope read:user, profile only)", url)
             except AttributeError:
                 st.markdown(f"[Authorize GitHub identity check (scope read:user, profile only)]({url})")
-            st.caption("This reads your GitHub profile only. No repository is read, written, committed, or pushed by this app.")
+            st.caption("This reads your GitHub profile only.")
         else:
             st.caption("Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and GITHUB_REDIRECT_URI in the environment to enable it.")
         if token:
@@ -562,53 +687,56 @@ def render_repository_work(project_scope: str, ledger: QuotaLedger, submission: 
                 st.session_state.pop("github_oauth_state", None)
                 st.rerun()
 
-    st.markdown("**Local sandbox pipeline**")
-    repo_path = st.text_input(
-        "Repository path", value="", key="repo_path",
-        placeholder="Absolute path to a local git repository (never the deployed app's own checkout)",
-    )
-    repo_goal = st.text_area(
-        "Requested repository change",
-        height=100,
-        key="repo_goal",
-        placeholder="Describe a reviewable change; generated edits stay in an isolated sandbox.",
-    )
-    run_repo = st.button(
-        "Run sandboxed repository pipeline",
-        type="primary",
-        key="run_repo_pipeline",
-        disabled=not bool(repo_goal.strip() and repo_path.strip() and configured_provider_names()),
-    )
-    if run_repo:
-        app_root = str(Path(__file__).resolve().parent)
-        if not os.path.isdir(repo_path):
-            st.error("Repository path does not exist.")
-        elif os.path.realpath(repo_path) == os.path.realpath(app_root):
-            st.error("Refusing to run the pipeline on the studio's own checkout; point it at another repository.")
-        else:
-            with st.status("Ingesting, patching, and verifying…", expanded=True) as status:
-                try:
-                    report = Orchestrator(ledger=ledger).run(repo_goal, repo_path=repo_path)
-                    status.update(label="Pipeline completed", state="complete")
-                    if report["branch"] == "(copy-mode)":
-                        st.warning(
-                            "git worktree was unavailable, so the sandbox is a copied tree under the temp directory. "
-                            "The diff below is computed against your source tree; nothing was committed."
-                        )
-                    else:
-                        st.success(f"Sandbox branch: {report['branch']}")
-                    st.json(report["ingest"], expanded=False)
-                    if report.get("diff"):
-                        st.code(report["diff"][:20_000], language="diff")
-                    st.text_area("Execution memory", report.get("memory", ""), height=180)
-                except Exception as exc:
-                    status.update(label="Pipeline stopped", state="error")
-                    st.error(f"Repository pipeline failed: {exc}")
-    st.divider()
-    render_deploy_kit(project_scope)
-    st.divider()
-    render_history(project_scope, "Repository conversation", workspace="repository")
-    dispatch_chat(project_scope, "repository", submission, ledger)
+
+def render_push_ledger() -> None:
+    """Every push made this session (Deploy Kit or pipeline) with a revert action."""
+    state = github_push_status()
+    pushes: List[PushRecord] = st.session_state.setdefault("kit_pushes", [])
+    if not pushes:
+        st.caption("No pushes this session.")
+        return
+    for index, record in enumerate(pushes):
+        label = "revert" if record.kind == "revert" else "push"
+        st.caption(f"{label} · {record.owner}/{record.repo} · branch {record.branch} · PR #{record.pr_number} · {record.pr_url}")
+        if record.kind == "push" and state["armed"] and st.button("Open revert PR", key=f"ledger_revert_{index}"):
+            try:
+                reverted = GitHubWriter(str(st.session_state.get("github_push_token", "")), state["repo"]).open_revert(record)
+                pushes.append(reverted)
+                st.success(f"Revert pull request #{reverted.pr_number}: {reverted.pr_url}")
+                st.rerun()
+            except GitHubPushError as exc:
+                st.error(f"Revert failed: {exc}")
+
+
+REPO_DIRECTIONS = """
+**What this workspace does.** It changes a repository for you inside an isolated sandbox and hands you a
+reviewable result. It never touches your default branch, never stores a token, and never runs cloud CLIs.
+
+**The four tabs**
+1. **Work** · pick a source, describe the change, run the pipeline, review the diff, push it as a branch with a pull request.
+2. **Deploy Kit** · generate CI/CD, container, Helm, Terraform, serverless, observability, rollback, and runbook files for a target; validate them offline; download or push them.
+3. **GitHub** · the state of the session-only push slot, every push made this session with a one-click revert pull request, and the optional profile-only identity check.
+4. **Directions** · this page.
+
+**Sequence for a GitHub repository**
+1. In the sidebar, open *GitHub push (session only)*: switch it on, enter `owner/repo`, paste a fine-grained token with Contents and Pull requests write access (read access is enough to fetch a private repository). Nothing is stored.
+2. *Work* → Source *GitHub repository* → **Fetch repository**. The tree is downloaded through the GitHub API at one commit into a temporary sandbox; the commit and file count are shown.
+3. Describe the change and press **Run sandboxed pipeline**. The pipeline ingests the tree within a token budget, plans typed steps, asks the routed model for complete file blocks or unified diffs, applies them in the sandbox, and validates Python syntax. Tick *Run the repository's tests* only when you accept that the repository's own test suite executes here.
+4. Review the diff and the changed-file list. **Download patch** gives you the unified diff; **Push … and open a pull request** creates one commit on a new branch off the fetched ref and opens the pull request.
+5. The GitHub tab lists the push; **Open revert PR** restores the touched paths.
+
+**Local path** works the same on a self-hosted run: point at a repository on the machine that runs the app; a git worktree is used when possible.
+
+**When the diff is empty** the model answered without file blocks. Name the files or behaviour you expect to change and run again; the *Execution memory* shows what each step returned.
+
+**When the pipeline fails** the error names the provider or step. Free-tier limits are paced automatically; a retired model id is rediscovered on the next call.
+
+**What never happens here** · writes to the default branch · stored tokens · Docker, Terraform, Helm, or cloud CLI execution · running your tests unless you tick the box · any push without your button press.
+"""
+
+
+def render_repo_directions() -> None:
+    st.markdown(REPO_DIRECTIONS)
 
 
 _KIT_CODE_LANGUAGE = {"dockerfile": "docker", "bash": "bash", "yaml": "yaml", "json": "json", "hcl": "hcl", "markdown": "markdown", "text": "text"}
