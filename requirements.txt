@@ -1,0 +1,9 @@
+# Loose lower bounds so hosted platforms (Streamlit Community Cloud, newer
+# Python releases) can resolve current wheels. CI runs against these too.
+requests>=2.31
+streamlit>=1.32
+python-dotenv>=1.0
+numpy>=1.26
+scipy>=1.13
+ruff>=0.2
+pytest>=8.0

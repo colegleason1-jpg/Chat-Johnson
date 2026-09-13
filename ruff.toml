@@ -1,0 +1,13 @@
+line-length = 120
+target-version = "py310"
+
+[lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+# app.py must run the duplicate-module sanitizer before importing the orchestrator
+# package, and st.set_page_config must be the first Streamlit call.
+"app.py" = ["E402"]
+# The research engine keeps the validated Project Seth variable names (A = W*T/I).
+"research/project_seth_phase3.py" = ["E741"]

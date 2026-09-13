@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Chat Johnson local state (never commit)
+chat_johnson_vault.db
+chat_johnson_vault.db-journal
+chat_johnson_vault.db-wal
+chat_johnson_vault.db-shm
+.orchestrator/
+generated/
+phase3_output/

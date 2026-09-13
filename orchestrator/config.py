@@ -7,8 +7,9 @@ The orchestrator only uses providers whose key is present.
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Mapping
 
 try:  # optional dev convenience
     from dotenv import load_dotenv
@@ -20,6 +21,47 @@ except ImportError:  # pragma: no cover
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+# ---------------------------------------------------------------------------
+# Session key overlay (BYOK entered in the UI)
+# ---------------------------------------------------------------------------
+# Keys pasted into the app sidebar are held in a ContextVar so they are scoped
+# to the current execution context (one Streamlit browser session's script
+# run, or a worker context explicitly copied from it). They take precedence
+# over the environment, are never written to disk, and are invisible to other
+# sessions in the same process. The app re-binds them at the top of every run.
+_SESSION_KEYS: ContextVar[Mapping[str, str]] = ContextVar("chat_johnson_session_keys", default={})
+
+
+def session_keys() -> Dict[str, str]:
+    """Copy of the keys bound in this context. Values are secrets; never log them."""
+    return dict(_SESSION_KEYS.get())
+
+
+def bind_session_keys(mapping: Mapping[str, str]) -> None:
+    """Replace the overlay for this context (called by the UI on every run)."""
+    _SESSION_KEYS.set({name: value.strip() for name, value in mapping.items() if value and value.strip()})
+
+
+def set_session_key(env_name: str, value: str) -> None:
+    """Store or remove one session-only secret under its environment name."""
+    current = session_keys()
+    cleaned = (value or "").strip()
+    if cleaned:
+        current[env_name] = cleaned
+    else:
+        current.pop(env_name, None)
+    _SESSION_KEYS.set(current)
+
+
+def clear_session_keys() -> None:
+    _SESSION_KEYS.set({})
+
+
+def resolve_secret(env_name: str) -> str:
+    """Session overlay first, then the process environment. Never logs the value."""
+    return _SESSION_KEYS.get().get(env_name, "") or _env(env_name)
 
 
 @dataclass
@@ -45,7 +87,7 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         env_key="GEMINI_API_KEY",
         base_url="https://generativelanguage.googleapis.com/v1beta",
         kind="gemini",
-        default_model="gemini-2.0-flash",
+        default_model="gemini-2.5-flash",
         model_env="GEMINI_MODEL",
         rpm_limit=15,
         tpm_limit=1_000_000,
@@ -58,10 +100,10 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         label="Groq (LPU, ultra-fast)",
         env_key="GROQ_API_KEY",
         base_url="https://api.groq.com/openai/v1",
-        default_model="llama-3.3-70b-versatile",
+        default_model="openai/gpt-oss-120b",
         model_env="GROQ_MODEL",
         rpm_limit=28,
-        tpm_limit=60_000,
+        tpm_limit=8_000,
         context_window=128_000,
         strengths=("code_patch", "quick_text", "chat"),
         priority=20,
@@ -122,7 +164,7 @@ PROVIDERS: Dict[str, ProviderConfig] = {
 
 
 def provider_api_key(cfg: ProviderConfig) -> str:
-    return _env(cfg.env_key)
+    return resolve_secret(cfg.env_key)
 
 
 def provider_model(cfg: ProviderConfig) -> str:
