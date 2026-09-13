@@ -172,3 +172,54 @@ def test_legacy_vault_rows_are_backfilled_into_a_thread(db):
     thread = db.active_thread("legacy")
     rows = db.recent_messages("legacy")
     assert len(rows) == 1 and rows[0]["thread_id"] == thread["id"]
+
+
+def test_delete_thread_removes_history_archive_and_summaries_only_for_that_thread(db):
+    scope = "d"
+    first = db.active_thread(scope)["id"]
+    fill(db, scope, 6)
+    db.clear_thread(first)  # six rows now live in the archive
+    fill(db, scope, 4)
+    second = db.create_thread(scope, "keep me")
+    fill(db, scope, 3)
+    db.switch_thread(first)
+    assert db.active_thread(scope)["id"] == first
+    counts = db.delete_thread(first)
+    assert counts == {"message_history": 4, "message_archive": 6, "summaries": 0}
+    assert db.thread_by_id(first) is None
+    assert db.archived_messages(scope, 100, thread_id=first) == []
+    assert db.active_thread(scope)["id"] == second
+    assert [r["content"] for r in db.recent_messages(scope)] == ["turn 0", "turn 1", "turn 2"]
+    with pytest.raises(ValueError):
+        db.delete_thread(first)
+
+
+def test_deleting_the_only_thread_yields_a_fresh_empty_one(db):
+    scope = "e"
+    only = db.active_thread(scope)["id"]
+    fill(db, scope, 2)
+    db.delete_thread(only)
+    fresh = db.active_thread(scope)
+    assert fresh["id"] != only
+    assert db.recent_messages(scope) == []
+
+
+def test_deleting_a_migrated_parent_keeps_the_successor_and_its_digest(db, monkeypatch):
+    scope = "f"
+    parent = db.active_thread(scope)["id"]
+    fill(db, scope, 8, text="we decided the API must stay free-tier only; step {i}")
+    result = db.migrate_thread(scope, workspace="normal_chat")
+    successor = db.thread_by_id(result["new_thread_id"])
+    assert int(successor["parent_thread_id"]) == parent
+    db.delete_thread(parent)
+    successor = db.thread_by_id(result["new_thread_id"])
+    assert successor is not None and successor["parent_thread_id"] is None
+    assert db.artifact_by_id(result["digest_artifact_id"]) is not None
+
+
+def test_messages_record_their_task_type(db):
+    db.append_message("t", "user", "find sources", task_type="research")
+    db.append_message("t", "assistant", "here they are", provider="groq/x", task_type="research")
+    db.append_message("t", "user", "thanks")
+    rows = db.recent_messages("t")
+    assert [r["task_type"] for r in rows] == ["research", "research", ""]

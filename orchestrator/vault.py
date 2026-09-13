@@ -143,6 +143,7 @@ def initialize_database() -> None:
         for table in ("message_history", "message_archive", "summaries"):
             _ensure_column(connection, table, "thread_id", "INTEGER")
         _ensure_column(connection, "threads", "workspace", "TEXT NOT NULL DEFAULT 'normal_chat'")
+        _ensure_column(connection, "message_history", "task_type", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_message_thread ON message_history(thread_id, timestamp ASC, id ASC)"
         )
@@ -306,6 +307,27 @@ def clear_thread(thread_id: int) -> int:
         return len(rows)
 
 
+def delete_thread(thread_id: int) -> Dict[str, int]:
+    """Remove a thread with its live window, archive, and summaries. Locked artifacts are project-level and stay.
+
+    Clear keeps history in the archive; this is the operator's explicit "forget it" and is the only
+    path that deletes anything. Successor threads keep their digest artifact and lose only the parent link.
+    """
+    with _open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if connection.execute("SELECT id FROM threads WHERE id = ?", (int(thread_id),)).fetchone() is None:
+            connection.rollback()
+            raise ValueError(f"thread {int(thread_id)} does not exist")
+        counts: Dict[str, int] = {}
+        for table in ("message_history", "message_archive", "summaries"):
+            cursor = connection.execute(f"DELETE FROM {table} WHERE thread_id = ?", (int(thread_id),))
+            counts[table] = int(cursor.rowcount)
+        connection.execute("UPDATE threads SET parent_thread_id = NULL WHERE parent_thread_id = ?", (int(thread_id),))
+        connection.execute("DELETE FROM threads WHERE id = ?", (int(thread_id),))
+        connection.commit()
+    return counts
+
+
 def estimate_tokens(text: str) -> int:
     return max(1, len(text.strip()) // 4) if text.strip() else 0
 
@@ -335,6 +357,7 @@ def append_message(
     mode: str = "normal",
     thread_id: Optional[int] = None,
     workspace: Optional[str] = None,
+    task_type: str = "",
 ) -> int:
     """Insert a message into the workspace's current (or given) thread, then texturize + archive past the window."""
     safe_role = role if role in {"user", "assistant", "system"} else "user"
@@ -347,8 +370,8 @@ def append_message(
         cursor = connection.execute(
             """
             INSERT INTO message_history
-                (role, content, timestamp, token_count, project_scope, provider, mode, thread_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (role, content, timestamp, token_count, project_scope, provider, mode, thread_id, task_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 safe_role,
@@ -359,6 +382,7 @@ def append_message(
                 provider[:120],
                 mode[:40],
                 resolved_thread,
+                (task_type or "")[:40],
             ),
         )
         message_id = int(cursor.lastrowid)

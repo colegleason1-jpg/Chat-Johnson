@@ -50,8 +50,10 @@ approved reconstruction plan.
 
 ## Operational environments
 
-Four tabs across the top of the main panel. Each tab owns its own threads (selector, New thread,
-Clear chat, Rename, health gauge, Migrate now); keys are never touched by any of these.
+A workspace switch across the top of the main panel and one chat bar pinned to the bottom of the
+screen. The bar always sends to the selected workspace, so the input is never out of reach while
+reading. Each workspace owns its own chats (selector, New chat, Clear chat, Delete chat, and a More
+menu with Rename, context load, and Migrate now); keys are never touched by any of these.
 
 - **Task Finder**: a mission is classified (research, code, analysis, plan, general) with no provider
   call and expanded into typed workstreams you can edit before launch. Steps run one at a time through
@@ -84,8 +86,14 @@ code block (versioned save to SQLite), output token budget slider, per-project s
 
 ## Threads and the thread-health agent
 
-Every workspace tab holds any number of **threads**. The thread bar at the top of each tab lets you
-switch, start a new one, rename, or **Clear chat** (messages move to the archive; keys are untouched).
+Every workspace holds any number of **chats** (threads). The row at the top of each workspace lets you
+switch, start a new one, **Clear chat** (messages move to the archive and leave the context; keys are
+untouched), or **Delete chat** (the chat, its archive, and its summaries are removed after a
+confirmation; locked artifacts stay). Rename and Migrate now live under More.
+
+Every send is traced in the **Routing log** on the right (workspace, task type, provider/model,
+latency, solver reason) and stored with its task type on the message, so routing can be judged
+against the project's vision over a long session.
 Each thread has its own 200-message window and its own texturized summaries.
 
 Before every send, a zero-quota **health sweep** measures the active thread: message count, estimated
