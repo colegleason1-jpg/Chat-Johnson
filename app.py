@@ -68,12 +68,14 @@ from orchestrator.config import PROVIDERS, bind_session_keys, provider_model, re
 from orchestrator.executor import Orchestrator
 from orchestrator.quota import QuotaLedger
 from orchestrator.router import (
+    CORTEX_ENDPOINTS,
     CortexStream,
     PaidReasoningSlot,
     ProviderError,
     byok_status,
     classify,
     cortex_available,
+    endpoint_model,
     generate_mode,
     probe_all_endpoints,
 )
@@ -164,11 +166,12 @@ def session_paid_slot() -> PaidReasoningSlot:
 def provider_status_rows() -> List[Tuple[str, str, str, bool]]:
     status = byok_status()
     rows: List[Tuple[str, str, str, bool]] = []
-    for name, label, model, env_name in (
-        ("google_ai_studio", "Google AI Studio", "Gemini 1.5 Pro", "GEMINI_API_KEY"),
-        ("groq", "Groq Cloud", "Llama 3.3 70B", "GROQ_API_KEY"),
-        ("huggingface", "Hugging Face Serverless", "Qwen2.5-Coder-32B", "HUGGINGFACE_API_KEY / HF_TOKEN"),
+    for name, label, env_name in (
+        ("google_ai_studio", "Google AI Studio", "GEMINI_API_KEY"),
+        ("groq", "Groq Cloud", "GROQ_API_KEY"),
+        ("huggingface", "Hugging Face Serverless", "HUGGINGFACE_API_KEY / HF_TOKEN"),
     ):
+        model = endpoint_model(CORTEX_ENDPOINTS[name])
         configured = bool(status.get(name, {}).get("configured", False))
         if name == "google_ai_studio":
             configured = bool(status.get("gemini", {}).get("configured", configured))
@@ -758,6 +761,21 @@ bind_session_keys(st.session_state.byok_keys)
 if "heavy_mode" not in st.session_state:
     st.session_state.heavy_mode = False
 
+WORKSPACES = ("Task Finder", "Repository Work", "Chat Bot", "Normal Chat")
+
+# The chosen workspace lives in its own session key so it survives any rerun
+# in which a selector widget is not rendered (Streamlit drops widget state in
+# that case, which would snap the radio back to the first option).
+if st.session_state.get("workspace") not in WORKSPACES:
+    st.session_state.workspace = WORKSPACES[0]
+
+
+def _sync_workspace(widget_key: str) -> None:
+    chosen = st.session_state.get(widget_key)
+    if chosen in WORKSPACES:
+        st.session_state.workspace = chosen
+
+
 ledger = get_quota_ledger()
 with st.sidebar:
     st.markdown(f"<div class='eyebrow'>Chat Johnson · Gen 2 · build {build_marker()}</div>", unsafe_allow_html=True)
@@ -811,6 +829,15 @@ with st.sidebar:
                 marker = "✅" if row["ok"] else ("⚪" if row["detail"] == "no key configured" else "❌")
                 status = f" · HTTP {row['status']}" if row["status"] else ""
                 st.caption(f"{marker} **{row['endpoint']}** · {row['model']} · key {row['key']}{status} · {row['detail']}")
+    st.radio(
+        "Workspace",
+        WORKSPACES,
+        index=WORKSPACES.index(st.session_state.workspace),
+        key="environment_sidebar",
+        on_change=_sync_workspace,
+        args=("environment_sidebar",),
+        help="Same switch as the main panel; handy on small screens.",
+    )
     project_input = st.text_input("Active project scope", value=st.session_state.project_scope, key="project_scope_input")
     st.session_state.project_scope = project_input.strip() or "chat-johnson"
     st.checkbox(
@@ -886,32 +913,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.caption("Project Seth's stochastic signal is an experimental routing feature only; it does not establish propulsion, lift, or a physical mechanism.")
-
-WORKSPACES = ("Task Finder", "Repository Work", "Chat Bot", "Normal Chat")
-
-# The chosen workspace lives in its own session key so it survives any rerun
-# in which a selector widget is not rendered (Streamlit drops widget state in
-# that case, which would snap the radio back to the first option).
-if st.session_state.get("workspace") not in WORKSPACES:
-    st.session_state.workspace = WORKSPACES[0]
-
-
-def _sync_workspace(widget_key: str) -> None:
-    chosen = st.session_state.get(widget_key)
-    if chosen in WORKSPACES:
-        st.session_state.workspace = chosen
-
-
-with st.sidebar:
-    st.radio(
-        "Workspace",
-        WORKSPACES,
-        index=WORKSPACES.index(st.session_state.workspace),
-        key="environment_sidebar",
-        on_change=_sync_workspace,
-        args=("environment_sidebar",),
-        help="Same switch as the main panel; handy on small screens.",
-    )
 
 left_panel, right_panel = st.columns([0.48, 0.52], gap="large")
 with left_panel:
