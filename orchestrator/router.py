@@ -20,8 +20,10 @@ import math
 import os
 import re
 import time
+import zlib
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 try:
     import requests
@@ -227,8 +229,12 @@ def _require_numpy() -> Any:
     return np
 
 
-def shannon_entropy(values: Sequence[float], bins: Optional[int] = None) -> float:
-    """Return histogram Shannon entropy H(x) in bits for a trajectory array."""
+def shannon_entropy(values: Sequence[float], bins: Any = None) -> float:
+    """Return histogram Shannon entropy H(x) in bits for a trajectory array.
+
+    ``bins`` may be a count (histogram over the data's own range) or explicit bin
+    edges (fixed range, so a wider distribution scores higher).
+    """
     if np is None:
         finite = [float(value) for value in values if math.isfinite(float(value))]
         if not finite or min(finite) == max(finite):
@@ -246,8 +252,8 @@ def shannon_entropy(values: Sequence[float], bins: Optional[int] = None) -> floa
     array = array[np.isfinite(array)]
     if array.size == 0 or float(array.max() - array.min()) == 0.0:
         return 0.0
-    bin_count = bins or max(8, min(128, int(math.sqrt(array.size)) * 2))
-    histogram, _ = np.histogram(array, bins=bin_count)
+    bin_spec: Any = bins if bins is not None else max(8, min(128, int(math.sqrt(array.size)) * 2))
+    histogram, _ = np.histogram(array, bins=bin_spec)
     probabilities = histogram.astype(float) / float(array.size)
     probabilities = probabilities[probabilities > 0.0]
     return float(-np.sum(probabilities * np.log2(probabilities)))
@@ -272,6 +278,9 @@ def fit_one_over_f_alpha(
         return float("nan")
     slope, _ = np.polyfit(np.log(frequency_array[mask]), np.log(power_array[mask]), 1)
     return float(-slope)
+
+
+ALPHA_FIT_REALIZATIONS = 8
 
 
 def generate_one_over_f_noise(
@@ -317,7 +326,19 @@ def generate_one_over_f_noise(
     if standard_deviation <= 0.0 or not math.isfinite(standard_deviation):
         raise FloatingPointError("1/f realization could not be standardized")
     samples /= standard_deviation
+    # The alpha estimate averages the periodogram over independent realizations
+    # (Bartlett-style); a single periodogram's bins are chi-squared(2) noisy.
     power = (array_lib.abs(array_lib.fft.rfft(samples)) ** 2) / float(length)
+    for _ in range(ALPHA_FIT_REALIZATIONS - 1):
+        extra = (rng.standard_normal(frequencies.size) + 1j * rng.standard_normal(frequencies.size)) * amplitude
+        extra[0] = 0.0
+        extra_samples = array_lib.fft.irfft(extra, n=length).astype(float)
+        extra_samples -= float(array_lib.mean(extra_samples))
+        extra_std = float(array_lib.std(extra_samples))
+        if extra_std > 0.0 and math.isfinite(extra_std):
+            extra_samples /= extra_std
+            power = power + (array_lib.abs(array_lib.fft.rfft(extra_samples)) ** 2) / float(length)
+    power = power / float(ALPHA_FIT_REALIZATIONS)
     alpha_estimate = fit_one_over_f_alpha(
         frequencies, power, cutoff, high_frequency_hz=high_frequency_hz
     )
@@ -404,41 +425,90 @@ def simulate_project_seth_trajectory(
     return trajectory_array
 
 
+# Rolling per-endpoint observations from real HTTP attempts: (latency_seconds, ok).
+ENDPOINT_TELEMETRY: Dict[str, Deque[Tuple[float, bool]]] = {}
+TELEMETRY_WINDOW = 50
+LATENCY_BASELINE_SECONDS = 2.0
+
+
+def record_telemetry(endpoint_name: str, latency_seconds: float, ok: bool) -> None:
+    bucket = ENDPOINT_TELEMETRY.setdefault(endpoint_name, deque(maxlen=TELEMETRY_WINDOW))
+    bucket.append((max(0.0, float(latency_seconds)), bool(ok)))
+
+
+def telemetry_snapshot(endpoint_name: str) -> Dict[str, float]:
+    """Observed failure rate and latency ratio for an endpoint (zeros when unobserved)."""
+    bucket = ENDPOINT_TELEMETRY.get(endpoint_name)
+    if not bucket:
+        return {"observations": 0.0, "failure_rate": 0.0, "latency_ratio": 0.0}
+    failures = sum(1 for _, ok in bucket if not ok)
+    successes = [latency for latency, ok in bucket if ok]
+    mean_latency = (sum(successes) / len(successes)) if successes else LATENCY_BASELINE_SECONDS
+    return {
+        "observations": float(len(bucket)),
+        "failure_rate": failures / len(bucket),
+        "latency_ratio": max(0.0, mean_latency / LATENCY_BASELINE_SECONDS - 1.0),
+    }
+
+
+def _entropy_bins(sample_count: int) -> int:
+    return max(8, min(128, int(math.sqrt(sample_count)) * 2))
+
+
+PENALTY_WEIGHTS = {"failure_rate": 0.6, "latency": 0.3, "seth": 0.1}
+_SETH_EDGES_RANGE = (-2.5, 2.5)
+
+
 def project_seth_routing_entropy(
     endpoint_names: Iterable[str],
     seed: Optional[int] = None,
     length: int = 128,
     alpha: float = 1.0,
+    telemetry: Optional[Mapping[str, Mapping[str, float]]] = None,
 ) -> Dict[str, float]:
-    """Produce normalized entropy penalties for the active routing channels."""
+    """Observed-degradation penalty per endpoint, in [0, 1].
+
+    penalty = 0.6 * failure_rate + 0.3 * min(1, latency_ratio / 2) + 0.1 * seth_term
+
+    failure_rate and latency_ratio come from real HTTP attempts recorded by
+    :func:`record_telemetry`; both terms are monotone in what was observed.
+    seth_term is the Project Seth SDE driven by those same observables (bias C
+    from the failure rate, noise gate sigma from latency), integrated on 1/f
+    forcing seeded by the endpoint name so it is reproducible, and scored as
+    the fixed-range histogram entropy gained over the undriven baseline. It is
+    a bounded stochastic-shape component, never the majority of the penalty.
+    An endpoint with no observations has no evidence against it and scores 0.
+    This is a routing signal, not a physical claim.
+    """
     names = list(endpoint_names)
-    if np is None:
-        return {name: 0.0 for name in names}
-    maximum = max(1.0, math.log2(max(8, min(128, int(math.sqrt(length)) * 2))))
-    root_seed = int(seed if seed is not None else time.time_ns() % (2**32 - 1))
     result: Dict[str, float] = {}
-    for index, name in enumerate(names):
-        noise = generate_one_over_f_noise(
-            length=length,
-            alpha=alpha,
-            seed=root_seed + index,
-            sample_rate=100.0,
-            low_frequency_hz=max(0.01, 100.0 / length),
+    for name in names:
+        snapshot = dict((telemetry or {}).get(name) or telemetry_snapshot(name))
+        if snapshot.get("observations", 0.0) <= 0.0:
+            result[name] = 0.0
+            continue
+        failure_rate = max(0.0, min(1.0, float(snapshot.get("failure_rate", 0.0))))
+        latency_ratio = max(0.0, min(3.0, float(snapshot.get("latency_ratio", 0.0))))
+        seth_term = 0.0
+        if np is not None:
+            endpoint_seed = int(seed) if seed is not None else zlib.crc32(name.encode("utf-8")) & 0xFFFFFFFF
+            noise = generate_one_over_f_noise(
+                length=length, alpha=alpha, seed=endpoint_seed, sample_rate=100.0, low_frequency_hz=max(0.01, 100.0 / length)
+            )
+            edges = np.linspace(_SETH_EDGES_RANGE[0], _SETH_EDGES_RANGE[1], _entropy_bins(length + 1) + 1)
+            baseline = simulate_project_seth_trajectory(0.0, noise.samples, 0.01, 0.12, 0.55, 0.01)
+            driven = simulate_project_seth_trajectory(
+                0.0, noise.samples, 0.01, 0.12 * (1.0 + latency_ratio), 0.55, 0.01 + 0.30 * failure_rate
+            )
+            maximum = max(1.0, math.log2(len(edges) - 1))
+            gain = (shannon_entropy(driven, bins=edges) - shannon_entropy(baseline, bins=edges)) / maximum
+            seth_term = max(0.0, min(1.0, gain))
+        penalty = (
+            PENALTY_WEIGHTS["failure_rate"] * failure_rate
+            + PENALTY_WEIGHTS["latency"] * min(1.0, latency_ratio / 2.0)
+            + PENALTY_WEIGHTS["seth"] * seth_term
         )
-        # The routing penalty is computed from the integrated trajectory, not
-        # from a raw noise series.  Coefficients vary only to create independent
-        # deterministic channels; this is an experimental signal, not a quality
-        # measurement or a physical observable.
-        trajectory = simulate_project_seth_trajectory(
-            initial_x=0.0,
-            eta=noise.samples,
-            dt=0.01,
-            sigma=0.12,
-            A=0.55 + 0.08 * index,
-            C=0.01 * (index + 1),
-        )
-        trajectory_entropy = shannon_entropy(trajectory)
-        result[name] = max(0.0, min(1.0, trajectory_entropy / maximum))
+        result[name] = max(0.0, min(1.0, penalty))
     return result
 
 
@@ -456,18 +526,26 @@ class MILPDecision:
     reason: str
 
 
+def _vendor(endpoint: "CortexEndpoint") -> str:
+    """The ledger bucket for an endpoint: one bucket per credential/vendor."""
+    return discovery.vendor_for(endpoint.name)
+
+
 def _ensure_cortex_ledger(ledger: Optional[QuotaLedger]) -> None:
+    """Register each Cortex endpoint's vendor bucket, tightening to the stricter policy.
+
+    The legacy registry may already have registered the same vendor (for example
+    ``gemini`` at 15 RPM); one key must be metered once, so the tighter of the
+    two ceilings applies to both routing paths.
+    """
     if ledger is None:
         return
     for endpoint in CORTEX_ENDPOINTS.values():
-        try:
-            ledger.usage(endpoint.name)
-        except KeyError:
-            ledger.register(
-                endpoint.name,
-                endpoint.rpm_limit,
-                endpoint.tpm_limit if endpoint.tpm_limit is not None else 10**9,
-            )
+        ledger.tighten(
+            _vendor(endpoint),
+            endpoint.rpm_limit,
+            endpoint.tpm_limit if endpoint.tpm_limit is not None else 10**9,
+        )
 
 
 def _endpoint_key(endpoint: CortexEndpoint) -> str:
@@ -483,12 +561,13 @@ def _endpoint_usage(
     ledger: Optional[QuotaLedger],
     current_usage: Optional[Mapping[str, Mapping[str, float]]],
 ) -> Tuple[float, float]:
-    if current_usage and endpoint.name in current_usage:
-        row = current_usage[endpoint.name]
-        return float(row.get("rpm_used", 0.0)), float(row.get("tpm_used", 0.0))
+    for key in (endpoint.name, _vendor(endpoint)):
+        if current_usage and key in current_usage:
+            row = current_usage[key]
+            return float(row.get("rpm_used", 0.0)), float(row.get("tpm_used", 0.0))
     if ledger is not None:
         try:
-            row = ledger.usage(endpoint.name)
+            row = ledger.usage(_vendor(endpoint))
             return float(row.get("rpm_used", 0.0)), float(row.get("tpm_used", 0.0))
         except KeyError:
             return 0.0, 0.0
@@ -511,17 +590,25 @@ def _utility_score(endpoint: CortexEndpoint, task_type: str, entropy_penalty: fl
     return float(raw + task_bonus - 0.30 * max(0.0, min(1.0, entropy_penalty)))
 
 
-def _feasible_endpoint(
-    endpoint: CortexEndpoint,
-    rpm_used: float,
-    tpm_used: float,
-    estimated_tokens: int,
-) -> bool:
+def _feasible_endpoint(endpoint: CortexEndpoint, rpm_used: float, tpm_used: float, estimated_tokens: int) -> bool:
+    """Kept for callers/tests: the same capacity rows the solver enforces, evaluated in Python."""
+    return bool(_endpoint_key(endpoint)) and not _capacity_reasons(endpoint, rpm_used, tpm_used, estimated_tokens)
+
+
+def _capacity_reasons(endpoint: CortexEndpoint, rpm_used: float, tpm_used: float, estimated_tokens: int) -> List[str]:
+    """Human-readable reasons an endpoint cannot take this request right now."""
+    reasons: List[str] = []
     if rpm_used + 1.0 > endpoint.rpm_limit:
-        return False
-    if endpoint.tpm_limit is not None and tpm_used + estimated_tokens > endpoint.tpm_limit:
-        return False
-    return bool(_endpoint_key(endpoint))
+        reasons.append(f"{int(rpm_used)}/{endpoint.rpm_limit} requests used in the last minute")
+    if endpoint.tpm_limit is not None:
+        if estimated_tokens > endpoint.tpm_limit:
+            reasons.append(
+                f"request needs ~{estimated_tokens} tokens but the ceiling is {endpoint.tpm_limit} TPM "
+                "(lower the output token budget or shorten the prompt)"
+            )
+        elif tpm_used + estimated_tokens > endpoint.tpm_limit:
+            reasons.append(f"~{int(tpm_used)}+{estimated_tokens} tokens would exceed {endpoint.tpm_limit} TPM this minute")
+    return reasons
 
 
 def _build_constraint_array(
@@ -530,7 +617,11 @@ def _build_constraint_array(
     estimated_tokens: int,
     enabled: Mapping[str, bool],
 ) -> Any:
-    """Build the unbending equality/capacity constraints for scipy.milp."""
+    """Constraint rows for scipy.milp: exclusivity, RPM capacity, TPM capacity, key/exclusion.
+
+    These rows decide feasibility. ``enabled`` only encodes "has a key and is not
+    excluded"; the RPM/TPM ceilings are enforced here, by the solver.
+    """
     if np is None or LinearConstraint is None:
         return None
     array_lib = _require_numpy()
@@ -540,35 +631,24 @@ def _build_constraint_array(
     upper: List[float] = [1.0]
 
     for index, endpoint in enumerate(endpoints):
+        rpm_used, tpm_used = usage[endpoint.name]
         row = array_lib.zeros(len(endpoints), dtype=float)
         row[index] = 1.0
-        rpm_used, _ = usage[endpoint.name]
         rows.append(row)
         lower.append(-array_lib.inf)
-        upper.append(float(max(0.0, endpoint.rpm_limit - rpm_used)))
-
-    for index, endpoint in enumerate(endpoints):
-        if endpoint.tpm_limit is None:
-            continue
-        row = array_lib.zeros(len(endpoints), dtype=float)
-        row[index] = float(estimated_tokens)
-        _, tpm_used = usage[endpoint.name]
-        rows.append(row)
-        lower.append(-array_lib.inf)
-        upper.append(float(max(0.0, endpoint.tpm_limit - tpm_used)))
-
-    # A missing key or explicit exclusion is represented as x_i <= 0. This is
-    # part of the linear constraint system rather than a post-solver mutation.
-    for index, endpoint in enumerate(endpoints):
+        upper.append(float(max(0.0, endpoint.rpm_limit - rpm_used)))  # x_i <= remaining requests
+        if endpoint.tpm_limit is not None:
+            row = array_lib.zeros(len(endpoints), dtype=float)
+            row[index] = float(estimated_tokens)
+            rows.append(row)
+            lower.append(-array_lib.inf)
+            upper.append(float(max(0.0, endpoint.tpm_limit - tpm_used)))  # tokens * x_i <= remaining tokens
         if not enabled.get(endpoint.name, False):
             row = array_lib.zeros(len(endpoints), dtype=float)
             row[index] = 1.0
             rows.append(row)
             lower.append(-array_lib.inf)
-            upper.append(0.0)
-
-    if LinearConstraint is None:
-        return None
+            upper.append(0.0)  # no key / excluded: x_i <= 0
     return LinearConstraint(array_lib.asarray(rows), array_lib.asarray(lower), array_lib.asarray(upper))
 
 
@@ -583,52 +663,40 @@ def select_milp_endpoint(
     """Select exactly one BYOK endpoint under strict RPM/TPM constraints.
 
     SciPy's ``milp`` receives binary integrality and a LinearConstraint whose
-    first row enforces sum(x)=1, followed by per-endpoint RPM and TPM caps.
-    When SciPy is not installed, the same feasible set is evaluated with a
-    deterministic binary fallback; no request is sent outside the caps.
+    rows enforce sum(x)=1, per-endpoint RPM and TPM capacity, and key/exclusion.
+    The solver decides feasibility; when SciPy is absent the identical rows are
+    evaluated in Python. When nothing is feasible the error names, per endpoint,
+    exactly which ceiling blocks it.
     """
     if estimated_tokens < 1:
         raise ValueError("estimated_tokens must be at least one")
     _ensure_cortex_ledger(ledger)
     excluded_set = set(excluded or ())
     endpoints = list(CORTEX_ENDPOINTS.values())
-    usage = {
-        endpoint.name: _endpoint_usage(endpoint, ledger, current_usage)
-        for endpoint in endpoints
-    }
+    usage = {endpoint.name: _endpoint_usage(endpoint, ledger, current_usage) for endpoint in endpoints}
     supplied_entropy = dict(entropy_by_endpoint or {})
     if not supplied_entropy:
-        supplied_entropy = project_seth_routing_entropy(
-            (endpoint.name for endpoint in endpoints),
-            length=128,
-        )
-    penalties = {
-        endpoint.name: float(supplied_entropy.get(endpoint.name, 0.0))
-        for endpoint in endpoints
-    }
-    utilities = {
-        endpoint.name: _utility_score(endpoint, task_type, penalties[endpoint.name])
-        for endpoint in endpoints
-    }
+        supplied_entropy = project_seth_routing_entropy((endpoint.name for endpoint in endpoints), length=128)
+    penalties = {endpoint.name: float(supplied_entropy.get(endpoint.name, 0.0)) for endpoint in endpoints}
+    utilities = {endpoint.name: _utility_score(endpoint, task_type, penalties[endpoint.name]) for endpoint in endpoints}
     enabled = {
-        endpoint.name: (
-            endpoint.name not in excluded_set
-            and bool(_endpoint_key(endpoint))
-            and _feasible_endpoint(endpoint, usage[endpoint.name][0], usage[endpoint.name][1], estimated_tokens)
-        )
-        for endpoint in endpoints
+        endpoint.name: endpoint.name not in excluded_set and bool(_endpoint_key(endpoint)) for endpoint in endpoints
     }
-    feasible = [endpoint for endpoint in endpoints if enabled[endpoint.name]]
-    if not feasible:
-        raise ProviderError(
-            "Cortex 2 found no BYOK endpoint with RPM/TPM headroom; "
-            "add a permitted key or wait for the provider window to roll over."
-        )
+    # The same capacity rows the solver sees, evaluated for the fallback and for diagnostics.
+    blocked: Dict[str, List[str]] = {}
+    for endpoint in endpoints:
+        if not enabled[endpoint.name]:
+            blocked[endpoint.name] = ["no key configured" if not _endpoint_key(endpoint) else "already tried this request"]
+            continue
+        reasons = _capacity_reasons(endpoint, usage[endpoint.name][0], usage[endpoint.name][1], estimated_tokens)
+        if reasons:
+            blocked[endpoint.name] = reasons
+    feasible = [endpoint for endpoint in endpoints if endpoint.name not in blocked]
 
-    constraint = _build_constraint_array(endpoints, usage, estimated_tokens, enabled)
     decision_vector: Dict[str, int]
     solver_name = "deterministic-binary-fallback"
     chosen: Optional[CortexEndpoint] = None
+    constraint = _build_constraint_array(endpoints, usage, estimated_tokens, enabled)
 
     if milp is not None and constraint is not None and Bounds is not None:
         objective = -np.asarray([utilities[endpoint.name] for endpoint in endpoints], dtype=float)
@@ -644,13 +712,17 @@ def select_milp_endpoint(
             if len(selected_indices) == 1:
                 chosen = endpoints[selected_indices[0]]
                 solver_name = "scipy.optimize.milp"
+        elif feasible:
+            # Solver and Python rows disagree only if the model is malformed; surface it loudly.
+            raise ProviderError(f"Cortex 2 solver reported infeasible while rows allow {[e.name for e in feasible]}")
 
     if chosen is None:
+        if not feasible:
+            detail = "; ".join(f"{name}: {', '.join(reasons)}" for name, reasons in blocked.items())
+            raise ProviderError(f"Cortex 2 found no BYOK endpoint with headroom -> {detail}")
         chosen = max(feasible, key=lambda endpoint: (utilities[endpoint.name], -endpoints.index(endpoint)))
 
-    decision_vector = {
-        endpoint.name: int(endpoint.name == chosen.name) for endpoint in endpoints
-    }
+    decision_vector = {endpoint.name: int(endpoint.name == chosen.name) for endpoint in endpoints}
     return MILPDecision(
         endpoint=chosen,
         decision_vector=decision_vector,
@@ -751,6 +823,8 @@ def _resilient_post(
     stream: bool,
     system_prompt: str,
     timeout: int,
+    ledger: Optional[QuotaLedger] = None,
+    probe: bool = False,
 ) -> Tuple[Any, str]:
     """POST to the endpoint with retirement recovery, transient retries, and sibling fallback.
 
@@ -765,23 +839,33 @@ def _resilient_post(
     model_id = endpoint_model(selected)
     rediscovered = False
     last_error = "no attempt made"
+    max_attempts = 1 if probe else discovery.MAX_TRANSIENT_ATTEMPTS
+    max_models = 2 if probe else 4  # a probe may follow one retired-id rediscovery, never sibling fallback
+    vendor = _vendor(selected)
 
     while True:
         tried.append(model_id)
-        for attempt in range(1, discovery.MAX_TRANSIENT_ATTEMPTS + 1):
+        for attempt in range(1, max_attempts + 1):
             url, headers, payload = build_cortex_request(
                 selected, messages, max_tokens, temperature, stream=stream, system_prompt=system_prompt, model_id=model_id
             )
+            if ledger is not None:
+                ledger.record_attempt(vendor)  # every real POST counts toward the vendor's RPM
+            started = time.monotonic()
             try:
                 response = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=stream)
             except requests.RequestException as exc:
+                record_telemetry(selected.name, time.monotonic() - started, False)
                 last_error = f"network error: {exc}"
-                if attempt < discovery.MAX_TRANSIENT_ATTEMPTS:
+                if attempt < max_attempts:
                     discovery.sleep(discovery.retry_delay(attempt))
                     continue
                 raise ProviderError(f"{selected.name} {last_error}") from exc
+            latency = time.monotonic() - started
             if response.status_code < 400:
+                record_telemetry(selected.name, latency, True)
                 return response, model_id
+            record_telemetry(selected.name, latency, False)
             response.encoding = "utf-8"
             detail = response.text[:400]
             retry_after = response.headers.get("Retry-After") if hasattr(response, "headers") else None
@@ -789,7 +873,7 @@ def _resilient_post(
             if secret:
                 detail = detail.replace(secret, "[REDACTED_SECRET]")
             last_error = f"HTTP {response.status_code}: {detail}"
-            if discovery.is_transient(response.status_code) and attempt < discovery.MAX_TRANSIENT_ATTEMPTS:
+            if discovery.is_transient(response.status_code) and attempt < max_attempts:
                 discovery.sleep(discovery.retry_delay(attempt, retry_after))
                 continue
             break  # permanent error, or transient retries exhausted, for this model
@@ -802,7 +886,7 @@ def _resilient_post(
             if replacement and replacement not in tried:
                 model_id = replacement
                 continue
-        if not key_override and not original and len(tried) < 4 and discovery.looks_like_unusable_model(status, last_error):
+        if not key_override and not original and len(tried) < max_models and discovery.looks_like_unusable_model(status, last_error):
             # A discovered or sibling id this key cannot use (OAuth-only, allowlisted, gone):
             # drop it from the cache and move to the next validated candidate.
             discovery.DISCOVERED.pop(discovery.vendor_for(selected.name), None)
@@ -810,7 +894,7 @@ def _resilient_post(
             if replacement and replacement not in tried:
                 model_id = replacement
                 continue
-        if not key_override and discovery.is_transient(status):
+        if not key_override and not probe and discovery.is_transient(status):
             siblings = [
                 name for name in discovery.alternates(
                     selected.name, selected.kind, selected.base_url, secret, model_id, timeout=min(timeout, 20)
@@ -911,6 +995,10 @@ def _iter_sse_payloads(response: requests.Response) -> Iterator[Mapping[str, Any
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, dict):
+            if "error" in parsed and not parsed.get("choices") and not parsed.get("candidates"):
+                error = parsed.get("error")
+                message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+                raise ProviderError(f"stream error frame: {str(message)[:300]}")
             yield parsed
 
 
@@ -921,6 +1009,7 @@ def cortex_stream(
     temperature: float = 0.2,
     system_prompt: str = "",
     timeout: Optional[int] = None,
+    ledger: Optional[QuotaLedger] = None,
 ) -> Iterator[str]:
     """Yield generated text chunks from a MILP-selected provider endpoint.
 
@@ -933,15 +1022,31 @@ def cortex_stream(
     selected = _as_endpoint(endpoint)
     effective_timeout = timeout or int(os.environ.get("CHAT_JOHNSON_TIMEOUT", "120"))
     response, _ = _resilient_post(
-        selected, messages, max_tokens, temperature, stream=True, system_prompt=system_prompt, timeout=effective_timeout
+        selected, messages, max_tokens, temperature, stream=True, system_prompt=system_prompt,
+        timeout=effective_timeout, ledger=ledger,
     )
+    emitted = False
     try:
         for payload_item in _iter_sse_payloads(response):
             chunk = _extract_stream_text(selected, payload_item)
             if chunk:
+                emitted = True
                 yield chunk
     finally:
         response.close()
+    if not emitted:
+        raise ProviderError(f"{selected.name} returned an empty stream (no text; blocked, truncated, or filtered)")
+
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN = re.compile(r"^\s*<think>.*\Z", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning_tags(text: str) -> str:
+    """Remove <think>…</think> blocks reasoning models put in message content; never show hidden reasoning."""
+    cleaned = _THINK_BLOCK.sub("", text or "")
+    cleaned = _THINK_OPEN.sub("", cleaned)  # an unterminated block means the answer never started
+    return cleaned.strip() if cleaned != text else text
 
 
 def _estimate_tokens(messages: Sequence[Mapping[str, str]], output: str = "") -> int:
@@ -987,12 +1092,12 @@ def cortex_generate(
                 max_tokens=max_tokens,
                 temperature=temperature,
                 system_prompt=system_prompt,
+                ledger=ledger,
             )
-            text = "".join(chunks)
+            text = strip_reasoning_tags("".join(chunks))
             tokens = _estimate_tokens(messages, text)
             if ledger is not None:
-                _ensure_cortex_ledger(ledger)
-                ledger.record(endpoint.name, tokens)
+                ledger.record(_vendor(endpoint), tokens, count_request=False)
             route_decision = RouteDecision(
                 provider=endpoint.name,
                 model=endpoint_model(endpoint),
@@ -1051,12 +1156,13 @@ class CortexStream:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             system_prompt=self.system_prompt,
+            ledger=self.ledger,
         ):
             self.text += chunk
             yield chunk
+        self.text = strip_reasoning_tags(self.text)
         if self.ledger is not None:
-            _ensure_cortex_ledger(self.ledger)
-            self.ledger.record(self.milp.endpoint.name, _estimate_tokens(self.messages, self.text))
+            self.ledger.record(_vendor(self.milp.endpoint), _estimate_tokens(self.messages, self.text), count_request=False)
 
 
 def stream_generation(
@@ -1109,7 +1215,8 @@ def probe_endpoint(endpoint: str | CortexEndpoint, timeout: int = 20) -> Dict[st
     configured = endpoint_model(selected)
     try:
         response, used_model = _resilient_post(
-            selected, [{"role": "user", "content": "ping"}], 8, 0.0, stream=False, system_prompt="", timeout=timeout
+            selected, [{"role": "user", "content": "ping"}], 8, 0.0, stream=False, system_prompt="",
+            timeout=timeout, probe=True,
         )
     except ProviderError as exc:
         text = str(exc)
@@ -1344,7 +1451,7 @@ def generate(
     tried: List[str] = []
     failures: Dict[str, str] = {}
     for name in candidates(normalized_type, settings_value.providers_available()):
-        if PROVIDERS[name].context_window < estimated_tokens or not ledger.has_headroom(name, estimated_tokens):
+        if PROVIDERS[name].context_window < estimated_tokens or not ledger.has_headroom(discovery.vendor_for(name), estimated_tokens):
             failures[name] = "skipped: no quota headroom or context too small"
             continue
         tried.append(name)
@@ -1353,7 +1460,7 @@ def generate(
         except ProviderError as exc:
             failures[name] = str(exc)
             continue
-        ledger.record(name, tokens)
+        ledger.record(discovery.vendor_for(name), tokens)
         config = PROVIDERS[name]
         return text, RouteDecision(
             name,

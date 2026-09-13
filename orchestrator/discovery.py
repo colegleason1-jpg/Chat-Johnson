@@ -31,8 +31,8 @@ VENDOR_PREFERENCES: Dict[str, Tuple[str, ...]] = {
     "groq": ("openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"),
     "huggingface": ("Qwen/Qwen2.5-Coder-32B-Instruct", "Qwen/Qwen3-Coder-30B-A3B-Instruct"),
     "nvidia": (
-        "deepseek-ai/deepseek-v3.2", "deepseek-ai/deepseek-r1-0528", "deepseek-ai/deepseek-r1",
         "meta/llama-3.3-70b-instruct", "qwen/qwen3-coder-480b-a35b-instruct", "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "deepseek-ai/deepseek-v3.2", "deepseek-ai/deepseek-r1-0528", "deepseek-ai/deepseek-r1",
     ),
     "openrouter": (
         "qwen/qwen-2.5-coder-32b-instruct:free", "deepseek/deepseek-chat-v3-0324:free", "meta-llama/llama-3.3-70b-instruct:free",

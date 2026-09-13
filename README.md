@@ -128,10 +128,25 @@ at call time in this order:
 1. an env override: `CORTEX_GEMINI_MODEL`, `CORTEX_GROQ_MODEL`, `CORTEX_HF_MODEL`;
 2. a live id discovered from the vendor's model list after a "retired / not found" error
    (cached for the process, preferring the newest Flash / gpt-oss ids);
-3. the built-in default (`gemini-2.5-flash`, `openai/gpt-oss-120b`, `Qwen/Qwen2.5-Coder-32B-Instruct`).
+3. the built-in default (`gemini-3.6-flash`, `openai/gpt-oss-120b`, `Qwen/Qwen2.5-Coder-32B-Instruct`; legacy NVIDIA default `meta/llama-3.3-70b-instruct`).
 
-The RPM/TPM ceilings never change with the id. The sidebar **Test keys** button sends one tiny
-request per configured endpoint and reports the real HTTP status, including any auto-switch.
+The RPM/TPM ceilings never change with the id. The sidebar **Test keys** button sends one small
+request per configured provider (plus one model lookup if the id is retired) and reports the real
+HTTP status, key fingerprint, and any auto-switch. Probes count toward the vendor's request ceiling.
+
+### Routing signals, honestly labelled
+
+- **Cortex 2** selects one endpoint with `scipy.optimize.milp`; its constraint rows (exclusivity, RPM
+  capacity, TPM capacity, key present) decide feasibility. When nothing fits, the error names the
+  blocking ceiling per endpoint. Without SciPy the identical rows are evaluated in Python.
+- **Cortex 3** turns *observed* telemetry into a penalty: every real HTTP attempt records latency and
+  outcome per endpoint; the Project Seth SDE is driven by the observed failure rate (bias term) and
+  latency (noise gate), seeded by the endpoint name so it is reproducible, and the penalty is the
+  entropy gained over the undriven baseline. An endpoint with no observations gets no penalty. This
+  is a routing signal, not a physical claim.
+- **Quota ledger**: one bucket per vendor credential; every HTTP attempt (retries, rediscovery,
+  probes) counts toward RPM; tokens are charged on success. A visitor's ledger is keyed by a
+  non-reversible fingerprint of their applied keys, so visitors never throttle each other.
 
 ### Paid reasoning slot (optional, session-only)
 

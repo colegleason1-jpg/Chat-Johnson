@@ -204,8 +204,14 @@ def chat(
     """Send a chat completion to a provider. Returns (text, total_tokens)."""
     s = settings or get_settings()
     cfg = PROVIDERS[provider]
-    if not provider_api_key(cfg):
+    key = provider_api_key(cfg)
+    if not key:
         raise ProviderError(f"no API key configured for provider '{provider}'")
-    if cfg.kind == "gemini":
-        return _call_gemini(provider, messages, s, max_tokens, temperature)
-    return _call_openai_compatible(provider, messages, s, max_tokens, temperature)
+    try:
+        if cfg.kind == "gemini":
+            return _call_gemini(provider, messages, s, max_tokens, temperature)
+        return _call_openai_compatible(provider, messages, s, max_tokens, temperature)
+    except ProviderError as exc:
+        # Never let a vendor echo of the credential escape into logs or the vault.
+        message = str(exc).replace(key, "[REDACTED_SECRET]")
+        raise ProviderError(message, status_code=exc.status_code, body=exc.body.replace(key, "[REDACTED_SECRET]")) from None

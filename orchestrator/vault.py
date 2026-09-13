@@ -310,7 +310,10 @@ def estimate_tokens(text: str) -> int:
 
 _SECRET_SHAPES = (
     re.compile(r"(?i)(api[_ -]?key|client[_ -]?secret|access[_ -]?token|bearer)\s*[:=]\s*[^\s,;]+"),
-    re.compile(r"\b(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|AIza[A-Za-z0-9_-]{20,})\b"),
+    re.compile(
+        r"\b(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{12,}|AIza[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9]{12,}"
+        r"|nvapi-[A-Za-z0-9_-]{12,}|csk-[A-Za-z0-9_-]{12,}|hf_[A-Za-z0-9]{12,}|AQ\.[A-Za-z0-9_-]{20,})\b"
+    ),
 )
 
 

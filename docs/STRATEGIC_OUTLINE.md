@@ -17,7 +17,7 @@ The repo is not an empty shell. The last Freebuff commit (`910cd6f`, 2026-09-13 
 | Cortex 3: rFFT 1/f noise, low-frequency clamp, standardization, alpha fit, Shannon entropy | `router.py` `generate_one_over_f_noise`, `fit_one_over_f_alpha`, `shannon_entropy` | Done |
 | Cortex 3: Euler-Maruyama step `x + [A(x-x^3)+C]dt + sigma(1+|x|)eta sqrt(dt)` | `router.py` `advance_stochastic_project_seth_step`, `simulate_project_seth_trajectory` | Done, exact stencil |
 | Cortex 2: `scipy.optimize.milp` with sum(x)=1, RPM and TPM rows, no-key exclusion rows, entropy-weighted utility | `router.py` `select_milp_endpoint`, `_build_constraint_array` | Done, with deterministic fallback when SciPy is absent |
-| Free-tier ceilings 2/32k, 30/15k, 60 RPM | `router.py` `CORTEX_ENDPOINTS` | Done |
+| Free-tier ceilings 2 RPM / 32k TPM (Gemini), 30 RPM / 8k TPM (Groq, tightened 2026-09-13 to its free plan), 60 RPM (Hugging Face) | `router.py` `CORTEX_ENDPOINTS` | Done; policy ceilings, not vendor guarantees |
 | Cortex 1: provider payload formatting, system prompt append, SSE stream | `router.py` `build_cortex_request`, `cortex_stream`, `cortex_generate` | Done |
 | Heavy Mode multi-pass (draft → critique → synthesis) | `router.py` `_heavy_pipeline`, `generate_mode` | Done, bounded |
 | Tree sanitization of `App.py`, `Router.py`, `Sandbox.py` | `app.py` `_sanitize_duplicate_modules` | Done, runs at import |
@@ -63,7 +63,7 @@ throw away working, tested code. The right move is to harden, clean, and extend.
    and the GitHub OAuth state check all have zero tests. This is the main crash-recovery risk: without
    tests, a future corruption is invisible.
 5. **Model IDs will age out.** *Resolved 2026-09-13:* env override → live discovery from the vendor
-   model list after a retirement error → default. Defaults moved to `gemini-2.5-flash` and
+   model list after a retirement error → default. Defaults moved to `gemini-3.6-flash` (after Google retired 2.5 Flash for new users) and
    `openai/gpt-oss-120b`; Groq TPM ceiling tightened to its free-plan 8K. Ceilings stay policy.
 6. **Heavy Mode spec conflict.** The directive names o1/o3-mini chains. OpenAI has no free tier, which
    violates the BYOK free-only invariant in the Bible. Current code runs Heavy Mode as a bounded

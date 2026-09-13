@@ -45,6 +45,37 @@ class QuotaLedger:
             self._limits[provider] = (rpm_limit, tpm_limit)
             self._buckets.setdefault(provider, Bucket())
 
+    def tighten(self, provider: str, rpm_limit: int, tpm_limit: int) -> None:
+        """Register, or lower existing limits to the stricter of the two policies.
+
+        One credential must have exactly one bucket, so when two routing tables
+        describe the same vendor the tighter ceiling wins.
+        """
+        with self._lock:
+            current = self._limits.get(provider)
+            if current is None:
+                self._limits[provider] = (rpm_limit, tpm_limit)
+            else:
+                self._limits[provider] = (min(current[0], rpm_limit), min(current[1], tpm_limit))
+            self._buckets.setdefault(provider, Bucket())
+
+    def known(self, provider: str) -> bool:
+        with self._lock:
+            return provider in self._limits
+
+    def record_attempt(self, provider: str) -> None:
+        """Count one HTTP request against the RPM window without charging tokens.
+
+        Every real POST counts toward a vendor's request ceiling, including
+        retries, rediscovery, and probes; tokens are charged separately on success.
+        """
+        now = time.time()
+        with self._lock:
+            bucket = self._buckets.setdefault(provider, Bucket())
+            self._limits.setdefault(provider, (10**9, 10**9))
+            self._prune(bucket, now)
+            bucket.requests.append(now)
+
     def _prune(self, bucket: Bucket, now: float) -> None:
         while bucket.requests and now - bucket.requests[0] > WINDOW_SECONDS:
             bucket.requests.popleft()
@@ -99,12 +130,14 @@ class QuotaLedger:
             )
             return max(0.0, need_req_wait, need_tok_wait)
 
-    def record(self, provider: str, tokens: int) -> None:
-        """Record one completed request consuming `tokens` total."""
+    def record(self, provider: str, tokens: int, count_request: bool = True) -> None:
+        """Charge `tokens` for one completed request (and one request unless already counted)."""
         now = time.time()
         with self._lock:
-            bucket = self._buckets[provider]
+            bucket = self._buckets.setdefault(provider, Bucket())
+            self._limits.setdefault(provider, (10**9, 10**9))
             self._prune(bucket, now)
-            bucket.requests.append(now)
+            if count_request:
+                bucket.requests.append(now)
             bucket.tokens.append((now, max(tokens, 1)))
             bucket.daily_tokens += max(tokens, 1)

@@ -693,6 +693,143 @@ def test_probe_includes_legacy_providers_with_status(monkeypatch):
 def test_legacy_vendor_discovery_covers_nvidia():
     from orchestrator import discovery
     assert discovery.vendor_for("nvidia") == "nvidia"
-    ranked = discovery.rank_models("nvidia", ["meta/llama-3.3-70b-instruct", "deepseek-ai/deepseek-r1", "other/x"])
-    assert ranked[0] == "deepseek-ai/deepseek-r1"
+    ranked = discovery.rank_models("nvidia", ["deepseek-ai/deepseek-r1", "meta/llama-3.3-70b-instruct", "other/x"])
+    assert ranked[0] == "meta/llama-3.3-70b-instruct"  # a non-reasoning default: no <think> blocks in chat
     assert discovery.rank_models("openrouter", ["a/b", "c/d:free"])[0] == "c/d:free"
+
+
+# ----------------------------------------------------------------------------
+# Audit follow-ups: telemetry-driven penalty, one bucket per vendor, metering,
+# load-bearing MILP rows, stream error frames, probes, reasoning tags
+# ----------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def clear_telemetry():
+    router.ENDPOINT_TELEMETRY.clear()
+    yield
+    router.ENDPOINT_TELEMETRY.clear()
+
+
+def test_entropy_penalty_is_zero_without_observations_and_grows_with_failures():
+    names = list(CORTEX_ENDPOINTS)
+    assert project_seth_routing_entropy(names) == {name: 0.0 for name in names}
+    for _ in range(10):
+        router.record_telemetry("groq", 0.4, True)
+    for _ in range(10):
+        router.record_telemetry("google_ai_studio", 0.4, False)
+    penalties = project_seth_routing_entropy(names)
+    assert penalties["huggingface"] == 0.0
+    assert penalties["google_ai_studio"] > penalties["groq"] >= 0.0
+    assert project_seth_routing_entropy(names) == penalties  # deterministic: seeded by endpoint name
+
+
+def test_latency_degradation_raises_penalty():
+    for _ in range(10):
+        router.record_telemetry("groq", 0.3, True)
+    calm = project_seth_routing_entropy(["groq"])["groq"]
+    router.ENDPOINT_TELEMETRY.clear()
+    for _ in range(10):
+        router.record_telemetry("groq", 7.0, True)
+    slow = project_seth_routing_entropy(["groq"])["groq"]
+    assert slow > calm
+
+
+def test_one_gemini_key_is_metered_in_one_bucket(all_keys, monkeypatch):
+    ledger = QuotaLedger({"gemini": (15, 1_000_000)})  # what the legacy registry pre-registers
+    router._ensure_cortex_ledger(ledger)
+    usage = ledger.usage("gemini")
+    assert (usage["rpm_limit"], usage["tpm_limit"]) == (2, 32_000)  # tightened to the strict Cortex policy
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: FakeResponse(lines=sse({"candidates": [{"content": {"parts": [{"text": "hi"}]}}]})))
+    zero = {name: 0.0 for name in CORTEX_ENDPOINTS}
+    monkeypatch.setattr(router, "project_seth_routing_entropy", lambda *a, **k: zero)
+    cortex_generate("context_load", [{"role": "user", "content": "x"}], ledger=ledger, max_tokens=16)
+    assert ledger.usage("gemini")["rpm_used"] == 1
+    with pytest.raises(KeyError):
+        ledger.usage("google_ai_studio")
+
+
+def test_every_http_attempt_counts_toward_rpm(all_keys, monkeypatch):
+    calls = {"n": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return FakeResponse(status_code=503, text="busy")
+        return FakeResponse(lines=sse({"choices": [{"delta": {"content": "ok"}}]}))
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    ledger = QuotaLedger({})
+    text, _ = cortex_generate("quick_text", [{"role": "user", "content": "x"}], ledger=ledger, max_tokens=16)
+    assert text == "ok"
+    assert ledger.usage("groq")["rpm_used"] == 3  # two retries plus the success
+
+
+def test_milp_error_names_the_blocking_ceiling(all_keys):
+    zero = {name: 0.0 for name in CORTEX_ENDPOINTS}
+    # Hugging Face has no TPM ceiling, so it would absorb the request; exclude it to force the diagnostic.
+    with pytest.raises(ProviderError) as excinfo:
+        select_milp_endpoint("quick_text", 200_000, entropy_by_endpoint=zero, excluded=("huggingface",))
+    message = str(excinfo.value)
+    assert "groq: request needs ~200000 tokens but the ceiling is 8000 TPM" in message
+    assert "google_ai_studio: request needs ~200000 tokens" in message
+    assert "huggingface: already tried this request" in message
+
+
+def test_milp_rows_decide_feasibility_not_python_prefilter(all_keys, monkeypatch):
+    """With SciPy present the solver must reject the over-cap endpoint on its own rows."""
+    zero = {name: 0.0 for name in CORTEX_ENDPOINTS}
+    monkeypatch.setattr(router, "_capacity_reasons", lambda *a, **k: [])  # disable the Python diagnostics
+    decision = select_milp_endpoint("context_load", 40_000, entropy_by_endpoint=zero)
+    assert decision.solver == "scipy.optimize.milp"
+    assert decision.endpoint.name == "huggingface"  # Gemini's TPM row excludes it; HF has no TPM row
+
+
+def test_stream_error_frame_and_empty_stream_raise(all_keys, monkeypatch):
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: FakeResponse(lines=sse({"error": {"message": "quota exhausted", "code": 429}})))
+    with pytest.raises(ProviderError) as excinfo:
+        list(router.cortex_stream("groq", [{"role": "user", "content": "x"}]))
+    assert "quota exhausted" in str(excinfo.value)
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: FakeResponse(lines=["data: [DONE]"]))
+    with pytest.raises(ProviderError) as excinfo:
+        list(router.cortex_stream("groq", [{"role": "user", "content": "x"}]))
+    assert "empty stream" in str(excinfo.value)
+
+
+def test_probe_makes_a_single_request_even_on_transient_error(all_keys, monkeypatch):
+    calls = {"n": 0}
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        calls["n"] += 1
+        return FakeResponse(status_code=503, text="busy")
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    row = router.probe_endpoint("groq")
+    assert calls["n"] == 1
+    assert row["ok"] is False and row["status"] == 503
+
+
+def test_reasoning_tags_are_stripped_from_answers(all_keys, monkeypatch):
+    raw = "<think>secret chain of thought</think>\nThe answer is 42."
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: FakeResponse(lines=sse({"choices": [{"delta": {"content": raw}}]})))
+    text, _ = cortex_generate("quick_text", [{"role": "user", "content": "x"}], max_tokens=16)
+    assert text == "The answer is 42."
+    assert router.strip_reasoning_tags("<think>never finished") == ""
+    assert router.strip_reasoning_tags("plain") == "plain"
+
+
+def test_legacy_error_text_never_contains_the_key(monkeypatch):
+    from orchestrator import providers, config
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_legacysecret1234567890")
+
+    class Resp:
+        def __init__(self):
+            self.status_code, self.text, self.headers = 401, "bad key gsk_legacysecret1234567890", {}
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(providers.requests, "post", lambda *a, **k: Resp())
+    with pytest.raises(ProviderError) as excinfo:
+        providers.chat("groq", [{"role": "user", "content": "x"}], settings=config.get_settings())
+    assert "gsk_legacysecret" not in str(excinfo.value)
+    assert "[REDACTED_SECRET]" in str(excinfo.value)

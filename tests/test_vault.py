@@ -112,3 +112,20 @@ def test_artifact_body_is_redacted(db):
     with db._open_database() as connection:
         body = connection.execute("SELECT code_body FROM artifact_store").fetchone()[0]
     assert "ghp_abcdefghijklmnopqrstuvwxyz" not in body
+
+
+def test_redaction_covers_every_supported_key_shape(db):
+    samples = {
+        "groq": "gsk_abcdefghijklmnopqrstuvwxyz0123",
+        "nvidia": "nvapi-abcdefghijklmnopqrstuvwxyz0123",
+        "cerebras": "csk-abcdefghijklmnopqrstuvwxyz0123",
+        "hf": "hf_abcdefghijklmnopqrstuvwxyz0123",
+        "google_new": "AQ.Ab8RN6KMDVwvwdjNI4op4GmmLqSAnVMsq",
+        "google": "AIzaSyAbcdefghijklmnopqrstuvwxyz0123",
+    }
+    for name, secret in samples.items():
+        db.append_message("scope", "user", f"{name} key is {secret}")
+    for row in db.recent_messages("scope"):
+        for secret in samples.values():
+            assert secret not in row["content"]
+        assert "[REDACTED_SECRET]" in row["content"]

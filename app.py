@@ -80,6 +80,7 @@ from orchestrator.router import (
     endpoint_model,
     generate_mode,
     probe_all_endpoints,
+    strip_reasoning_tags,
 )
 
 
@@ -120,19 +121,48 @@ initialize_database()
 # =============================================================================
 
 @st.cache_resource
+def _ledger_registry() -> Dict[str, Tuple[QuotaLedger, threading.Lock]]:
+    """Process-wide registry of ledgers, one per distinct credential set."""
+    return {}
+
+
+def credential_fingerprint() -> str:
+    """Non-reversible id of the keys in effect for this session (overlay + environment)."""
+    from orchestrator.config import resolve_secret as _resolve
+    from orchestrator.router import BYOK_ENV_KEYS
+
+    material = "|".join(
+        f"{env}:{hashlib.sha256(_resolve(env).encode()).hexdigest()[:16]}"
+        for names in BYOK_ENV_KEYS.values() for env in names if _resolve(env)
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:16] if material else "no-keys"
+
+
 def get_quota_ledger() -> QuotaLedger:
-    return QuotaLedger({name: (cfg.rpm_limit, cfg.tpm_limit) for name, cfg in PROVIDERS.items()})
+    """The ledger for THIS visitor's keys. Two visitors with different keys never share a bucket.
 
-
-@st.cache_resource
-def get_task_request_lock() -> threading.Lock:
-    """Serialize task-finder provider calls around quota check + record.
-
-    Futures still provide independent task lifecycle/progress, while this
-    narrow lock prevents concurrent workers from observing the same RPM/TPM
-    headroom and collectively exceeding the hard free-tier policy.
+    Buckets are keyed by vendor (one credential = one bucket) and start from
+    the legacy registry's ceilings; Cortex tightens them to its stricter policy.
     """
-    return threading.Lock()
+    registry = _ledger_registry()
+    fingerprint = credential_fingerprint()
+    if fingerprint not in registry:
+        from orchestrator.discovery import vendor_for
+
+        limits: Dict[str, Tuple[int, int]] = {}
+        for name, cfg in PROVIDERS.items():
+            vendor = vendor_for(name)
+            rpm, tpm = limits.get(vendor, (cfg.rpm_limit, cfg.tpm_limit))
+            limits[vendor] = (min(rpm, cfg.rpm_limit), min(tpm, cfg.tpm_limit))
+        registry[fingerprint] = (QuotaLedger(limits), threading.Lock())
+    return registry[fingerprint][0]
+
+
+def get_task_request_lock() -> threading.Lock:
+    """Serialize Task Finder provider calls for this visitor's keys around quota check + record."""
+    registry = _ledger_registry()
+    get_quota_ledger()
+    return registry[credential_fingerprint()][1]
 
 
 @st.cache_resource
@@ -212,7 +242,7 @@ def build_prompt_messages(
     context = context_block(project_scope, workspace=workspace)
     parts = [f"ACTIVE PROJECT: {project_scope}", "PROJECT MEMORY:\n" + context]
     if injected_context.strip():
-        parts.append("USER-CONSENTED FILE INJECTIONS:\n" + injected_context[:120_000])
+        parts.append("USER-CONSENTED FILE INJECTIONS:\n" + injected_context)  # already budgeted per file
     parts.append("CURRENT REQUEST:\n" + user_prompt.strip())
     return [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}]
 
@@ -320,6 +350,22 @@ def safe_preview_document(source: str) -> str:
     )
 
 
+_EXTENSION_LANGUAGES = {
+    "py": "python", "js": "javascript", "ts": "typescript", "tsx": "typescript", "jsx": "javascript", "json": "json",
+    "md": "markdown", "yml": "yaml", "yaml": "yaml", "toml": "toml", "css": "css", "html": "html", "sql": "sql",
+    "sh": "bash", "bash": "bash", "txt": "text",
+}
+
+
+def display_language(language: str, body: str) -> str:
+    """Prism language for st.code: 'file: path.py' fences derive it from the extension."""
+    label = language.strip()
+    if label.lower().startswith("file:"):
+        path = infer_artifact_path(label, body)
+        return _EXTENSION_LANGUAGES.get(path.rsplit(".", 1)[-1].lower(), "text") if "." in path else "text"
+    return label.split(":", 1)[0].strip() or "text"
+
+
 def infer_artifact_path(language: str, body: str) -> str:
     label = language.strip()
     if label.lower().startswith("file:"):
@@ -351,7 +397,7 @@ def render_output_with_artifacts(
         body = match.group("body")
         left, right = st.columns([0.88, 0.12], gap="small")
         with left:
-            st.code(body, language=language.split(":", 1)[0].strip() or "text")
+            st.code(body, language=display_language(language, body))
         with right:
             st.caption("Artifact")
             key_material = f"{artifact_prefix}:{index}:{hashlib.sha256(body.encode()).hexdigest()[:12]}"
@@ -562,18 +608,31 @@ def render_repository_work(project_scope: str, ledger: QuotaLedger) -> None:
 # =============================================================================
 
 
-def uploaded_file_context(files: Sequence[Any]) -> str:
+INJECTION_BUDGET_CHARS = 120_000
+
+
+def uploaded_file_context(files: Sequence[Any], budget: int = INJECTION_BUDGET_CHARS) -> Tuple[str, List[str]]:
+    """Join uploaded files under one prompt budget, splitting it evenly and marking every truncation."""
     chunks: List[str] = []
-    for uploaded in files:
+    notes: List[str] = []
+    valid = [uploaded for uploaded in files if hasattr(uploaded, "getvalue")]
+    if not valid:
+        return "", notes
+    per_file = max(1_000, budget // len(valid))
+    for uploaded in valid:
         try:
-            raw = uploaded.getvalue()
-            if len(raw) > 120_000:
-                raw = raw[:120_000] + b"\n...[file truncated by UI budget]"
-            decoded = raw.decode("utf-8", errors="replace")
-            chunks.append(f"===== INJECTED FILE: {uploaded.name} =====\n{decoded}")
+            decoded = uploaded.getvalue().decode("utf-8", errors="replace")
         except (AttributeError, UnicodeError):
+            notes.append(f"{uploaded.name}: could not be read as text; skipped")
             continue
-    return "\n\n".join(chunks)
+        if len(decoded) > per_file:
+            dropped = len(decoded) - per_file
+            decoded = decoded[:per_file] + f"\n[TRUNCATED: {dropped} characters of {uploaded.name} not sent]"
+            notes.append(f"{uploaded.name}: sent {per_file} of {per_file + dropped} characters")
+        else:
+            notes.append(f"{uploaded.name}: sent {len(decoded)} characters in full")
+        chunks.append(f"===== INJECTED FILE: {uploaded.name} =====\n{decoded}")
+    return "\n\n".join(chunks), notes
 
 
 def run_generation(
@@ -630,10 +689,12 @@ def run_generation(
             )
     except Exception as exc:
         live_box.empty()
-        append_message(project_scope, "assistant", f"Provider error: {exc}", mode=mode, workspace=workspace)
+        # Shown, not persisted: vendor error bodies must never be re-injected into later prompts.
+        st.session_state.setdefault("provider_events", []).append(str(exc)[:600])
         st.error(f"Generation failed: {exc}")
         return user_message_id
     live_box.empty()
+    answer = strip_reasoning_tags(answer)
     assistant_id = append_message(
         project_scope,
         "assistant",
@@ -767,9 +828,9 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger) -> None:
         type=["py", "js", "ts", "tsx", "jsx", "json", "md", "txt", "yml", "yaml", "toml", "css", "html"],
         key="chat_bot_files",
     )
-    injected = uploaded_file_context(files or [])
+    injected, injection_notes = uploaded_file_context(files or [])
     if files:
-        st.caption(f"{len(files)} file(s) staged in memory only; use Artifact Lock to persist an output.")
+        st.caption(f"{len(files)} file(s) staged in memory only; use Artifact Lock to persist an output. " + " · ".join(injection_notes))
     with st.form("chat_bot_form", clear_on_submit=True):
         prompt = st.text_area(
             "Developer request",
@@ -819,6 +880,14 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
             step["title"] = str(row.get("workstream") or step["title"])
             step["type"] = str(row.get("type") or step["type"])
             step["description"] = str(row.get("instruction") or step["description"])
+    if plan:
+        passes = 3 if active_mode() == "heavy" else 1
+        calls = len(plan) * passes
+        budget = int(st.session_state.get("max_tokens", 2048))
+        st.caption(
+            f"Cost preview: {len(plan)} workstream(s) × {passes} pass(es) = {calls} provider call(s), "
+            f"up to ~{calls * budget} output tokens" + (" · Heavy Mode is on" if passes == 3 else "")
+        )
     execute = st.button(
         "Launch workstreams",
         type="primary",
@@ -856,23 +925,32 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
                 )
             return int(step["id"]), answer, decision.provider, decision.model
 
+        succeeded = failed = 0
         with ThreadPoolExecutor(max_workers=min(3, len(plan))) as executor:
             futures = {executor.submit(contextvars.copy_context().run, worker, step): step for step in plan}
-            for completed, future in enumerate(as_completed(futures), start=1):
+            for finished, future in enumerate(as_completed(futures), start=1):
                 step = futures[future]
                 try:
                     step_id, answer, provider, model = future.result()
+                    answer = strip_reasoning_tags(answer)
                     results[step_id] = (answer, provider, model, str(step["title"]))
                     step["status"] = "complete"
+                    succeeded += 1
                     append_message(project_scope, "user", f"[{step['title']}] {step['description']}", mode=task_mode, workspace="task_finder")
                     append_message(project_scope, "assistant", answer, provider=f"{provider}/{model}", mode=task_mode, workspace="task_finder")
                 except Exception as exc:
                     step["status"] = "failed"
+                    failed += 1
+                    # Shown in the results list, never written into the thread's context.
                     results[int(step["id"])] = (f"Task failed: {exc}", "", "", str(step["title"]))
-                    append_message(project_scope, "assistant", f"Task failed: {exc}", mode=task_mode, workspace="task_finder")
-                progress.progress(completed / len(plan), text=f"Completed {completed}/{len(plan)} workstreams")
+                progress.progress(finished / len(plan), text=f"{succeeded} succeeded · {failed} failed · {finished}/{len(plan)} done")
         results_store[thread_id] = results
-        st.success("Workstreams finished. Continue the mission below; every result is in this thread's memory.")
+        if failed == 0:
+            st.success(f"All {succeeded} workstream(s) finished. Continue the mission below; every result is in this thread's memory.")
+        elif succeeded == 0:
+            st.error(f"All {failed} workstream(s) failed. Open a result for the provider's exact error, then retry or adjust keys.")
+        else:
+            st.warning(f"{succeeded} workstream(s) succeeded, {failed} failed. Failed steps show the provider's exact error.")
     thread_results = results_store.get(thread_id, {})
     if thread_results:
         st.markdown("**Workstream results**")
@@ -964,16 +1042,24 @@ with st.sidebar:
             apply_clicked = apply_col.form_submit_button("Apply keys", type="primary", use_container_width=True)
             clear_clicked = clear_col.form_submit_button("Clear all", use_container_width=True)
         if apply_clicked:
-            applied = 0
+            added = updated = removed = 0
             for env_name, value in entered.items():
-                if value.strip():
-                    st.session_state.byok_keys[env_name] = value.strip()
-                    applied += 1
+                cleaned = value.strip()
+                previous = st.session_state.byok_keys.get(env_name)
+                if cleaned and previous is None:
+                    st.session_state.byok_keys[env_name] = cleaned
+                    added += 1
+                elif cleaned and cleaned != previous:
+                    st.session_state.byok_keys[env_name] = cleaned
+                    updated += 1
+                elif not cleaned and previous is not None:
+                    st.session_state.byok_keys.pop(env_name, None)
+                    removed += 1
             bind_session_keys(st.session_state.byok_keys)
-            if applied:
-                st.success(f"{applied} key(s) applied for this browser session.")
+            if added or updated or removed:
+                st.success(f"Keys: {added} added, {updated} updated, {removed} removed (blank a field and Apply to remove one).")
             else:
-                st.info("No key values entered.")
+                st.info("No key changes.")
         if clear_clicked:
             st.session_state.byok_keys = {}
             bind_session_keys({})
