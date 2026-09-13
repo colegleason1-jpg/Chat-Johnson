@@ -226,7 +226,7 @@ def shannon_entropy(values: Sequence[float], bins: Optional[int] = None) -> floa
 
     array = np.asarray(values, dtype=float).reshape(-1)
     array = array[np.isfinite(array)]
-    if array.size == 0 or float(np.ptp(array)) == 0.0:
+    if array.size == 0 or float(array.max() - array.min()) == 0.0:
         return 0.0
     bin_count = bins or max(8, min(128, int(math.sqrt(array.size)) * 2))
     histogram, _ = np.histogram(array, bins=bin_count)

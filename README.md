@@ -60,7 +60,7 @@ code block (versioned save to SQLite), output token budget slider, per-project s
 
 ## Setup
 
-1. `pip install -r Requirements.txt`
+1. `pip install -r requirements.txt`
 2. Supply keys either way:
    - **In the app:** open the sidebar "API keys" panel, paste any subset, click **Apply keys**.
      They live in process memory for the session only and override environment variables.
@@ -97,6 +97,15 @@ and Normal mode never uses it. Close the tab and it is gone.
 - **Guardrails before handoff.** `ast.parse()` on every changed file, then pytest, then the traceback
   goes back to a reasoning model.
 - **No hidden chain-of-thought.** Heavy Mode shows the final answer and a concise rationale only.
+
+## Deploying on Streamlit Community Cloud
+
+- Point the app at **this repository, the branch you want to run, and `app.py`**. The
+  `main` branch does not yet carry the key panel; use `claude/ai-nonlinear-logic-arch-jakbpm`
+  until it is merged.
+- Dependencies come from the lowercase `requirements.txt`; `.python-version` requests 3.12.
+- Keys pasted in the sidebar are scoped to your own browser session. Other visitors to the same
+  app URL do not see them and must paste their own.
 
 ## Development
 

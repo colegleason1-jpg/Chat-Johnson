@@ -44,4 +44,28 @@ def test_clear_removes_everything(monkeypatch):
     config.set_session_key("HF_TOKEN", "y")
     config.clear_session_keys()
     assert config.resolve_secret("GEMINI_API_KEY") == ""
-    assert config.SESSION_KEYS == {}
+    assert config.session_keys() == {}
+
+
+def test_keys_are_isolated_per_context(monkeypatch):
+    import contextvars
+    import threading
+
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    config.bind_session_keys({"GROQ_API_KEY": "session-a"})
+    seen: dict = {}
+
+    def other_session():
+        seen["fresh_thread"] = config.resolve_secret("GROQ_API_KEY")
+
+    def copied_worker():
+        seen["copied"] = config.resolve_secret("GROQ_API_KEY")
+
+    thread = threading.Thread(target=other_session)
+    thread.start()
+    thread.join()
+    worker = threading.Thread(target=contextvars.copy_context().run, args=(copied_worker,))
+    worker.start()
+    worker.join()
+    assert seen["fresh_thread"] == ""  # another session sees nothing
+    assert seen["copied"] == "session-a"  # explicitly copied workers (Task Finder) do

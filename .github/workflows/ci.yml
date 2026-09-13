@@ -13,9 +13,9 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: Requirements.txt
+          cache-dependency-path: requirements.txt
       - name: Install dependencies
-        run: pip install -r Requirements.txt
+        run: pip install -r requirements.txt
       - name: Lint
         run: ruff check app.py cli.py orchestrator research tests
       - name: Compile

@@ -14,6 +14,7 @@ The app is intentionally local-first:
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import hmac
 import html
@@ -47,12 +48,23 @@ def _sanitize_duplicate_modules() -> List[str]:
 
 SANITIZED_DUPLICATES = _sanitize_duplicate_modules()
 
-import requests
 import streamlit as st
 
 st.set_page_config(page_title="Chat Johnson · Master Studio", page_icon="🧠", layout="wide")
 
-from orchestrator.config import PROVIDERS, clear_session_keys, provider_model, resolve_secret, set_session_key
+try:
+    import requests
+    import numpy  # noqa: F401  (surface a broken scientific stack early, with a clear message)
+except ImportError as _import_error:  # pragma: no cover - only reachable on a broken deploy
+    st.error(
+        "A required dependency failed to import: "
+        f"{getattr(_import_error, 'name', None) or _import_error}. "
+        "Install with `pip install -r requirements.txt` (lowercase file name; hosted platforms "
+        "such as Streamlit Community Cloud only detect that exact name) and use Python 3.10+."
+    )
+    st.stop()
+
+from orchestrator.config import PROVIDERS, bind_session_keys, provider_model, resolve_secret
 from orchestrator.executor import Orchestrator
 from orchestrator.quota import QuotaLedger
 from orchestrator.router import (
@@ -673,7 +685,7 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
             return int(step["id"]), answer, decision.provider, decision.model
 
         with ThreadPoolExecutor(max_workers=min(3, len(plan))) as executor:
-            futures = {executor.submit(worker, step): step for step in plan}
+            futures = {executor.submit(contextvars.copy_context().run, worker, step): step for step in plan}
             for completed, future in enumerate(as_completed(futures), start=1):
                 step = futures[future]
                 try:
@@ -720,6 +732,10 @@ st.markdown(
 
 if "project_scope" not in st.session_state:
     st.session_state.project_scope = "chat-johnson"
+if "byok_keys" not in st.session_state:
+    st.session_state.byok_keys = {}
+# Keys pasted in this browser session are bound to this script run only.
+bind_session_keys(st.session_state.byok_keys)
 if "heavy_mode" not in st.session_state:
     st.session_state.heavy_mode = False
 
@@ -729,9 +745,9 @@ with st.sidebar:
     st.title("Control deck")
     with st.expander("🔑 API keys (BYOK, session only)", expanded=not configured_provider_names()):
         st.caption(
-            "Paste free-tier keys here to use the studio like a normal user. They stay in this "
-            "process's memory for the session, override environment variables, and are never "
-            "written to SQLite, logs, artifacts, or git."
+            "Paste free-tier keys here to use the studio like a normal user. They are scoped to "
+            "this browser session only, override environment variables, and are never written "
+            "to SQLite, logs, artifacts, or git."
         )
         key_fields = (
             ("GEMINI_API_KEY", "Google AI Studio (Gemini)"),
@@ -753,14 +769,16 @@ with st.sidebar:
             applied = 0
             for env_name, value in entered.items():
                 if value.strip():
-                    set_session_key(env_name, value)
+                    st.session_state.byok_keys[env_name] = value.strip()
                     applied += 1
+            bind_session_keys(st.session_state.byok_keys)
             if applied:
-                st.success(f"{applied} key(s) applied for this session.")
+                st.success(f"{applied} key(s) applied for this browser session.")
             else:
                 st.info("No key values entered.")
         if clear_clicked:
-            clear_session_keys()
+            st.session_state.byok_keys = {}
+            bind_session_keys({})
             for env_name, _ in key_fields:
                 st.session_state.pop(f"byok_{env_name}", None)
             st.info("Session keys cleared. Environment variables, if any, remain in effect.")
