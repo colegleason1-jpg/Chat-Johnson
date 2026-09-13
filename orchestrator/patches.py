@@ -38,7 +38,7 @@ def parse_file_blocks(text: str) -> Dict[str, str]:
     """Extract {relative_path: full_new_content} from FILE blocks."""
     patches: Dict[str, str] = {}
     for m in FILE_BLOCK_RE.finditer(text):
-        path = m.group("path").strip().lstrip("/")
+        path = m.group("path").strip()
         body = m.group("body")
         if body.startswith("\n"):
             body = body[1:]
