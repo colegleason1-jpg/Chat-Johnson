@@ -40,6 +40,7 @@ except ModuleNotFoundError as exc:  # Keep pure routing/math helpers importable 
     def legacy_chat(*args: Any, **kwargs: Any) -> Tuple[str, int]:
         raise ProviderError("requests is required for provider HTTP execution")
 
+from . import discovery
 from .config import PROVIDERS, Settings, get_settings, provider_model, resolve_secret
 from .quota import QuotaLedger
 
@@ -129,21 +130,13 @@ class CortexEndpoint:
     model_env: str = ""
 
 
-# Live model ids discovered after a vendor retired the default. Process-wide
-# because a retirement is a property of the vendor, not of a session.
-_DISCOVERED_MODELS: Dict[str, str] = {}
-
-# Preference order when discovering a replacement from a vendor's model list.
-MODEL_PREFERENCES: Dict[str, Tuple[str, ...]] = {
-    "google_ai_studio": (
-        "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.1-flash", "gemini-3-flash",
-        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.1-pro", "gemini-2.5-pro",
-    ),
-    "groq": ("openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"),
-    "huggingface": ("Qwen/Qwen2.5-Coder-32B-Instruct", "Qwen/Qwen3-Coder-30B-A3B-Instruct"),
+# Shared with the legacy provider client: one live-id cache per vendor.
+_DISCOVERED_MODELS = discovery.DISCOVERED
+MODEL_PREFERENCES = {
+    "google_ai_studio": discovery.VENDOR_PREFERENCES["gemini"],
+    "groq": discovery.VENDOR_PREFERENCES["groq"],
+    "huggingface": discovery.VENDOR_PREFERENCES["huggingface"],
 }
-
-_RETIRED_MARKERS = ("not found", "decommissioned", "deprecated", "does not exist", "not supported", "no longer")
 
 
 def endpoint_model(endpoint: "CortexEndpoint") -> str:
@@ -152,12 +145,10 @@ def endpoint_model(endpoint: "CortexEndpoint") -> str:
         override = os.environ.get(endpoint.model_env, "").strip()
         if override:
             return override
-    return _DISCOVERED_MODELS.get(endpoint.name) or endpoint.model
+    return discovery.discovered(endpoint.name) or endpoint.model
 
 
-def looks_like_retired_model(status_code: int, body: str) -> bool:
-    lowered = body.lower()
-    return status_code in (400, 404, 410) and any(marker in lowered for marker in _RETIRED_MARKERS)
+looks_like_retired_model = discovery.looks_like_retired_model
 
 
 # These are deliberate routing ceilings from the Project Seth / Chat Johnson
@@ -174,7 +165,7 @@ CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
         env_keys=("GEMINI_API_KEY",),
         base_url="https://generativelanguage.googleapis.com/v1beta",
         kind="gemini",
-        model="gemini-2.5-flash",
+        model="gemini-3.6-flash",
         rpm_limit=2,
         tpm_limit=32_000,
         speed_score=0.48,
@@ -711,55 +702,83 @@ def append_system_prompt(messages: Sequence[Mapping[str, str]], system_prompt: s
 def list_endpoint_models(endpoint: str | CortexEndpoint, timeout: int = 20) -> List[str]:
     """Return generation-capable model ids from the vendor's model list (needs a key)."""
     selected = _as_endpoint(endpoint)
-    key = _endpoint_key(selected)
-    if requests is None or not key:
-        return []
-    try:
-        if selected.kind == "gemini":
-            response = requests.get(
-                f"{selected.base_url}/models",
-                headers={"x-goog-api-key": key},
-                params={"pageSize": 200},
-                timeout=timeout,
-            )
-            if response.status_code != 200:
-                return []
-            models = []
-            for row in response.json().get("models", []):
-                methods = row.get("supportedGenerationMethods", [])
-                if "generateContent" in methods:
-                    models.append(str(row.get("name", "")).split("/", 1)[-1])
-            return [name for name in models if name]
-        response = requests.get(
-            f"{selected.base_url}/models",
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=timeout,
-        )
-        if response.status_code != 200:
-            return []
-        return [str(row.get("id", "")) for row in response.json().get("data", []) if row.get("id")]
-    except (requests.RequestException, ValueError, AttributeError):
-        return []
+    return discovery.list_models(selected.kind, selected.base_url, _endpoint_key(selected), timeout=timeout)
 
 
 def discover_endpoint_model(endpoint: str | CortexEndpoint, timeout: int = 20) -> Optional[str]:
     """Pick a live replacement id from the vendor list and cache it for this process."""
     selected = _as_endpoint(endpoint)
-    available = list_endpoint_models(selected, timeout=timeout)
-    if not available:
-        return None
-    chosen: Optional[str] = None
-    for preferred in MODEL_PREFERENCES.get(selected.name, ()):
-        if preferred in available:
-            chosen = preferred
-            break
-    if chosen is None and selected.kind == "gemini":
-        flash = [name for name in available if "flash" in name and "image" not in name and "tts" not in name and "live" not in name]
-        chosen = sorted(flash)[-1] if flash else None
-    if chosen is None:
-        chosen = available[0]
-    _DISCOVERED_MODELS[selected.name] = chosen
-    return chosen
+    return discovery.discover(selected.name, selected.kind, selected.base_url, _endpoint_key(selected), timeout=timeout)
+
+
+def _resilient_post(
+    selected: CortexEndpoint,
+    messages: Sequence[Mapping[str, str]],
+    max_tokens: int,
+    temperature: float,
+    stream: bool,
+    system_prompt: str,
+    timeout: int,
+) -> Tuple[Any, str]:
+    """POST to the endpoint with retirement recovery, transient retries, and sibling fallback.
+
+    Returns ``(response, model_id)`` with a 2xx response, or raises ProviderError
+    carrying the last real status. Order of operations per model:
+    up to MAX_TRANSIENT_ATTEMPTS tries with backoff on 429/5xx, one rediscovery
+    on a retired-id error, then up to two sibling models if still overloaded.
+    """
+    secret = _endpoint_key(selected)
+    key_override = os.environ.get(selected.model_env, "").strip() if selected.model_env else ""
+    tried: List[str] = []
+    model_id = endpoint_model(selected)
+    rediscovered = False
+    last_error = "no attempt made"
+
+    while True:
+        tried.append(model_id)
+        for attempt in range(1, discovery.MAX_TRANSIENT_ATTEMPTS + 1):
+            url, headers, payload = build_cortex_request(
+                selected, messages, max_tokens, temperature, stream=stream, system_prompt=system_prompt, model_id=model_id
+            )
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=stream)
+            except requests.RequestException as exc:
+                last_error = f"network error: {exc}"
+                if attempt < discovery.MAX_TRANSIENT_ATTEMPTS:
+                    discovery.sleep(discovery.retry_delay(attempt))
+                    continue
+                raise ProviderError(f"{selected.name} {last_error}") from exc
+            if response.status_code < 400:
+                return response, model_id
+            detail = response.text[:400]
+            retry_after = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+            response.close()
+            if secret:
+                detail = detail.replace(secret, "[REDACTED_SECRET]")
+            last_error = f"HTTP {response.status_code}: {detail}"
+            if discovery.is_transient(response.status_code) and attempt < discovery.MAX_TRANSIENT_ATTEMPTS:
+                discovery.sleep(discovery.retry_delay(attempt, retry_after))
+                continue
+            break  # permanent error, or transient retries exhausted, for this model
+
+        status = int(response.status_code)
+        if not key_override and not rediscovered and discovery.looks_like_retired_model(status, last_error):
+            rediscovered = True
+            replacement = discover_endpoint_model(selected, timeout=min(timeout, 20))
+            if replacement and replacement not in tried:
+                model_id = replacement
+                continue
+        if not key_override and discovery.is_transient(status):
+            siblings = [
+                name for name in discovery.alternates(
+                    selected.name, selected.kind, selected.base_url, secret, model_id, timeout=min(timeout, 20)
+                )
+                if name not in tried
+            ]
+            if siblings:
+                model_id = siblings[0]
+                continue
+        raise ProviderError(f"{selected.name} {last_error} (models tried: {tried})")
 
 
 def build_cortex_request(
@@ -769,6 +788,7 @@ def build_cortex_request(
     temperature: float,
     stream: bool,
     system_prompt: str = "",
+    model_id: Optional[str] = None,
 ) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
     """Format a provider-specific URL, redacted-safe headers, and JSON body."""
     selected = _as_endpoint(endpoint)
@@ -776,6 +796,7 @@ def build_cortex_request(
     key = _endpoint_key(selected)
     if not key:
         raise ProviderError(f"no BYOK key configured for {selected.name}")
+    resolved_model = model_id or endpoint_model(selected)
 
     if selected.kind == "gemini":
         system_parts = [message["content"] for message in prepared if message["role"] == "system"]
@@ -796,16 +817,15 @@ def build_cortex_request(
         }
         if system_parts:
             payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
-        model_id = endpoint_model(selected)
         url = (
-            f"{selected.base_url}/models/{model_id}:streamGenerateContent?alt=sse"
+            f"{selected.base_url}/models/{resolved_model}:streamGenerateContent?alt=sse"
             if stream
-            else f"{selected.base_url}/models/{model_id}:generateContent"
+            else f"{selected.base_url}/models/{resolved_model}:generateContent"
         )
         return url, {"x-goog-api-key": key, "Content-Type": "application/json"}, payload
 
     payload = {
-        "model": endpoint_model(selected),
+        "model": resolved_model,
         "messages": prepared,
         "max_tokens": int(max_tokens),
         "temperature": float(temperature),
@@ -860,44 +880,24 @@ def cortex_stream(
 ) -> Iterator[str]:
     """Yield generated text chunks from a MILP-selected provider endpoint.
 
-    If the vendor reports the configured model id as retired, the model list is
-    consulted once, a live id is cached, and the request is retried once.
+    Transient vendor errors are retried with backoff, a retired model id is
+    replaced from the vendor's live list, and an overloaded model falls back
+    to a sibling on the same vendor before the endpoint is declared failed.
     """
     if requests is None:
         raise ProviderError("requests is required for provider HTTP execution")
     selected = _as_endpoint(endpoint)
     effective_timeout = timeout or int(os.environ.get("CHAT_JOHNSON_TIMEOUT", "120"))
-    secret = _endpoint_key(selected)
-
-    for attempt in (1, 2):
-        url, headers, payload = build_cortex_request(
-            selected, messages, max_tokens, temperature, stream=True, system_prompt=system_prompt
-        )
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=effective_timeout, stream=True)
-        except requests.RequestException as exc:
-            raise ProviderError(f"{selected.name} network error: {exc}") from exc
-
-        if response.status_code >= 400:
-            detail = response.text[:400]
-            response.close()
-            if secret:
-                detail = detail.replace(secret, "[REDACTED_SECRET]")
-            if attempt == 1 and looks_like_retired_model(response.status_code, detail):
-                previous = endpoint_model(selected)
-                replacement = discover_endpoint_model(selected, timeout=min(effective_timeout, 20))
-                if replacement and replacement != previous:
-                    continue
-            raise ProviderError(f"{selected.name} HTTP {response.status_code}: {detail}")
-
-        try:
-            for payload_item in _iter_sse_payloads(response):
-                chunk = _extract_stream_text(selected, payload_item)
-                if chunk:
-                    yield chunk
-        finally:
-            response.close()
-        return
+    response, _ = _resilient_post(
+        selected, messages, max_tokens, temperature, stream=True, system_prompt=system_prompt, timeout=effective_timeout
+    )
+    try:
+        for payload_item in _iter_sse_payloads(response):
+            chunk = _extract_stream_text(selected, payload_item)
+            if chunk:
+                yield chunk
+    finally:
+        response.close()
 
 
 def _estimate_tokens(messages: Sequence[Mapping[str, str]], output: str = "") -> int:
@@ -1062,40 +1062,30 @@ def probe_endpoint(endpoint: str | CortexEndpoint, timeout: int = 20) -> Dict[st
     if not _endpoint_key(selected):
         result["detail"] = "no key configured"
         return result
-    healed = ""
-    for attempt in (1, 2):
-        try:
-            url, headers, payload = build_cortex_request(
-                selected, [{"role": "user", "content": "ping"}], max_tokens=8, temperature=0.0, stream=False
-            )
-            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        except ProviderError as exc:
-            result["detail"] = str(exc)
-            return result
-        except requests.RequestException as exc:
-            result["detail"] = f"network error: {type(exc).__name__}"
-            return result
-        body = response.text[:300].replace(_endpoint_key(selected), "[REDACTED_SECRET]")
-        if attempt == 1 and looks_like_retired_model(response.status_code, body):
-            previous = endpoint_model(selected)
-            replacement = discover_endpoint_model(selected, timeout=timeout)
-            if replacement and replacement != previous:
-                healed = f" (auto-switched from retired {previous} to {replacement})"
-                result["model"] = replacement
-                continue
-        break
+    configured = endpoint_model(selected)
+    try:
+        response, used_model = _resilient_post(
+            selected, [{"role": "user", "content": "ping"}], 8, 0.0, stream=False, system_prompt="", timeout=timeout
+        )
+    except ProviderError as exc:
+        text = str(exc)
+        match = re.search(r"HTTP (\d{3})", text)
+        result["status"] = int(match.group(1)) if match else None
+        if result["status"] in (401, 403):
+            result["detail"] = f"key rejected: {text}"
+        elif result["status"] == 404:
+            result["detail"] = f"model id not found (override with {selected.model_env}): {text}"
+        elif result["status"] == 429:
+            result["detail"] = f"rate limited: {text}"
+        else:
+            result["detail"] = text
+        return result
+    healed = f" (auto-switched from {configured} to {used_model})" if used_model != configured else ""
+    result["model"] = used_model
+    response.close()
     result["status"] = int(response.status_code)
-    if response.status_code == 200:
-        result["ok"] = True
-        result["detail"] = "reachable" + healed
-    elif response.status_code in (401, 403):
-        result["detail"] = f"key rejected: {body}"
-    elif response.status_code == 404:
-        result["detail"] = f"model id not found (override with {selected.model_env}): {body}"
-    elif response.status_code == 429:
-        result["detail"] = f"rate limited: {body}"
-    else:
-        result["detail"] = body
+    result["ok"] = True
+    result["detail"] = "reachable" + healed
     return result
 
 

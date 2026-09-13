@@ -8,11 +8,11 @@ This keeps one code path for all free tiers and avoids heavyweight SDKs.
 """
 from __future__ import annotations
 
-import time
 from typing import Dict, List, Optional, Tuple
 
 import requests
 
+from . import discovery
 from .config import (
     PROVIDERS,
     Settings,
@@ -25,7 +25,12 @@ Message = Dict[str, str]  # {"role": "...", "content": "..."}
 
 
 class ProviderError(RuntimeError):
-    pass
+    """Raised when a provider call fails; ``status_code`` is set for HTTP failures."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None, body: str = ""):
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
 
 
 def _post_with_retry(
@@ -35,22 +40,53 @@ def _post_with_retry(
     timeout: int,
     max_retries: int,
 ) -> dict:
+    """POST with bounded retries on network errors and transient statuses.
+
+    Retired-model and other permanent errors raise immediately with the
+    status attached so the caller can decide whether to rediscover a model.
+    """
     last_err: Optional[str] = None
-    for attempt in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
         except requests.RequestException as exc:  # network hiccup
             last_err = f"network error: {exc}"
-            time.sleep(2 ** attempt)
+            discovery.sleep(discovery.retry_delay(attempt))
             continue
         if resp.status_code == 200:
             return resp.json()
-        if resp.status_code == 429:  # rate limited: back off and retry
-            last_err = f"429 rate limited: {resp.text[:200]}"
-            time.sleep(min(2 ** attempt * 2, 30))
+        body = resp.text[:400]
+        if discovery.is_transient(resp.status_code) and attempt < max_retries:
+            last_err = f"HTTP {resp.status_code}: {body[:200]}"
+            discovery.sleep(discovery.retry_delay(attempt, resp.headers.get("Retry-After")))
             continue
-        raise ProviderError(f"HTTP {resp.status_code}: {resp.text[:400]}")
+        raise ProviderError(f"HTTP {resp.status_code}: {body}", status_code=resp.status_code, body=body)
     raise ProviderError(f"provider failed after {max_retries} attempts: {last_err}")
+
+
+def _with_model_recovery(cfg, call):
+    """Run ``call(model_id)``; on a retired-model error rediscover once and retry.
+
+    On a persistent transient error, try up to two sibling models from the
+    vendor list before giving up, so one overloaded model does not block a key.
+    """
+    model_id = provider_model(cfg)
+    try:
+        return call(model_id)
+    except ProviderError as exc:
+        status = exc.status_code
+        if status is not None and discovery.looks_like_retired_model(status, exc.body):
+            replacement = discovery.discover(cfg.name, cfg.kind, cfg.base_url, provider_api_key(cfg))
+            if replacement and replacement != model_id:
+                return call(replacement)
+            raise
+        if status is not None and discovery.is_transient(status):
+            for sibling in discovery.alternates(cfg.name, cfg.kind, cfg.base_url, provider_api_key(cfg), model_id):
+                try:
+                    return call(sibling)
+                except ProviderError:
+                    continue
+        raise
 
 
 def _call_openai_compatible(
@@ -61,12 +97,6 @@ def _call_openai_compatible(
     temperature: float,
 ) -> Tuple[str, int]:
     cfg = PROVIDERS[provider]
-    payload = {
-        "model": provider_model(cfg),
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
     headers = {
         "Authorization": f"Bearer {provider_api_key(cfg)}",
         "Content-Type": "application/json",
@@ -74,13 +104,23 @@ def _call_openai_compatible(
     if provider == "openrouter":
         headers["HTTP-Referer"] = "https://freebuff.dev"
         headers["X-Title"] = "Free-tier Orchestrator"
-    data = _post_with_retry(
-        f"{cfg.base_url}/chat/completions",
-        headers,
-        payload,
-        settings.request_timeout,
-        settings.max_retries_per_call,
-    )
+
+    def call(model_id: str) -> dict:
+        payload = {
+            "model": model_id,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        return _post_with_retry(
+            f"{cfg.base_url}/chat/completions",
+            headers,
+            payload,
+            settings.request_timeout,
+            settings.max_retries_per_call,
+        )
+
+    data = _with_model_recovery(cfg, call)
     try:
         text = data["choices"][0]["message"]["content"] or ""
         usage = data.get("usage", {})
@@ -114,13 +154,16 @@ def _call_gemini(
         "maxOutputTokens": max_tokens,
         "temperature": temperature,
     }
-    data = _post_with_retry(
-        f"{cfg.base_url}/models/{provider_model(cfg)}:generateContent",
-        {"x-goog-api-key": provider_api_key(cfg), "Content-Type": "application/json"},
-        payload,
-        settings.request_timeout,
-        settings.max_retries_per_call,
-    )
+    def call(model_id: str) -> dict:
+        return _post_with_retry(
+            f"{cfg.base_url}/models/{model_id}:generateContent",
+            {"x-goog-api-key": provider_api_key(cfg), "Content-Type": "application/json"},
+            payload,
+            settings.request_timeout,
+            settings.max_retries_per_call,
+        )
+
+    data = _with_model_recovery(cfg, call)
     try:
         parts = data["candidates"][0]["content"]["parts"]
         text = "".join(p.get("text", "") for p in parts)

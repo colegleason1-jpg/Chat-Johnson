@@ -32,6 +32,13 @@ from orchestrator.router import (
 )
 
 
+@pytest.fixture(autouse=True)
+def no_sleep_no_network_lists(monkeypatch):
+    from orchestrator import discovery
+    monkeypatch.setattr(discovery, "sleep", lambda seconds: None)
+    monkeypatch.setattr(router.requests, "get", lambda *a, **k: FakeGet(200, {"data": [], "models": []}))
+
+
 @pytest.fixture()
 def all_keys(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret-key")
@@ -46,6 +53,7 @@ class FakeResponse:
         self._lines = list(lines)
         self.text = text
         self._body = body
+        self.headers: Dict[str, str] = {}
         self.closed = False
 
     def iter_lines(self, decode_unicode=True):
@@ -56,6 +64,17 @@ class FakeResponse:
 
     def close(self):
         self.closed = True
+
+
+class FakeGet:
+    def __init__(self, status_code, body, headers=None):
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers or {}
+        self.text = ""
+
+    def json(self):
+        return self._body
 
 
 def sse(*chunks: Dict[str, Any]) -> List[str]:
@@ -209,7 +228,7 @@ def test_model_id_override_from_environment(all_keys, monkeypatch):
     url, _, _ = build_cortex_request("google_ai_studio", [{"role": "user", "content": "x"}], 10, 0.1, stream=False)
     assert "/models/gemini-2.5-pro:" in url
     monkeypatch.delenv("CORTEX_GEMINI_MODEL")
-    assert endpoint_model(CORTEX_ENDPOINTS["google_ai_studio"]) == "gemini-2.5-flash"
+    assert endpoint_model(CORTEX_ENDPOINTS["google_ai_studio"]) == "gemini-3.6-flash"
 
 
 def test_cortex_generate_streams_records_ledger_and_reports_decision(all_keys, monkeypatch):
@@ -238,7 +257,7 @@ def test_cortex_generate_falls_through_on_http_error_and_redacts(all_keys, monke
     def fake_post(url, headers=None, json=None, timeout=None, stream=False):
         attempts.append(url)
         if "groq" in url:
-            return FakeResponse(status_code=500, text="boom groq-secret-key leaked")
+            return FakeResponse(status_code=401, text="boom groq-secret-key leaked")
         return FakeResponse(lines=sse({"choices": [{"delta": {"content": "ok"}}]}))
 
     monkeypatch.setattr(router.requests, "post", fake_post)
@@ -385,7 +404,7 @@ def test_legacy_generate_reports_every_real_failure(monkeypatch):
 
 
 def test_probe_reports_status_without_leaking_key(all_keys, monkeypatch):
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
         assert json.get("max_tokens") == 8 or json.get("generationConfig", {}).get("maxOutputTokens") == 8
         if "groq" in url:
             return FakeResponse(status_code=200, text="{}")
@@ -422,15 +441,6 @@ def clear_discovery():
     router._DISCOVERED_MODELS.clear()
     yield
     router._DISCOVERED_MODELS.clear()
-
-
-class FakeGet:
-    def __init__(self, status_code, body):
-        self.status_code = status_code
-        self._body = body
-
-    def json(self):
-        return self._body
 
 
 def test_retired_groq_model_is_discovered_and_retried(all_keys, monkeypatch):
@@ -485,7 +495,7 @@ def test_non_retirement_errors_do_not_trigger_discovery(all_keys, monkeypatch):
 
 
 def test_probe_reports_auto_switch(all_keys, monkeypatch):
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
         if json.get("model") == "openai/gpt-oss-120b":
             return FakeResponse(status_code=200, text="{}")
         return FakeResponse(status_code=404, text="model not found")
@@ -497,4 +507,87 @@ def test_probe_reports_auto_switch(all_keys, monkeypatch):
     row = router.probe_endpoint("groq")
     assert row["ok"] is True
     assert row["model"] == "openai/gpt-oss-120b"
-    assert "auto-switched from retired dead-model" in row["detail"]
+    assert "auto-switched from dead-model to openai/gpt-oss-120b" in row["detail"]
+
+
+# ----------------------------------------------------------------------------
+# Transient errors: retry, then sibling model, then fail over
+# ----------------------------------------------------------------------------
+
+def test_transient_503_is_retried_then_succeeds(all_keys, monkeypatch):
+    calls: List[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        calls.append(json.get("model"))
+        if len(calls) < 3:
+            return FakeResponse(status_code=503, text='{"error":{"status":"UNAVAILABLE","message":"high demand"}}')
+        return FakeResponse(lines=sse({"choices": [{"delta": {"content": "ok"}}]}))
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    assert "".join(router.cortex_stream("groq", [{"role": "user", "content": "x"}])) == "ok"
+    assert calls == ["openai/gpt-oss-120b"] * 3
+
+
+def test_overloaded_model_falls_back_to_sibling(all_keys, monkeypatch):
+    calls: List[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        model = url.split("/models/")[1].split(":")[0]
+        calls.append(model)
+        if model == "gemini-3.6-flash":
+            return FakeResponse(status_code=503, text='{"error":{"status":"UNAVAILABLE"}}')
+        return FakeResponse(lines=sse({"candidates": [{"content": {"parts": [{"text": "lite ok"}]}}]}))
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    monkeypatch.setattr(router.requests, "get", lambda *a, **k: FakeGet(200, {"models": [
+        {"name": "models/gemini-3.6-flash", "supportedGenerationMethods": ["generateContent"]},
+        {"name": "models/gemini-3.6-flash-lite", "supportedGenerationMethods": ["generateContent"]},
+    ]}))
+    text = "".join(router.cortex_stream("google_ai_studio", [{"role": "user", "content": "x"}]))
+    assert text == "lite ok"
+    assert calls == ["gemini-3.6-flash"] * 3 + ["gemini-3.6-flash-lite"]
+
+
+def test_env_override_disables_model_switching(all_keys, monkeypatch):
+    monkeypatch.setenv("CORTEX_GEMINI_MODEL", "pinned-flash")
+    calls: List[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        calls.append(url.split("/models/")[1].split(":")[0])
+        return FakeResponse(status_code=503, text="busy")
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    with pytest.raises(ProviderError) as excinfo:
+        list(router.cortex_stream("google_ai_studio", [{"role": "user", "content": "x"}]))
+    assert calls == ["pinned-flash"] * 3
+    assert "HTTP 503" in str(excinfo.value)
+
+
+def test_legacy_gemini_recovers_from_retired_model(monkeypatch):
+    from orchestrator import providers, config
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    calls: List[str] = []
+
+    class Resp:
+        def __init__(self, status, body, text=""):
+            self.status_code, self._body, self.text, self.headers = status, body, text, {}
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        model = url.split("/models/")[1].split(":")[0]
+        calls.append(model)
+        if model == "gemini-3.6-flash":
+            return Resp(404, None, "This model models/gemini-3.6-flash is no longer available to new users")
+        return Resp(200, {"candidates": [{"content": {"parts": [{"text": "hi"}]}}], "usageMetadata": {"totalTokenCount": 5}})
+
+    monkeypatch.setattr(providers.requests, "post", fake_post)
+    monkeypatch.setattr(providers.requests, "get", lambda *a, **k: FakeGet(200, {"models": [
+        {"name": "models/gemini-3.7-flash", "supportedGenerationMethods": ["generateContent"]},
+    ]}))
+    text, tokens = providers.chat("gemini", [{"role": "user", "content": "x"}], settings=config.get_settings())
+    assert text == "hi" and tokens == 5
+    assert calls == ["gemini-3.6-flash", "gemini-3.7-flash"]
+    assert config.provider_model(config.PROVIDERS["gemini"]) == "gemini-3.7-flash"

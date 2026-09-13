@@ -887,14 +887,45 @@ st.markdown(
 )
 st.caption("Project Seth's stochastic signal is an experimental routing feature only; it does not establish propulsion, lift, or a physical mechanism.")
 
+WORKSPACES = ("Task Finder", "Repository Work", "Chat Bot", "Normal Chat")
+
+# The chosen workspace lives in its own session key so it survives any rerun
+# in which a selector widget is not rendered (Streamlit drops widget state in
+# that case, which would snap the radio back to the first option).
+if st.session_state.get("workspace") not in WORKSPACES:
+    st.session_state.workspace = WORKSPACES[0]
+
+
+def _sync_workspace(widget_key: str) -> None:
+    chosen = st.session_state.get(widget_key)
+    if chosen in WORKSPACES:
+        st.session_state.workspace = chosen
+
+
+with st.sidebar:
+    st.radio(
+        "Workspace",
+        WORKSPACES,
+        index=WORKSPACES.index(st.session_state.workspace),
+        key="environment_sidebar",
+        on_change=_sync_workspace,
+        args=("environment_sidebar",),
+        help="Same switch as the main panel; handy on small screens.",
+    )
+
 left_panel, right_panel = st.columns([0.48, 0.52], gap="large")
 with left_panel:
     st.markdown("### Operational environments")
-    environment = st.radio(
+    st.radio(
         "Choose a workspace",
-        ("Task Finder", "Repository Work", "Chat Bot", "Normal Chat"),
+        WORKSPACES,
+        index=WORKSPACES.index(st.session_state.workspace),
         key="environment",
+        on_change=_sync_workspace,
+        args=("environment",),
+        horizontal=True,
     )
+    environment = st.session_state.workspace
     scope = st.session_state.project_scope
     if environment == "Task Finder":
         render_task_finder(scope, ledger)

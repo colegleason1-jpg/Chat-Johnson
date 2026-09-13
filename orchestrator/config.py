@@ -87,7 +87,7 @@ PROVIDERS: Dict[str, ProviderConfig] = {
         env_key="GEMINI_API_KEY",
         base_url="https://generativelanguage.googleapis.com/v1beta",
         kind="gemini",
-        default_model="gemini-2.5-flash",
+        default_model="gemini-3.6-flash",
         model_env="GEMINI_MODEL",
         rpm_limit=15,
         tpm_limit=1_000_000,
@@ -168,8 +168,13 @@ def provider_api_key(cfg: ProviderConfig) -> str:
 
 
 def provider_model(cfg: ProviderConfig) -> str:
+    """Env override > live id discovered after a vendor retirement > default."""
     override = _env(cfg.model_env) if cfg.model_env else ""
-    return override or cfg.default_model
+    if override:
+        return override
+    from .discovery import discovered  # local import keeps config dependency-free at import time
+
+    return discovered(cfg.name) or cfg.default_model
 
 
 @dataclass
