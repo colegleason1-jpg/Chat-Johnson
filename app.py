@@ -116,7 +116,11 @@ from orchestrator.vault import (
     migrate_thread,
     recent_artifacts,
     recent_messages,
+    recent_routes,
     recent_summaries,
+    record_route,
+    route_stats,
+    routes_csv,
     rename_thread,
     save_artifact,
     search_artifacts,
@@ -766,8 +770,9 @@ def thread_mission(thread: sqlite3.Row) -> str:
     return str(thread["mission"]).strip() if "mission" in thread.keys() and thread["mission"] else ""
 
 
-def log_route(workspace: Optional[str], task_type: str, route: str, mode: str, started: float, reason: str) -> None:
-    """Session-only trace of every send: what was asked, where it went, how long it took, and why."""
+def log_route(workspace: Optional[str], task_type: str, route: str, mode: str, started: float, reason: str, finish: str = "") -> None:
+    """Trace of every send (what was asked, where it went, how long, how it ended, why): session table plus the vault."""
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
     log: List[Dict[str, Any]] = st.session_state.setdefault("routing_log", [])
     log.append(
         {
@@ -776,11 +781,16 @@ def log_route(workspace: Optional[str], task_type: str, route: str, mode: str, s
             "task": task_type,
             "route": route,
             "mode": mode,
-            "ms": int((time.perf_counter() - started) * 1000),
+            "ms": elapsed_ms,
+            "finish": finish,
             "reason": (reason or "")[:160],
         }
     )
     del log[:-ROUTING_LOG_LIMIT]
+    try:
+        record_route(str(st.session_state.get("project_scope", "chat-johnson")), workspace or "", task_type, route, mode, elapsed_ms, finish, reason)
+    except Exception:  # telemetry must never break a send
+        pass
 
 
 _SCROLL_SNIPPET = (
@@ -874,8 +884,7 @@ def run_generation(
         workspace=workspace,
         task_type=task_type,
     )
-    log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started,
-              decision.reason + (f"; finish={decision.finish}" if decision.finish else ""))
+    log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish)
     with st.chat_message("assistant"):
         st.caption(f"{decision.provider}/{decision.model} · {task_type} · {mode}")
         render_output_with_artifacts(answer, project_scope, assistant_id, f"message-{assistant_id}")
@@ -1198,7 +1207,7 @@ def execute_mission(
                 project_scope, "assistant", answer, provider=f"{decision.provider}/{decision.model}",
                 mode=task_mode, workspace="task_finder", task_type=step_type,
             )
-            log_route("task_finder", step_type, f"{decision.provider}/{decision.model}", task_mode, started, decision.reason)
+            log_route("task_finder", step_type, f"{decision.provider}/{decision.model}", task_mode, started, decision.reason, decision.finish)
             st.session_state.last_decision = decision
             succeeded += 1
             truncated += int(decision.finish == "length")
@@ -1330,15 +1339,28 @@ WORKSPACE_RENDERERS = {
 
 
 def render_routing_log() -> None:
+    scope = str(st.session_state.get("project_scope", "chat-johnson"))
     st.markdown("#### Routing log (this session)")
     entries = st.session_state.get("routing_log", [])
-    if not entries:
+    if entries:
+        st.dataframe(list(reversed(entries)), hide_index=True, use_container_width=True)
+    else:
         st.caption(
-            "Every send is recorded here: workspace → task type → provider/model, latency, and the solver's reason, "
-            "so routing can be judged against the project's vision over a long session."
+            "Every send is recorded here: workspace → task type → provider/model, latency, finish reason, and the "
+            "solver's reason, so routing can be judged against the project's vision over a long session."
         )
-        return
-    st.dataframe(list(reversed(entries)), hide_index=True, use_container_width=True)
+    st.markdown("#### Ops · last 24 hours (persisted in the vault)")
+    stats = route_stats(scope, hours=24.0)
+    if stats:
+        st.dataframe(stats, hide_index=True, use_container_width=True)
+        st.caption("share = fraction of sends; p50/p95 = latency percentiles in ms; 'failed' rows are sends no endpoint answered.")
+    else:
+        st.caption("No sends recorded yet in this project scope.")
+    if recent_routes(scope, limit=1):
+        st.download_button(
+            "⬇ Routing log (.csv, up to 5000 rows)", data=routes_csv(scope), file_name=f"routing-log-{scope}.csv", mime="text/csv",
+            key="routes_csv", use_container_width=True,
+        )
 
 
 # =============================================================================
@@ -1582,7 +1604,7 @@ st.divider()
 # One column: a side panel squeezed the chat to a sliver at iPad width. The canvas opens itself when markup arrives.
 with st.expander("Live preview canvas", expanded=bool(st.session_state.get("preview_source"))):
     render_preview_panel()
-with st.expander("Routing log & last decision", expanded=False):
+with st.expander("Routing log, Ops stats & last decision", expanded=False):
     render_routing_log()
     decision = st.session_state.get("last_decision")
     if decision:

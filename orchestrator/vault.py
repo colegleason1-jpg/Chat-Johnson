@@ -115,6 +115,22 @@ CREATE TABLE IF NOT EXISTS threads (
 CREATE INDEX IF NOT EXISTS idx_threads_scope_updated
     ON threads(project_scope, workspace, updated_at DESC, id DESC);
 
+CREATE TABLE IF NOT EXISTS route_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    project_scope TEXT NOT NULL,
+    workspace TEXT NOT NULL DEFAULT '',
+    task_type TEXT NOT NULL DEFAULT '',
+    route TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'normal',
+    ms INTEGER NOT NULL DEFAULT 0,
+    finish TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_route_log_scope_time
+    ON route_log(project_scope, timestamp DESC, id DESC);
+
 -- Older databases carried a destructive trigger; the application now
 -- texturizes (summarize + archive) before evicting from the active window.
 DROP TRIGGER IF EXISTS message_history_rolling_cap;
@@ -795,6 +811,88 @@ def export_artifact(artifact_id: int) -> Tuple[str, str]:
     stem, dot, ext = filename.rpartition(".")
     filename = f"{stem}.v{row['version']}.{ext}" if dot else f"{filename}.v{row['version']}"
     return filename, str(row["code_body"])
+
+
+# =============================================================================
+# Routing telemetry (persisted per send; the session table is a view of the same events)
+# =============================================================================
+
+
+def record_route(
+    project_scope: str, workspace: str, task_type: str, route: str, mode: str, ms: int, finish: str = "", reason: str = ""
+) -> int:
+    """One row per send: where it went, how long it took, how it ended, why the solver chose it."""
+    scope = project_scope.strip() or "default"
+    with _open_database() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO route_log (timestamp, project_scope, workspace, task_type, route, mode, ms, finish, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (time.time(), scope, (workspace or "")[:40], (task_type or "")[:40], (route or "")[:120], (mode or "normal")[:40],
+             max(0, int(ms)), (finish or "")[:40], redact_secrets(reason or "")[:300]),
+        )
+        connection.commit()
+        return int(cursor.lastrowid)
+
+
+def recent_routes(project_scope: str, limit: int = 200, hours: Optional[float] = None) -> List[sqlite3.Row]:
+    scope = project_scope.strip() or "default"
+    query = "SELECT * FROM route_log WHERE project_scope = ?"
+    params: List[Any] = [scope]
+    if hours is not None:
+        query += " AND timestamp >= ?"
+        params.append(time.time() - float(hours) * 3600.0)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(max(1, min(int(limit), 5000)))
+    with _open_database() as connection:
+        return list(connection.execute(query, params).fetchall())
+
+
+def _percentile(values: Sequence[int], fraction: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+    return int(ordered[index])
+
+
+def route_stats(project_scope: str, hours: float = 24.0) -> List[Dict[str, Any]]:
+    """Per route (provider/model or 'failed'): sends, truncations, latency p50/p95, last seen. Pure arithmetic."""
+    rows = recent_routes(project_scope, limit=5000, hours=hours)
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        bucket = buckets.setdefault(str(row["route"]), {"route": str(row["route"]), "sends": 0, "truncated": 0, "filtered": 0, "ms": [], "last": 0.0})
+        bucket["sends"] += 1
+        bucket["truncated"] += int(row["finish"] == "length")
+        bucket["filtered"] += int(row["finish"] == "filtered")
+        bucket["ms"].append(int(row["ms"]))
+        bucket["last"] = max(float(bucket["last"]), float(row["timestamp"]))
+    total = sum(b["sends"] for b in buckets.values()) or 1
+    stats = []
+    for bucket in buckets.values():
+        stats.append({
+            "route": bucket["route"],
+            "sends": bucket["sends"],
+            "share": round(bucket["sends"] / total, 3),
+            "p50_ms": _percentile(bucket["ms"], 0.5),
+            "p95_ms": _percentile(bucket["ms"], 0.95),
+            "truncated": bucket["truncated"],
+            "filtered": bucket["filtered"],
+            "last_seen": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(bucket["last"])),
+        })
+    stats.sort(key=lambda item: (-item["sends"], item["route"]))
+    return stats
+
+
+def routes_csv(project_scope: str, limit: int = 5000) -> str:
+    header = "id,timestamp_utc,workspace,task_type,route,mode,ms,finish,reason"
+    lines = [header]
+    for row in reversed(recent_routes(project_scope, limit=limit)):
+        reason = str(row["reason"]).replace('"', "'").replace("\n", " ")
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(row["timestamp"])))
+        lines.append(f"{row['id']},{stamp},{row['workspace']},{row['task_type']},{row['route']},{row['mode']},{row['ms']},{row['finish']},\"{reason}\"")
+    return "\n".join(lines) + "\n"
 
 
 def health_check() -> Dict[str, Any]:

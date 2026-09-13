@@ -174,3 +174,20 @@ def test_alternating_turns_merges_neighbours_and_hands_back_a_leading_reply():
     assert [t["role"] for t in merged] == ["user", "assistant", "user"]
     assert merged[0]["content"] == "a\n\nb" and merged[-1]["content"] == "unanswered\n\nnow"
     assert vault.alternating_turns([], "solo") == ("", [{"role": "user", "content": "solo"}])
+
+
+def test_route_log_persists_and_stats_summarize_latency_and_finish(db):
+    for ms, finish in ((120, ""), (300, "length"), (900, ""), (80, "")):
+        db.record_route("scope", "normal_chat", "chat", "groq/gpt-oss-120b", "normal", ms, finish, "milp; key gsk_abcdefghijklmnopqrstuvwxyz123456")
+    db.record_route("scope", "task_finder", "research", "failed", "normal", 1500, "", "HTTP 429")
+    db.record_route("other-scope", "normal_chat", "chat", "groq/gpt-oss-120b", "normal", 5)
+    stats = {row["route"]: row for row in db.route_stats("scope")}
+    assert set(stats) == {"groq/gpt-oss-120b", "failed"}
+    groq = stats["groq/gpt-oss-120b"]
+    assert groq["sends"] == 4 and groq["truncated"] == 1 and groq["p50_ms"] == 300 and groq["p95_ms"] == 900 and groq["share"] == 0.8
+    assert stats["failed"]["sends"] == 1
+    rows = db.recent_routes("scope")
+    assert len(rows) == 5 and "gsk_abcdefghijklmnopqrstuvwxyz123456" not in rows[-1]["reason"]
+    csv = db.routes_csv("scope")
+    assert csv.startswith("id,timestamp_utc,workspace,task_type,route,mode,ms,finish,reason") and csv.count("\n") == 6
+    assert db.route_stats("scope", hours=0.0) == [] or all(r["sends"] >= 1 for r in db.route_stats("scope", hours=0.0))
