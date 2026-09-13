@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import sqlite3
 import hmac
 import html
 import os
@@ -69,6 +70,7 @@ from orchestrator.executor import Orchestrator
 from orchestrator.quota import QuotaLedger
 from orchestrator.router import (
     CORTEX_ENDPOINTS,
+    TASK_TYPES,
     CortexStream,
     PaidReasoningSlot,
     ProviderError,
@@ -85,8 +87,11 @@ from orchestrator.router import (
 # Local source of truth (orchestrator/vault.py)
 # =============================================================================
 
+from orchestrator.connectors import ROADMAP_FEATURES, connector_status
+from orchestrator.missions import MISSION_TEMPLATES, classify_mission, task_plan
 from orchestrator.vault import (
     MESSAGE_WINDOW,
+    WORKSPACES as VAULT_WORKSPACES,
     active_thread,
     append_message,
     archived_messages,
@@ -196,6 +201,7 @@ def build_prompt_messages(
     project_scope: str,
     user_prompt: str,
     injected_context: str = "",
+    workspace: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     system = (
         "You are Chat Johnson, a careful software and strategy assistant. "
@@ -203,7 +209,7 @@ def build_prompt_messages(
         "that generated code is flawless or that a scientific simulation proves "
         "physical propulsion. Do not reveal private chain-of-thought."
     )
-    context = context_block(project_scope)
+    context = context_block(project_scope, workspace=workspace)
     parts = [f"ACTIVE PROJECT: {project_scope}", "PROJECT MEMORY:\n" + context]
     if injected_context.strip():
         parts.append("USER-CONSENTED FILE INJECTIONS:\n" + injected_context[:120_000])
@@ -226,18 +232,20 @@ def model_refine_digest(digest: str, ledger: QuotaLedger) -> str:
     return text
 
 
-def health_sweep(project_scope: str, ledger: QuotaLedger, force: bool = False) -> Optional[Dict[str, Any]]:
+def health_sweep(
+    project_scope: str, ledger: QuotaLedger, force: bool = False, workspace: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """Run the thread-health agent; migrate to an optimized successor when warranted.
 
     Called before every send (and on demand). The digest is built deterministically
     at zero quota, then refined by a model when a key is available. Raw history is
     never deleted; the old thread is marked migrated and stays browsable.
     """
-    health = thread_health(project_scope)
+    health = thread_health(project_scope, workspace=workspace)
     if not force and not (health["recommend_migration"] and st.session_state.get("auto_migrate", True)):
         return None
     refine = (lambda digest: model_refine_digest(digest, ledger)) if configured_provider_names() else None
-    result = migrate_thread(project_scope, refine=refine)
+    result = migrate_thread(project_scope, refine=refine, workspace=workspace)
     result["reasons"] = health["reasons"]
     st.session_state.last_migration = result
     return result
@@ -463,6 +471,7 @@ def github_api_get(token: str, path: str) -> Any:
 def render_repository_work(project_scope: str, ledger: QuotaLedger) -> None:
     st.subheader("Repository Work")
     st.caption("Sandboxed local changes, reviewable diffs, and an explicit human handoff.")
+    render_thread_controls(project_scope, "repository", ledger)
     st.info(
         "The GitHub connection below is a least-privilege OAuth skeleton. It keeps the token in session memory only, "
         "does not collect SSH private keys, and never commits or pushes automatically."
@@ -536,6 +545,16 @@ def render_repository_work(project_scope: str, ledger: QuotaLedger) -> None:
                 except Exception as exc:
                     status.update(label="Pipeline stopped", state="error")
                     st.error(f"Repository pipeline failed: {exc}")
+    st.divider()
+    with st.form("repository_chat_form", clear_on_submit=True):
+        repo_prompt = st.text_area("Discuss the repository work", height=100, placeholder="Ask about the diff, plan the next change, or request a review…")
+        repo_submitted = st.form_submit_button("Send", type="primary")
+    if repo_submitted:
+        if not configured_provider_names():
+            st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
+        else:
+            run_generation(project_scope, repo_prompt, classify(repo_prompt), ledger, workspace="repository")
+    render_history(project_scope, "Repository conversation", workspace="repository")
 
 
 # =============================================================================
@@ -563,22 +582,26 @@ def run_generation(
     task_type: str,
     ledger: QuotaLedger,
     injected_context: str = "",
+    workspace: Optional[str] = None,
 ) -> Optional[int]:
     clean_prompt = prompt.strip()
     if not clean_prompt:
         return None
     mode = active_mode()
-    migration = health_sweep(project_scope, ledger)
+    migration = health_sweep(project_scope, ledger, workspace=workspace)
     if migration:
         st.info(
             f"Thread health agent migrated to an optimized thread (#{migration['new_thread_id']}) before sending: "
             + ", ".join(migration["reasons"])
             + f". Digest locked as artifact {migration['digest_artifact_id']} ({migration['method']})."
         )
-    user_message_id = append_message(project_scope, "user", clean_prompt, mode=mode)
-    messages = build_prompt_messages(project_scope, clean_prompt, injected_context)
+    user_message_id = append_message(project_scope, "user", clean_prompt, mode=mode, workspace=workspace)
+    messages = build_prompt_messages(project_scope, clean_prompt, injected_context, workspace=workspace)
     max_tokens = int(st.session_state.get("max_tokens", 2048))
     live_box = st.empty()
+    with live_box.container():
+        with st.chat_message("user"):
+            st.markdown(clean_prompt)
     try:
         if mode == "normal" and cortex_available():
             # Normal mode streams token-by-token from the MILP-selected endpoint.
@@ -607,7 +630,7 @@ def run_generation(
             )
     except Exception as exc:
         live_box.empty()
-        append_message(project_scope, "assistant", f"Provider error: {exc}", mode=mode)
+        append_message(project_scope, "assistant", f"Provider error: {exc}", mode=mode, workspace=workspace)
         st.error(f"Generation failed: {exc}")
         return user_message_id
     live_box.empty()
@@ -617,6 +640,7 @@ def run_generation(
         answer,
         provider=f"{decision.provider}/{decision.model}",
         mode=mode,
+        workspace=workspace,
     )
     st.session_state.preview_source = extract_preview_source(answer)
     st.session_state.preview_editor = st.session_state.preview_source
@@ -624,13 +648,15 @@ def run_generation(
     return assistant_id
 
 
-def render_history(project_scope: str, heading: str) -> None:
+def render_history(project_scope: str, heading: str, workspace: Optional[str] = None, limit: int = 24) -> None:
     st.markdown(f"#### {heading}")
-    rows = recent_messages(project_scope, MESSAGE_WINDOW)
+    rows = recent_messages(project_scope, MESSAGE_WINDOW, workspace=workspace)
     if not rows:
-        st.caption("No messages yet in this project scope.")
+        st.caption("No messages yet in this thread.")
         return
-    for row in rows[-24:]:
+    if len(rows) > limit:
+        st.caption(f"Showing the last {limit} of {len(rows)} messages in the active window.")
+    for row in rows[-limit:]:
         role = row["role"] if row["role"] in {"user", "assistant"} else "assistant"
         with st.chat_message(role):
             if row["provider"]:
@@ -646,9 +672,80 @@ def render_history(project_scope: str, heading: str) -> None:
                 st.markdown(row["content"])
 
 
+def render_thread_controls(project_scope: str, workspace: str, ledger: QuotaLedger) -> sqlite3.Row:
+    """Per-workspace thread bar: selector, New thread, Clear chat, Rename, health, Migrate.
+
+    Every chat surface owns its own threads; the health agent scores and migrates
+    the thread that is active in this workspace. Keys are never touched here.
+    """
+    current = active_thread(project_scope, workspace)
+    rows = list_threads(project_scope, workspace=workspace)
+    ids = [int(row["id"]) for row in rows]
+    labels = {
+        int(row["id"]): f"#{row['id']} · {row['title']}" + ("" if row["status"] == "active" else f" · {row['status']}")
+        for row in rows
+    }
+    select_key = f"thread_select_{workspace}"
+    st.session_state[select_key] = int(current["id"])
+
+    def _on_select(key: str = select_key) -> None:
+        switch_thread(int(st.session_state[key]))
+
+    with st.container(border=True):
+        top_left, top_mid, top_right = st.columns([0.5, 0.25, 0.25], gap="small")
+        with top_left:
+            st.selectbox(
+                "Thread", ids, format_func=lambda value: labels.get(value, str(value)), key=select_key,
+                on_change=_on_select, label_visibility="collapsed",
+            )
+        with top_mid:
+            if st.button("New thread", key=f"new_thread_{workspace}", use_container_width=True,
+                         help="Start a separate chat in this workspace. Keys and other threads are untouched."):
+                create_thread(project_scope, workspace=workspace)
+                st.rerun()
+        with top_right:
+            if st.button("Clear chat", key=f"clear_thread_{workspace}", use_container_width=True,
+                         help="Archive this thread's messages (raw text kept). Keys are untouched."):
+                st.session_state[f"last_clear_{workspace}"] = clear_thread(int(current["id"]))
+                st.rerun()
+        cleared = st.session_state.pop(f"last_clear_{workspace}", None)
+        if cleared is not None:
+            st.caption(f"Chat cleared: {cleared} message(s) moved to the archive.")
+
+        health = thread_health(project_scope, workspace=workspace)
+        gauge_left, gauge_right = st.columns([0.7, 0.3], gap="small")
+        with gauge_left:
+            st.progress(min(float(health["pressure"]), 1.0), text=f"Thread health · pressure {health['pressure']:.2f}")
+            st.caption(
+                f"gen {health['generation']} · {health['messages']} msgs · ~{health['tokens']} tokens · "
+                f"{health['summaries']} summaries · {health['archived']} archived"
+            )
+        with gauge_right:
+            if st.button("Migrate now", key=f"migrate_{workspace}", use_container_width=True,
+                         help="Compress this thread into a locked vision digest and continue in a fresh optimized thread."):
+                if health_sweep(project_scope, ledger, force=True, workspace=workspace):
+                    st.rerun()
+            with st.popover("Rename"):
+                title_key = f"thread_title_{workspace}_{current['id']}"
+                new_title = st.text_input("Title", value=current["title"], key=title_key)
+                if st.button("Save", key=f"save_title_{workspace}") and new_title.strip() and new_title.strip() != current["title"]:
+                    rename_thread(int(current["id"]), new_title)
+                    st.rerun()
+        if health["recommend_migration"]:
+            st.warning("Migration recommended: " + ", ".join(health["reasons"]))
+        last_migration = st.session_state.get("last_migration")
+        if last_migration and int(last_migration.get("new_thread_id", -1)) == int(current["id"]):
+            st.caption(
+                f"Optimized from #{last_migration['old_thread_id']} · digest artifact "
+                f"{last_migration['digest_artifact_id']} · {last_migration['method']}"
+            )
+    return current
+
+
 def render_normal_chat(project_scope: str, ledger: QuotaLedger) -> None:
     st.subheader("Normal Chat")
     st.caption("A low-overhead single-pass terminal for quick text, planning, and coding questions.")
+    render_thread_controls(project_scope, "normal_chat", ledger)
     with st.form("normal_chat_form", clear_on_submit=True):
         prompt = st.text_area("Message", height=120, placeholder="Ask a focused question…")
         submitted = st.form_submit_button("Send normal request", type="primary")
@@ -656,13 +753,14 @@ def render_normal_chat(project_scope: str, ledger: QuotaLedger) -> None:
         if not configured_provider_names():
             st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
         else:
-            run_generation(project_scope, prompt, classify(prompt), ledger)
-    render_history(project_scope, "Project conversation")
+            run_generation(project_scope, prompt, classify(prompt), ledger, workspace="normal_chat")
+    render_history(project_scope, "Conversation", workspace="normal_chat")
 
 
 def render_chat_bot(project_scope: str, ledger: QuotaLedger) -> None:
     st.subheader("Chat Bot")
     st.caption("Continuous developer mode with explicit, consented codebase file injections.")
+    render_thread_controls(project_scope, "chat_bot", ledger)
     files = st.file_uploader(
         "Inject text/code files into the next prompt",
         accept_multiple_files=True,
@@ -683,67 +781,69 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger) -> None:
         if not configured_provider_names():
             st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
         else:
-            run_generation(project_scope, prompt, classify(prompt), ledger, injected)
-    render_history(project_scope, "Developer conversation")
-
-
-def task_plan(goal: str, count: int) -> List[Dict[str, Any]]:
-    """Create a bounded deterministic task graph without spending provider quota."""
-    pieces = [piece.strip() for piece in re.split(r"[\n;]+", goal) if piece.strip()]
-    templates = [
-        ("Scope and constraints", "reasoning", "Identify acceptance criteria, risks, and a minimal execution boundary for: {goal}"),
-        ("Repository/context analysis", "context_load", "Map the relevant files, interfaces, dependencies, and existing tests for: {goal}"),
-        ("Implementation approach", "code_patch", "Propose a concrete implementation for: {goal}. Emit complete file blocks only if files are supplied."),
-        ("Verification plan", "test_fix", "Define tests and failure checks that validate: {goal}. Do not weaken existing tests."),
-        ("Operator handoff", "quick_text", "Write a concise review checklist and handoff summary for: {goal}"),
-    ]
-    goals = pieces[:count] if len(pieces) >= count else [goal] * count
-    return [
-        {
-            "id": index + 1,
-            "title": templates[index % len(templates)][0],
-            "type": templates[index % len(templates)][1],
-            "description": templates[index % len(templates)][2].format(goal=goals[index]),
-            "status": "queued",
-        }
-        for index in range(max(1, min(count, 6)))
-    ]
+            run_generation(project_scope, prompt, classify(prompt), ledger, injected, workspace="chat_bot")
+    render_history(project_scope, "Developer conversation", workspace="chat_bot")
 
 
 def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
     st.subheader("Task Finder")
-    st.caption("Bounded multi-agent task futures with progress, shared project scope, and quota-safe execution.")
-    goal = st.text_area("Mission", height=100, placeholder="Break a complex project objective into independently reviewable workstreams.", key="task_goal")
-    count = st.slider("Workstreams", min_value=2, max_value=6, value=3, key="task_count")
+    st.caption(
+        "Mission decomposition with per-step routing. Steps run one at a time to respect free-tier limits; "
+        "results land in this workspace's thread so the mission can continue as a conversation."
+    )
+    thread = render_thread_controls(project_scope, "task_finder", ledger)
+    thread_id = int(thread["id"])
+    goal = st.text_area(
+        "Mission", height=100, key="task_goal",
+        placeholder="Describe the mission. Research, writing, analysis, planning, and code missions each get fitting workstreams.",
+    )
+    kind = classify_mission(goal) if goal.strip() else "general"
+    max_steps = len(MISSION_TEMPLATES[kind][1])
+    count = st.slider("Workstreams", min_value=1, max_value=max_steps, value=min(3, max_steps), key=f"task_count_{kind}")
     plan = task_plan(goal, count) if goal.strip() else []
     if plan:
-        st.markdown("**Proposed work graph**")
-        st.dataframe(
-            [{"#": step["id"], "workstream": step["title"], "type": step["type"], "status": step["status"]} for step in plan],
+        st.markdown(f"**Proposed work graph** · mission type: `{kind}` · edit titles, types, or instructions before launch")
+        edited = st.data_editor(
+            [{"#": step["id"], "workstream": step["title"], "type": step["type"], "instruction": step["description"]} for step in plan],
             hide_index=True,
             use_container_width=True,
+            num_rows="fixed",
+            column_config={
+                "#": st.column_config.NumberColumn(disabled=True, width="small"),
+                "type": st.column_config.SelectboxColumn(options=list(TASK_TYPES), required=True, width="small"),
+                "instruction": st.column_config.TextColumn(width="large"),
+            },
+            key=f"plan_editor_{thread_id}_{kind}_{count}",
         )
+        for step, row in zip(plan, edited):
+            step["title"] = str(row.get("workstream") or step["title"])
+            step["type"] = str(row.get("type") or step["type"])
+            step["description"] = str(row.get("instruction") or step["description"])
     execute = st.button(
-        "Launch bounded task futures",
+        "Launch workstreams",
         type="primary",
         key="launch_task_futures",
         disabled=not bool(goal.strip() and configured_provider_names()),
+        help="Runs each workstream in order through the router; results are saved to this thread.",
     )
+    results_store: Dict[int, Dict[int, Tuple[str, str, str, str]]] = st.session_state.setdefault("task_results", {})
     if execute and plan:
-        migration = health_sweep(project_scope, ledger)
+        migration = health_sweep(project_scope, ledger, workspace="task_finder")
         if migration:
             st.info(f"Thread health agent migrated to optimized thread #{migration['new_thread_id']} before launching.")
+            thread_id = int(migration["new_thread_id"])
+        append_message(project_scope, "user", f"MISSION: {goal.strip()}", mode=active_mode(), workspace="task_finder")
         progress = st.progress(0.0, text="Starting workstreams…")
-        results: Dict[int, Tuple[str, str, str]] = {}
+        results: Dict[int, Tuple[str, str, str, str]] = {}
         request_lock = get_task_request_lock()
         task_mode = active_mode()
-        task_token_budget = int(st.session_state.get("max_tokens", 1536))
+        task_token_budget = int(st.session_state.get("max_tokens", 2048))
         task_paid_slot = session_paid_slot() if task_mode == "heavy" else None
 
         def worker(step: Mapping[str, Any]) -> Tuple[int, str, str, str]:
-            messages = build_prompt_messages(project_scope, str(step["description"]))
-            # The lock covers the full selection/request/ledger-record cycle.
-            # This is essential when multiple futures share one free-tier key.
+            messages = build_prompt_messages(project_scope, str(step["description"]), workspace="task_finder")
+            # The lock covers the full selection/request/ledger-record cycle: steps are
+            # serialized so several futures cannot overspend one free-tier key.
             with request_lock:
                 answer, decision = generate_mode(
                     task_mode,
@@ -762,24 +862,40 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
                 step = futures[future]
                 try:
                     step_id, answer, provider, model = future.result()
-                    results[step_id] = (answer, provider, model)
+                    results[step_id] = (answer, provider, model, str(step["title"]))
                     step["status"] = "complete"
-                    append_message(project_scope, "user", step["description"], mode=active_mode())
-                    append_message(project_scope, "assistant", answer, provider=f"{provider}/{model}", mode=active_mode())
+                    append_message(project_scope, "user", f"[{step['title']}] {step['description']}", mode=task_mode, workspace="task_finder")
+                    append_message(project_scope, "assistant", answer, provider=f"{provider}/{model}", mode=task_mode, workspace="task_finder")
                 except Exception as exc:
                     step["status"] = "failed"
-                    results[int(step["id"])] = (f"Task failed: {exc}", "", "")
+                    results[int(step["id"])] = (f"Task failed: {exc}", "", "", str(step["title"]))
+                    append_message(project_scope, "assistant", f"Task failed: {exc}", mode=task_mode, workspace="task_finder")
                 progress.progress(completed / len(plan), text=f"Completed {completed}/{len(plan)} workstreams")
-        st.session_state.task_results = results
-        st.success("Task futures finished; review each result before applying any code.")
-    for step in plan:
-        result = st.session_state.get("task_results", {}).get(int(step["id"]))
-        if result:
-            answer, provider, model = result
-            with st.expander(f"{step['id']}. {step['title']} · {step['status']}", expanded=True):
+        results_store[thread_id] = results
+        st.success("Workstreams finished. Continue the mission below; every result is in this thread's memory.")
+    thread_results = results_store.get(thread_id, {})
+    if thread_results:
+        st.markdown("**Workstream results**")
+        for step_id in sorted(thread_results):
+            answer, provider, model, title = thread_results[step_id]
+            status = "failed" if answer.startswith("Task failed") else "complete"
+            with st.expander(f"{step_id}. {title} · {status}", expanded=(status == "failed")):
                 if provider:
                     st.caption(f"{provider}/{model}")
-                render_output_with_artifacts(answer, project_scope, None, f"task-{step['id']}")
+                render_output_with_artifacts(answer, project_scope, None, f"task-{thread_id}-{step_id}")
+    st.divider()
+    with st.form("task_continue_form", clear_on_submit=True):
+        follow_up = st.text_area(
+            "Continue the mission", height=100,
+            placeholder="Ask a follow-up, refine a workstream, or steer the next step. The workstream results are already in context.",
+        )
+        follow_submitted = st.form_submit_button("Send", type="primary")
+    if follow_submitted:
+        if not configured_provider_names():
+            st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
+        else:
+            run_generation(project_scope, follow_up, classify(follow_up), ledger, workspace="task_finder")
+    render_history(project_scope, "Mission conversation", workspace="task_finder")
 
 
 # =============================================================================
@@ -811,20 +927,13 @@ bind_session_keys(st.session_state.byok_keys)
 if "heavy_mode" not in st.session_state:
     st.session_state.heavy_mode = False
 
-WORKSPACES = ("Task Finder", "Repository Work", "Chat Bot", "Normal Chat")
-
-# The chosen workspace lives in its own session key so it survives any rerun
-# in which a selector widget is not rendered (Streamlit drops widget state in
-# that case, which would snap the radio back to the first option).
-if st.session_state.get("workspace") not in WORKSPACES:
-    st.session_state.workspace = WORKSPACES[0]
-
-
-def _sync_workspace(widget_key: str) -> None:
-    chosen = st.session_state.get(widget_key)
-    if chosen in WORKSPACES:
-        st.session_state.workspace = chosen
-
+WORKSPACE_TABS = (
+    ("Task Finder", "task_finder"),
+    ("Repository Work", "repository"),
+    ("Chat Bot", "chat_bot"),
+    ("Normal Chat", "normal_chat"),
+)
+assert tuple(key for _, key in WORKSPACE_TABS) == VAULT_WORKSPACES
 
 ledger = get_quota_ledger()
 with st.sidebar:
@@ -879,83 +988,19 @@ with st.sidebar:
                 marker = "✅" if row["ok"] else ("⚪" if row["detail"] == "no key configured" else "❌")
                 status = f" · HTTP {row['status']}" if row["status"] else ""
                 st.caption(f"{marker} **{row['endpoint']}** · {row['model']} · key {row['key']}{status} · {row['detail']}")
-    st.radio(
-        "Workspace",
-        WORKSPACES,
-        index=WORKSPACES.index(st.session_state.workspace),
-        key="environment_sidebar",
-        on_change=_sync_workspace,
-        args=("environment_sidebar",),
-        help="Same switch as the main panel; handy on small screens.",
-    )
     project_input = st.text_input("Active project scope", value=st.session_state.project_scope, key="project_scope_input")
     st.session_state.project_scope = project_input.strip() or "chat-johnson"
 
-    st.subheader("Threads")
-    scope_for_threads = st.session_state.project_scope
-    current_thread = active_thread(scope_for_threads)
-    thread_rows = list_threads(scope_for_threads)
-    thread_ids = [int(row["id"]) for row in thread_rows]
-    thread_labels = {
-        int(row["id"]): f"#{row['id']} · {row['title']}" + ("" if row["status"] == "active" else f" · {row['status']}")
-        for row in thread_rows
-    }
-    # The selectbox reflects the vault's current thread; a user change switches the
-    # vault inside the callback so programmatic switches (migration, New thread)
-    # are never undone by stale widget state.
-    st.session_state.thread_select = int(current_thread["id"])
-
-    def _on_thread_select() -> None:
-        switch_thread(int(st.session_state.thread_select))
-
-    st.selectbox(
-        "Active thread",
-        thread_ids,
-        format_func=lambda value: thread_labels.get(value, str(value)),
-        key="thread_select",
-        on_change=_on_thread_select,
-    )
-    new_col, clear_col = st.columns(2)
-    if new_col.button("New thread", use_container_width=True, help="Start a separate chat on this project; keys stay as they are."):
-        create_thread(scope_for_threads)
-        st.rerun()
-    if clear_col.button("Clear thread", use_container_width=True, help="Archive this thread's messages (raw text kept). Keys are untouched."):
-        moved = clear_thread(int(current_thread["id"]))
-        st.session_state.last_clear = moved
-        st.rerun()
-    if st.session_state.pop("last_clear", None) is not None:
-        st.caption("Thread cleared; messages moved to the archive.")
-    with st.expander("Rename thread", expanded=False):
-        new_title = st.text_input("Title", value=current_thread["title"], key=f"thread_title_{current_thread['id']}")
-        if st.button("Save title", key="save_thread_title") and new_title.strip() and new_title.strip() != current_thread["title"]:
-            rename_thread(int(current_thread["id"]), new_title)
-            st.rerun()
-
-    health = thread_health(scope_for_threads)
-    st.progress(min(float(health["pressure"]), 1.0), text=f"Thread health · pressure {health['pressure']:.2f}")
-    st.caption(
-        f"gen {health['generation']} · {health['messages']} msgs · ~{health['tokens']} tokens · "
-        f"{health['summaries']} summaries · {health['archived']} archived"
-    )
+    st.subheader("Thread health agent")
     st.checkbox(
         "Auto-migrate heavy threads",
         key="auto_migrate",
         value=True,
-        help="Before each send the health agent checks load, repetition, and error loops. When a threshold trips, "
-        "it compresses the thread into a locked vision digest and continues in a fresh optimized thread.",
+        help="Applies to every workspace. Before each send the health agent checks the active thread's load, repetition, and "
+        "error loops. When a threshold trips, it compresses the thread into a locked vision digest and continues in a fresh "
+        "optimized thread. Thresholds: 120 active messages, ~18k live tokens, 2 stacked summaries, 25% repeated prompts, 5 error replies.",
     )
-    if health["recommend_migration"]:
-        st.warning("Migration recommended: " + ", ".join(health["reasons"]))
-    if st.button("Migrate to optimized thread now", key="migrate_now", use_container_width=True):
-        migration = health_sweep(scope_for_threads, ledger, force=True)
-        if migration:
-            st.rerun()
-    last_migration = st.session_state.get("last_migration")
-    if last_migration and int(last_migration.get("new_thread_id", -1)) == int(current_thread["id"]):
-        st.caption(
-            f"This thread was optimized from #{last_migration['old_thread_id']} · digest artifact "
-            f"{last_migration['digest_artifact_id']} · {last_migration['method']}"
-        )
+    st.caption("Each workspace tab has its own threads, New thread, Clear chat, and Migrate now controls.")
     st.checkbox(
         "Heavy Mode",
         key="heavy_mode",
@@ -1014,13 +1059,26 @@ with st.sidebar:
         st.caption("No artifacts in this scope yet.")
     st.divider()
     st.subheader("Memory")
-    active_count = len(recent_messages(st.session_state.project_scope, MESSAGE_WINDOW))
-    archive_count = len(archived_messages(st.session_state.project_scope, 5000))
-    summary_rows = recent_summaries(st.session_state.project_scope, 50)
+    active_count = len(recent_messages(st.session_state.project_scope, MESSAGE_WINDOW, thread_id=-1))
+    archive_count = len(archived_messages(st.session_state.project_scope, 5000, thread_id=-1))
+    summary_rows = recent_summaries(st.session_state.project_scope, 50, thread_id=-1)
+    thread_rows_all = list_threads(st.session_state.project_scope, limit=500)
+    per_workspace = {key: sum(1 for row in thread_rows_all if row["workspace"] == key) for _, key in WORKSPACE_TABS}
     st.caption(
-        f"Active window {active_count}/{MESSAGE_WINDOW} · archived {archive_count} · "
-        f"summaries {len(summary_rows)}. Raw history is texturized and archived, never deleted."
+        f"Active messages {active_count} · archived {archive_count} · summaries {len(summary_rows)} across "
+        + ", ".join(f"{label} {per_workspace[key]} thread(s)" for label, key in WORKSPACE_TABS)
+        + ". Raw history is texturized and archived, never deleted."
     )
+    st.divider()
+    with st.expander("Roadmap & stubs (not yet built)", expanded=False):
+        st.caption("Honest status of bible features that are not implemented. Nothing here can be switched on.")
+        for row in connector_status():
+            marker = "●" if row.status == "healthy" else "○"
+            note = " · source of truth" if row.source_of_truth else ""
+            st.markdown(f"{marker} **{row.name}** · {row.status}{note}")
+            st.caption(row.detail)
+        for feature, status, detail in ROADMAP_FEATURES:
+            st.toggle(f"{feature} · {status}", value=False, disabled=True, key=f"roadmap_{feature}", help=detail)
 
 st.markdown("<div class='eyebrow'>Sovereign local-first execution workspace</div>", unsafe_allow_html=True)
 st.title("Chat Johnson Master Studio")
@@ -1033,24 +1091,17 @@ st.caption("Project Seth's stochastic signal is an experimental routing feature 
 left_panel, right_panel = st.columns([0.48, 0.52], gap="large")
 with left_panel:
     st.markdown("### Operational environments")
-    st.radio(
-        "Choose a workspace",
-        WORKSPACES,
-        index=WORKSPACES.index(st.session_state.workspace),
-        key="environment",
-        on_change=_sync_workspace,
-        args=("environment",),
-        horizontal=True,
-    )
-    environment = st.session_state.workspace
     scope = st.session_state.project_scope
-    if environment == "Task Finder":
+    # Tabs keep their selection client-side, so a rerun can never snap the
+    # workspace back to the first option the way a stateful radio could.
+    tabs = st.tabs([label for label, _ in WORKSPACE_TABS])
+    with tabs[0]:
         render_task_finder(scope, ledger)
-    elif environment == "Repository Work":
+    with tabs[1]:
         render_repository_work(scope, ledger)
-    elif environment == "Chat Bot":
+    with tabs[2]:
         render_chat_bot(scope, ledger)
-    else:
+    with tabs[3]:
         render_normal_chat(scope, ledger)
 
 with right_panel:

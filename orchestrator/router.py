@@ -782,6 +782,7 @@ def _resilient_post(
                 raise ProviderError(f"{selected.name} {last_error}") from exc
             if response.status_code < 400:
                 return response, model_id
+            response.encoding = "utf-8"
             detail = response.text[:400]
             retry_after = response.headers.get("Retry-After") if hasattr(response, "headers") else None
             response.close()
@@ -895,7 +896,9 @@ def _extract_stream_text(selected: CortexEndpoint, payload: Mapping[str, Any]) -
 
 
 def _iter_sse_payloads(response: requests.Response) -> Iterator[Mapping[str, Any]]:
-    for raw_line in response.iter_lines(decode_unicode=True):
+    # Vendors send text/event-stream without a charset; requests would then decode
+    # as ISO-8859-1 and turn UTF-8 punctuation into mojibake. Decode bytes ourselves.
+    for raw_line in response.iter_lines():
         line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
         line = line.strip()
         if not line or line.startswith(":"):
@@ -1130,8 +1133,58 @@ def probe_endpoint(endpoint: str | CortexEndpoint, timeout: int = 20) -> Dict[st
     return result
 
 
+def probe_legacy_provider(name: str, timeout: int = 20) -> Dict[str, Any]:
+    """One-token call through the legacy client for a configured non-Cortex provider."""
+    from .config import provider_api_key  # local import: keep module import order stable
+
+    cfg = PROVIDERS[name]
+    key = provider_api_key(cfg)
+    result: Dict[str, Any] = {
+        "endpoint": name, "model": provider_model(cfg), "ok": False, "status": None,
+        "detail": "no key configured", "key": key_fingerprint(key),
+    }
+    if not key:
+        return result
+    settings = get_settings()
+    settings.request_timeout = timeout
+    settings.max_retries_per_call = 2
+    try:
+        chat(name, [{"role": "user", "content": "ping"}], 8, 0.0, settings)
+    except ProviderError as exc:
+        text = str(exc).replace(key, "[REDACTED_SECRET]")
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            match = re.search(r"HTTP (\d{3})", text)
+            status = int(match.group(1)) if match else None
+        result["status"] = status
+        if status in (401, 403):
+            result["detail"] = f"key rejected: {text}"
+        elif status == 404:
+            result["detail"] = f"model id not found (override with {cfg.model_env}): {text}"
+        elif status == 429:
+            result["detail"] = f"rate limited: {text}"
+        else:
+            result["detail"] = text
+        return result
+    except Exception as exc:  # network / parsing
+        result["detail"] = f"error: {type(exc).__name__}"
+        return result
+    used = provider_model(cfg)
+    result.update({"ok": True, "status": 200, "model": used,
+                   "detail": "reachable" + (f" (auto-switched to {used})" if used != cfg.default_model and not os.environ.get(cfg.model_env, "").strip() else "")})
+    return result
+
+
+LEGACY_ONLY_PROVIDERS = ("nvidia", "openrouter", "cerebras", "mistral")
+
+
 def probe_all_endpoints(timeout: int = 20) -> List[Dict[str, Any]]:
-    return [probe_endpoint(endpoint, timeout=timeout) for endpoint in CORTEX_ENDPOINTS.values()]
+    """Probe the strict Cortex endpoints, then every legacy provider that has a key."""
+    rows = [probe_endpoint(endpoint, timeout=timeout) for endpoint in CORTEX_ENDPOINTS.values()]
+    for name in LEGACY_ONLY_PROVIDERS:
+        if name in PROVIDERS:
+            rows.append(probe_legacy_provider(name, timeout=timeout))
+    return rows
 
 
 # =============================================================================

@@ -21,6 +21,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_DB_PATH = "chat_johnson_vault.db"
 MESSAGE_WINDOW = 200
+WORKSPACES = ("task_finder", "repository", "chat_bot", "normal_chat")
+DEFAULT_WORKSPACE = "normal_chat"
+
+
+def _workspace(value: Optional[str]) -> str:
+    return value if value in WORKSPACES else DEFAULT_WORKSPACE
 
 
 def database_path() -> Path:
@@ -100,12 +106,13 @@ CREATE TABLE IF NOT EXISTS threads (
     parent_thread_id INTEGER,
     digest_artifact_id INTEGER,
     generation INTEGER NOT NULL DEFAULT 1,
+    workspace TEXT NOT NULL DEFAULT 'normal_chat',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_threads_scope_updated
-    ON threads(project_scope, updated_at DESC, id DESC);
+    ON threads(project_scope, workspace, updated_at DESC, id DESC);
 
 -- Older databases carried a destructive trigger; the application now
 -- texturizes (summarize + archive) before evicting from the active window.
@@ -135,6 +142,7 @@ def initialize_database() -> None:
         connection.executescript(SCHEMA_SQL)
         for table in ("message_history", "message_archive", "summaries"):
             _ensure_column(connection, table, "thread_id", "INTEGER")
+        _ensure_column(connection, "threads", "workspace", "TEXT NOT NULL DEFAULT 'normal_chat'")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_message_thread ON message_history(thread_id, timestamp ASC, id ASC)"
         )
@@ -145,7 +153,7 @@ def initialize_database() -> None:
             for row in connection.execute(f"SELECT DISTINCT project_scope FROM {table} WHERE thread_id IS NULL").fetchall()
         }
         for scope in scopes:
-            thread_id = _active_thread_id(connection, scope, create=True)
+            thread_id = _active_thread_id(connection, scope, DEFAULT_WORKSPACE, create=True)
             for table in ("message_history", "message_archive", "summaries"):
                 connection.execute(
                     f"UPDATE {table} SET thread_id = ? WHERE project_scope = ? AND thread_id IS NULL",
@@ -158,13 +166,16 @@ def initialize_database() -> None:
 # Threads
 # =============================================================================
 
-def _active_thread_id(connection: sqlite3.Connection, scope: str, create: bool = True) -> Optional[int]:
+def _active_thread_id(
+    connection: sqlite3.Connection, scope: str, workspace: Optional[str] = None, create: bool = True
+) -> Optional[int]:
+    ws = _workspace(workspace)
     row = connection.execute(
         """
-        SELECT id FROM threads WHERE project_scope = ? AND status = 'active'
+        SELECT id FROM threads WHERE project_scope = ? AND workspace = ? AND status = 'active'
         ORDER BY updated_at DESC, id DESC LIMIT 1
         """,
-        (scope,),
+        (scope, ws),
     ).fetchone()
     if row is not None:
         return int(row["id"])
@@ -172,17 +183,18 @@ def _active_thread_id(connection: sqlite3.Connection, scope: str, create: bool =
         return None
     now = time.time()
     cursor = connection.execute(
-        "INSERT INTO threads (project_scope, title, status, generation, created_at, updated_at) VALUES (?, ?, 'active', 1, ?, ?)",
-        (scope, "Main thread", now, now),
+        "INSERT INTO threads (project_scope, title, status, generation, workspace, created_at, updated_at) "
+        "VALUES (?, ?, 'active', 1, ?, ?, ?)",
+        (scope, "Main thread", ws, now, now),
     )
     return int(cursor.lastrowid)
 
 
-def active_thread(project_scope: str) -> sqlite3.Row:
-    """The scope's current thread, created on first use."""
+def active_thread(project_scope: str, workspace: Optional[str] = None) -> sqlite3.Row:
+    """The scope's current thread for a workspace, created on first use."""
     scope = project_scope.strip() or "default"
     with _open_database() as connection:
-        thread_id = _active_thread_id(connection, scope, create=True)
+        thread_id = _active_thread_id(connection, scope, workspace, create=True)
         connection.commit()
         return connection.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
 
@@ -192,33 +204,51 @@ def thread_by_id(thread_id: int) -> Optional[sqlite3.Row]:
         return connection.execute("SELECT * FROM threads WHERE id = ?", (int(thread_id),)).fetchone()
 
 
-def list_threads(project_scope: str, include_closed: bool = True, limit: int = 50) -> List[sqlite3.Row]:
+def list_threads(
+    project_scope: str, include_closed: bool = True, limit: int = 50, workspace: Optional[str] = None
+) -> List[sqlite3.Row]:
+    """Threads in a scope; ``workspace=None`` lists every workspace."""
     scope = project_scope.strip() or "default"
     with _open_database() as connection:
         query = "SELECT * FROM threads WHERE project_scope = ?"
+        params: List[Any] = [scope]
+        if workspace is not None:
+            query += " AND workspace = ?"
+            params.append(_workspace(workspace))
         if not include_closed:
             query += " AND status = 'active'"
         query += " ORDER BY updated_at DESC, id DESC LIMIT ?"
-        return list(connection.execute(query, (scope, max(1, min(int(limit), 500)))).fetchall())
+        params.append(max(1, min(int(limit), 500)))
+        return list(connection.execute(query, params).fetchall())
 
 
-def create_thread(project_scope: str, title: str = "", parent_thread_id: Optional[int] = None) -> int:
-    """Start a fresh active thread in the scope; earlier threads keep their history."""
+def create_thread(
+    project_scope: str, title: str = "", parent_thread_id: Optional[int] = None, workspace: Optional[str] = None
+) -> int:
+    """Start a fresh active thread in the scope/workspace; earlier threads keep their history."""
     scope = project_scope.strip() or "default"
     now = time.time()
     with _open_database() as connection:
         generation = 1
+        ws = _workspace(workspace)
         if parent_thread_id is not None:
-            parent = connection.execute("SELECT generation FROM threads WHERE id = ?", (int(parent_thread_id),)).fetchone()
-            generation = int(parent["generation"]) + 1 if parent else 1
-        count = int(connection.execute("SELECT COUNT(*) FROM threads WHERE project_scope = ?", (scope,)).fetchone()[0])
+            parent = connection.execute(
+                "SELECT generation, workspace FROM threads WHERE id = ?", (int(parent_thread_id),)
+            ).fetchone()
+            if parent:
+                generation = int(parent["generation"]) + 1
+                if workspace is None:
+                    ws = _workspace(parent["workspace"])
+        count = int(connection.execute(
+            "SELECT COUNT(*) FROM threads WHERE project_scope = ? AND workspace = ?", (scope, ws)
+        ).fetchone()[0])
         safe_title = (title.strip() or f"Thread {count + 1}")[:120]
         cursor = connection.execute(
             """
-            INSERT INTO threads (project_scope, title, status, parent_thread_id, generation, created_at, updated_at)
-            VALUES (?, ?, 'active', ?, ?, ?, ?)
+            INSERT INTO threads (project_scope, title, status, parent_thread_id, generation, workspace, created_at, updated_at)
+            VALUES (?, ?, 'active', ?, ?, ?, ?, ?)
             """,
-            (scope, safe_title, parent_thread_id, generation, now, now),
+            (scope, safe_title, parent_thread_id, generation, ws, now, now),
         )
         connection.commit()
         return int(cursor.lastrowid)
@@ -299,13 +329,16 @@ def append_message(
     provider: str = "",
     mode: str = "normal",
     thread_id: Optional[int] = None,
+    workspace: Optional[str] = None,
 ) -> int:
-    """Insert a message into the scope's current (or given) thread, then texturize + archive past the window."""
+    """Insert a message into the workspace's current (or given) thread, then texturize + archive past the window."""
     safe_role = role if role in {"user", "assistant", "system"} else "user"
     safe_content = redact_secrets(content)
     scope = project_scope.strip() or "default"
     with _open_database() as connection:
-        resolved_thread = int(thread_id) if thread_id is not None else _active_thread_id(connection, scope, create=True)
+        resolved_thread = (
+            int(thread_id) if thread_id is not None else _active_thread_id(connection, scope, workspace, create=True)
+        )
         cursor = connection.execute(
             """
             INSERT INTO message_history
@@ -362,7 +395,7 @@ def extractive_summary(rows: Sequence[sqlite3.Row], max_characters: int = 1_800)
     return text[:max_characters]
 
 
-def enforce_window(project_scope: str, thread_id: Optional[int] = None) -> Optional[int]:
+def enforce_window(project_scope: str, thread_id: Optional[int] = None, workspace: Optional[str] = None) -> Optional[int]:
     """Texturize and archive the oldest messages once a thread exceeds the window.
 
     Returns the new summary id when eviction happened, else ``None``. Raw
@@ -372,7 +405,9 @@ def enforce_window(project_scope: str, thread_id: Optional[int] = None) -> Optio
     scope = project_scope.strip() or "default"
     with _open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        resolved_thread = int(thread_id) if thread_id is not None else _active_thread_id(connection, scope, create=True)
+        resolved_thread = (
+            int(thread_id) if thread_id is not None else _active_thread_id(connection, scope, workspace, create=True)
+        )
         total = int(connection.execute(
             "SELECT COUNT(*) FROM message_history WHERE project_scope = ? AND thread_id = ?", (scope, resolved_thread)
         ).fetchone()[0])
@@ -425,18 +460,22 @@ def enforce_window(project_scope: str, thread_id: Optional[int] = None) -> Optio
         return summary_id
 
 
-def _thread_filter(connection: sqlite3.Connection, scope: str, thread_id: Optional[int]) -> Tuple[str, Tuple[Any, ...]]:
-    """SQL fragment + params selecting one thread (default: the scope's current one) or all threads (-1)."""
+def _thread_filter(
+    connection: sqlite3.Connection, scope: str, thread_id: Optional[int], workspace: Optional[str] = None
+) -> Tuple[str, Tuple[Any, ...]]:
+    """SQL fragment + params selecting one thread (default: the workspace's current one) or all threads (-1)."""
     if thread_id == -1:
         return "project_scope = ?", (scope,)
-    resolved = int(thread_id) if thread_id is not None else _active_thread_id(connection, scope, create=True)
+    resolved = int(thread_id) if thread_id is not None else _active_thread_id(connection, scope, workspace, create=True)
     return "project_scope = ? AND thread_id = ?", (scope, resolved)
 
 
-def recent_summaries(project_scope: str, limit: int = 5, thread_id: Optional[int] = None) -> List[sqlite3.Row]:
+def recent_summaries(
+    project_scope: str, limit: int = 5, thread_id: Optional[int] = None, workspace: Optional[str] = None
+) -> List[sqlite3.Row]:
     scope = project_scope.strip() or "default"
     with _open_database() as connection:
-        where, params = _thread_filter(connection, scope, thread_id)
+        where, params = _thread_filter(connection, scope, thread_id, workspace)
         return list(
             connection.execute(
                 f"""
@@ -450,11 +489,13 @@ def recent_summaries(project_scope: str, limit: int = 5, thread_id: Optional[int
         )
 
 
-def archived_messages(project_scope: str, limit: int = 500, thread_id: Optional[int] = None) -> List[sqlite3.Row]:
+def archived_messages(
+    project_scope: str, limit: int = 500, thread_id: Optional[int] = None, workspace: Optional[str] = None
+) -> List[sqlite3.Row]:
     """Raw history that left the active window; available for authorized retrieval."""
     scope = project_scope.strip() or "default"
     with _open_database() as connection:
-        where, params = _thread_filter(connection, scope, thread_id)
+        where, params = _thread_filter(connection, scope, thread_id, workspace)
         return list(
             connection.execute(
                 f"""
@@ -475,11 +516,13 @@ def retexturize_summary(summary_id: int, new_content: str, method: str = "model"
         )
 
 
-def recent_messages(project_scope: str, limit: int = MESSAGE_WINDOW, thread_id: Optional[int] = None) -> List[sqlite3.Row]:
+def recent_messages(
+    project_scope: str, limit: int = MESSAGE_WINDOW, thread_id: Optional[int] = None, workspace: Optional[str] = None
+) -> List[sqlite3.Row]:
     bounded_limit = max(1, min(int(limit), MESSAGE_WINDOW))
     scope = project_scope.strip() or "default"
     with _open_database() as connection:
-        where, params = _thread_filter(connection, scope, thread_id)
+        where, params = _thread_filter(connection, scope, thread_id, workspace)
         return list(
             connection.execute(
                 f"""
@@ -496,10 +539,12 @@ def recent_messages(project_scope: str, limit: int = MESSAGE_WINDOW, thread_id: 
         )
 
 
-def context_block(project_scope: str, max_characters: int = 24_000, thread_id: Optional[int] = None) -> str:
+def context_block(
+    project_scope: str, max_characters: int = 24_000, thread_id: Optional[int] = None, workspace: Optional[str] = None
+) -> str:
     """Bounded prompt context for one thread: inherited digest, then summaries, then the live window."""
     scope = project_scope.strip() or "default"
-    thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope)
+    thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope, workspace)
     resolved_thread = int(thread["id"]) if thread is not None else None
     rows = recent_messages(scope, MESSAGE_WINDOW, thread_id=resolved_thread)
     summaries = recent_summaries(scope, 5, thread_id=resolved_thread)
@@ -688,12 +733,15 @@ def _normalized(text: str) -> str:
     return re.sub(r"\W+", " ", text.lower()).strip()
 
 
-def thread_health(project_scope: str, thread_id: Optional[int] = None) -> Dict[str, Any]:
+MIN_MESSAGES_AFTER_MIGRATION = 12  # a fresh successor must earn some history before it can migrate again
+
+
+def thread_health(project_scope: str, thread_id: Optional[int] = None, workspace: Optional[str] = None) -> Dict[str, Any]:
     """Cheap, deterministic sweep of one thread: load, repetition, and a migration recommendation."""
     scope = project_scope.strip() or "default"
-    thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope)
+    thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope, workspace)
     resolved = int(thread["id"])
-    rows = recent_messages(scope, MESSAGE_WINDOW, thread_id=resolved)
+    rows = [row for row in recent_messages(scope, MESSAGE_WINDOW, thread_id=resolved) if row["role"] != "system"]
     summaries = recent_summaries(scope, 50, thread_id=resolved)
     archived = archived_messages(scope, 5000, thread_id=resolved)
     tokens = sum(int(row["token_count"]) for row in rows)
@@ -719,9 +767,12 @@ def thread_health(project_scope: str, thread_id: Optional[int] = None) -> Dict[s
         reasons.append(f"{int(repetition * 100)}% repeated prompts")
     if error_turns >= 5:
         reasons.append(f"{error_turns} error replies in the window")
+    if int(thread["generation"]) > 1 and len(rows) < MIN_MESSAGES_AFTER_MIGRATION:
+        reasons = []  # a just-migrated successor is exempt until it has real history
     return {
         "thread_id": resolved,
         "title": thread["title"],
+        "workspace": thread["workspace"],
         "generation": int(thread["generation"]),
         "messages": len(rows),
         "tokens": tokens,
@@ -735,7 +786,9 @@ def thread_health(project_scope: str, thread_id: Optional[int] = None) -> Dict[s
     }
 
 
-def build_vision_digest(project_scope: str, thread_id: Optional[int] = None, max_characters: int = DIGEST_MAX_CHARACTERS) -> str:
+def build_vision_digest(
+    project_scope: str, thread_id: Optional[int] = None, max_characters: int = DIGEST_MAX_CHARACTERS, workspace: Optional[str] = None
+) -> str:
     """Deterministic compression of a thread into the material a fresh thread needs.
 
     Sections: vision (how the thread started), decisions and constraints, key
@@ -743,7 +796,7 @@ def build_vision_digest(project_scope: str, thread_id: Optional[int] = None, max
     stacked summaries. Zero provider quota; a model may refine it afterwards.
     """
     scope = project_scope.strip() or "default"
-    thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope)
+    thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope, workspace)
     resolved = int(thread["id"])
     live = recent_messages(scope, MESSAGE_WINDOW, thread_id=resolved)
     older = archived_messages(scope, 5000, thread_id=resolved)
@@ -810,6 +863,7 @@ def migrate_thread(
     thread_id: Optional[int] = None,
     refine: Optional[Any] = None,
     title: str = "",
+    workspace: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Close a heavy thread and open its optimized successor.
 
@@ -819,7 +873,7 @@ def migrate_thread(
        system message; 4. mark the old thread ``migrated``. Raw history stays.
     """
     scope = project_scope.strip() or "default"
-    thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope)
+    thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope, workspace)
     old_id = int(thread["id"])
     digest = build_vision_digest(scope, old_id)
     method = "extractive"
@@ -835,7 +889,7 @@ def migrate_thread(
         scope, f"thread-{old_id}-digest.md", f"threads/thread-{old_id}-digest.md", digest, "markdown"
     )
     new_title = title.strip() or f"{thread['title']} · v{int(thread['generation']) + 1}"
-    new_id = create_thread(scope, new_title, parent_thread_id=old_id)
+    new_id = create_thread(scope, new_title, parent_thread_id=old_id, workspace=thread["workspace"])
     with _open_database() as connection:
         connection.execute("UPDATE threads SET digest_artifact_id = ? WHERE id = ?", (artifact_id, new_id))
         connection.execute("UPDATE threads SET status = 'migrated', updated_at = ? WHERE id = ?", (time.time(), old_id))

@@ -646,3 +646,53 @@ def test_switched_model_that_turns_out_gated_cycles_to_next(all_keys, monkeypatc
         # for that model; we do not cycle from the original, we report it.
         list(router.cortex_stream("google_ai_studio", [{"role": "user", "content": "x"}]))
     assert calls == ["gemini-3.7-flash"]
+
+
+# ----------------------------------------------------------------------------
+# UTF-8 streaming and legacy provider probing
+# ----------------------------------------------------------------------------
+
+def test_sse_stream_decodes_utf8_punctuation_exactly(all_keys, monkeypatch):
+    """Vendors omit the charset on text/event-stream; we must not let requests decode as Latin-1."""
+    text = "end—to—end “pink waves” ≥ 0.5 — done"
+
+    class BytesResponse(FakeResponse):
+        def iter_lines(self, decode_unicode=False):
+            assert decode_unicode is False, "must not ask requests to decode with its guessed encoding"
+            payload = json.dumps({"choices": [{"delta": {"content": text}}]}, ensure_ascii=False)
+            yield ("data: " + payload).encode("utf-8")
+            yield b"data: [DONE]"
+
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: BytesResponse())
+    assert "".join(router.cortex_stream("groq", [{"role": "user", "content": "x"}])) == text
+
+
+def test_probe_includes_legacy_providers_with_status(monkeypatch):
+    from orchestrator import providers
+    for name in ("GEMINI_API_KEY", "GROQ_API_KEY", "HF_TOKEN", "HUGGINGFACE_API_KEY", "OPENROUTER_API_KEY", "CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-secret-1234567890")
+
+    class Resp:
+        def __init__(self, status, text):
+            self.status_code, self.text, self.headers = status, text, {}
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(providers.requests, "post", lambda *a, **k: Resp(401, "Invalid nvapi-secret-1234567890"))
+    rows = {row["endpoint"]: row for row in router.probe_all_endpoints()}
+    assert set(rows) >= {"google_ai_studio", "groq", "huggingface", "nvidia", "openrouter", "cerebras", "mistral"}
+    nvidia = rows["nvidia"]
+    assert nvidia["ok"] is False and nvidia["status"] == 401
+    assert "key rejected" in nvidia["detail"]
+    assert "nvapi-secret" not in nvidia["detail"] and "nvapi-secret" not in nvidia["key"]
+    assert rows["openrouter"]["detail"] == "no key configured"
+
+
+def test_legacy_vendor_discovery_covers_nvidia():
+    from orchestrator import discovery
+    assert discovery.vendor_for("nvidia") == "nvidia"
+    ranked = discovery.rank_models("nvidia", ["meta/llama-3.3-70b-instruct", "deepseek-ai/deepseek-r1", "other/x"])
+    assert ranked[0] == "deepseek-ai/deepseek-r1"
+    assert discovery.rank_models("openrouter", ["a/b", "c/d:free"])[0] == "c/d:free"

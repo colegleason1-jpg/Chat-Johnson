@@ -50,10 +50,34 @@ approved reconstruction plan.
 
 ## Operational environments
 
-- **Task Finder**: bounded multi-workstream execution with progress and per-step results.
-- **Repository Work**: least-privilege GitHub OAuth skeleton plus the local sandboxed patch pipeline.
+Four tabs across the top of the main panel. Each tab owns its own threads (selector, New thread,
+Clear chat, Rename, health gauge, Migrate now); keys are never touched by any of these.
+
+- **Task Finder**: a mission is classified (research, code, analysis, plan, general) with no provider
+  call and expanded into typed workstreams you can edit before launch. Steps run one at a time through
+  the router to respect free-tier limits; every result lands in the tab's thread, and a
+  "Continue the mission" box keeps the conversation going with the results in context.
+- **Repository Work**: least-privilege GitHub OAuth skeleton, the local sandboxed patch pipeline, and a
+  discussion thread for the change.
 - **Chat Bot**: long-form developer chat with file uploads injected as context.
-- **Normal Chat**: zero-overhead single-pass chat.
+- **Normal Chat**: single-pass chat.
+
+## Implemented vs roadmap
+
+| Bible feature | Status |
+|---|---|
+| BYOK key panel, session-scoped, Test keys for all 7 providers | Implemented |
+| Tri-Processor Cortex (1/f probe, MILP selection, streaming) with self-healing model ids | Implemented (routing signal only) |
+| Heavy Mode (draft → review → synthesis) with optional per-session paid review slot | Implemented |
+| SQLite vault: per-workspace threads, 200-message windows, texturize-then-archive, artifacts | Implemented |
+| Thread-health agent with vision-digest migration | Implemented |
+| Repository sandbox pipeline with AST + pytest repair loop | Implemented (local) |
+| GitHub OAuth handshake | Skeleton (read-only identity check) |
+| 10-cloud connector fabric | Roadmap · local SQLite is the only store; stubs listed in the sidebar |
+| Background Git-Streamer | Roadmap · not implemented |
+| Live SDK Document Scraper | Roadmap · not implemented |
+| Self-Correcting Execution Sandbox for chat output | Roadmap · exists only inside the repository pipeline |
+| Cross-thread semantic search | Roadmap · artifact search is text matching |
 
 Controls: **Heavy Mode** toggle (multi-pass, more tokens, longer wait), **Artifact Lock** beside every
 code block (versioned save to SQLite), output token budget slider, per-project scope.
