@@ -57,7 +57,7 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 
 - **Task Finder**: a mission is classified (research, code, analysis, plan, general) with no provider
   call and expanded into typed workstreams you can edit before launch. Steps run one at a time through
-  the router to respect free-tier limits; every result lands in the tab's thread, and a
+  the router to respect free-tier limits; every result lands in the workspace's chat, and a
   chat bar keeps the conversation going with the results in context.
 - **Repository Work**: least-privilege GitHub OAuth skeleton, the local sandboxed patch pipeline, and a
   discussion thread for the change.

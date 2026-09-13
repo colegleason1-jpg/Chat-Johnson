@@ -10,7 +10,7 @@ import re
 import sys
 
 ENTRIES = [
-    ("app.py", "Streamlit studio: sidebar (keys, Heavy Mode, paid slot, artifacts, memory, roadmap stubs), four workspace tabs, per-workspace thread bar, Task Finder, preview canvas"),
+    ("app.py", "Streamlit studio: sidebar (keys, Heavy Mode, paid slot, artifacts, memory, roadmap stubs), server-side workspace switch (segmented control or radio, ?ws=), one chat bar pinned to the bottom and routed to the selected workspace, per-workspace thread row (New/Clear/Delete/More), Task Finder missions, routing log, preview canvas"),
     ("orchestrator/router.py", "Cortex 1/2/3: BYOK status, endpoints + ceilings, 1/f noise + SDE + telemetry penalty, MILP selection, resilient HTTP + streaming, probes, paid slot, Heavy Mode pipeline, legacy generate/generate_mode"),
     ("orchestrator/discovery.py", "vendor model lists, preference order, retired/transient/unusable rules, backoff, validated discovery"),
     ("orchestrator/providers.py", "legacy OpenAI-compatible + Gemini client with retries, model recovery, key redaction"),
@@ -35,7 +35,7 @@ ENTRIES = [
 
 RIPPLE = """## Dependency ripple (what else to touch when you change a file)
 
-- `orchestrator/vault.py` signatures → `app.py` callers (`render_thread_controls`, `run_generation`, `render_history`, Task Finder) and `tests/test_threads.py`, `tests/test_vault.py`.
+- `orchestrator/vault.py` signatures → `app.py` callers (`render_thread_bar`, `execute_mission`, `render_routing_log`, `run_generation`, `render_history`, Task Finder) and `tests/test_threads.py`, `tests/test_vault.py`.
 - `orchestrator/router.py` public names → `app.py` imports block, `cli.py`, `orchestrator/decomposer.py`, `orchestrator/executor.py`, `tests/test_cortex.py`.
 - `orchestrator/config.py` provider defaults/limits → `orchestrator/discovery.py` preferences, README model-id lines, `tests/test_cortex.py` default assertions.
 - `orchestrator/discovery.py` rules → `orchestrator/router.py` `_resilient_post`, `orchestrator/providers.py` `_with_model_recovery`.

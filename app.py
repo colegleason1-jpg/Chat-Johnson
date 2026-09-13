@@ -373,23 +373,21 @@ def render_output_with_artifacts(
 
 
 def render_preview_panel() -> None:
-    with st.container(border=True):
-        st.subheader("Live preview canvas")
-        st.caption("HTML/CSS mockups are isolated and sanitized before rendering.")
-        if "preview_editor" not in st.session_state:
-            st.session_state.preview_editor = st.session_state.get("preview_source", "")
-        source = st.text_area(
-            "Preview markup",
-            key="preview_editor",
-            height=170,
-            label_visibility="collapsed",
-            placeholder="Paste HTML/CSS here or generate an interface in Chat Bot mode…",
-        )
-        render_clicked = st.button("Render sanitized preview", key="render_preview", type="secondary")
-        if render_clicked:
-            st.session_state.preview_source = source
-        effective_source = st.session_state.get("preview_source", "") or source
-        st.components.v1.html(safe_preview_document(effective_source), height=410, scrolling=True)
+    st.caption("HTML/CSS mockups are isolated and sanitized before rendering.")
+    if "preview_editor" not in st.session_state:
+        st.session_state.preview_editor = st.session_state.get("preview_source", "")
+    source = st.text_area(
+        "Preview markup",
+        key="preview_editor",
+        height=170,
+        label_visibility="collapsed",
+        placeholder="Paste HTML/CSS here or generate an interface in Chat Bot mode…",
+    )
+    render_clicked = st.button("Render sanitized preview", key="render_preview", type="secondary")
+    if render_clicked:
+        st.session_state.preview_source = source
+    effective_source = st.session_state.get("preview_source", "") or source
+    st.components.v1.html(safe_preview_document(effective_source), height=410, scrolling=True)
 
 
 # =============================================================================
@@ -467,7 +465,7 @@ def github_api_get(token: str, path: str) -> Any:
 
 def render_repository_work(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
     st.subheader("Repository Work")
-    st.caption("Sandboxed local changes, reviewable diffs, and an explicit human handoff.")
+    st.caption("Sandboxed local changes, reviewable diffs, and an explicit human handoff." + mode_caption())
     render_thread_bar(project_scope, "repository", ledger)
     code = _query_value("code")
     received_state = _query_value("state")
@@ -643,14 +641,18 @@ def log_route(workspace: Optional[str], task_type: str, route: str, mode: str, s
 
 _SCROLL_SNIPPET = (
     "<!-- NONCE --><script>(function(){try{var d=window.parent.document;"
-    "var m=d.querySelector('section[data-testid=\"stMain\"]')||d.querySelector('section.main')||d.querySelector('.main');"
-    "var go=function(){if(m){m.scrollTo({top:m.scrollHeight,behavior:'smooth'});}else{window.parent.scrollTo(0,d.body.scrollHeight);}};"
+    "var m=d.querySelector('section[data-testid=\"stAppScrollToBottomContainer\"]')||d.querySelector('section.stMain')"
+    "||d.querySelector('[data-testid=\"ScrollToBottomContainer\"]')||d.querySelector('section[data-testid=\"stMain\"]')"
+    "||d.querySelector('section.main')||d.querySelector('.main');"
+    "var msgs=d.querySelectorAll('[data-testid=\"stChatMessage\"]');var last=msgs.length?msgs[msgs.length-1]:null;"
+    "var go=function(){if(last){last.scrollIntoView({block:'start',behavior:'smooth'});}"
+    "else if(m){m.scrollTo({top:m.scrollHeight,behavior:'smooth'});}else{window.parent.scrollTo(0,d.body.scrollHeight);}};"
     "go();setTimeout(go,400);setTimeout(go,1500);}catch(e){}})();</script>"
 )
 
 
 def scroll_to_bottom(nonce: Any) -> None:
-    """Bring the newest exchange into view after a send; the pinned chat bar never moves."""
+    """Scroll the message just sent to the top of the view so the answer streams in below it; the pinned bar never moves."""
     components.html(_SCROLL_SNIPPET.replace("NONCE", str(nonce)), height=0)
 
 
@@ -809,12 +811,11 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
     def _on_select(key: str = select_key) -> None:
         switch_thread(int(st.session_state[key]))
 
-    pick, new, clear, delete, more = st.columns([0.36, 0.16, 0.16, 0.16, 0.16], gap="small")
-    with pick:
-        st.selectbox(
-            "Chat", ids, format_func=lambda value: labels.get(value, str(value)), key=select_key,
-            on_change=_on_select, label_visibility="collapsed",
-        )
+    st.selectbox(
+        "Chat", ids, format_func=lambda value: labels.get(value, str(value)), key=select_key,
+        on_change=_on_select, label_visibility="collapsed",
+    )
+    new, clear, delete, more = st.columns(4, gap="small")  # four equal buttons stay readable at iPad width
     if new.button("New chat", key=f"new_thread_{workspace}", use_container_width=True,
                   help="Start a fresh chat in this workspace. Keys and other chats stay as they are."):
         create_thread(project_scope, workspace=workspace)
@@ -822,9 +823,11 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
     if clear.button("Clear chat", key=f"clear_thread_{workspace}", use_container_width=True,
                     help="Empty this chat. The messages move to the archive and leave the context; keys are untouched."):
         moved = clear_thread(int(current["id"]))
+        for bucket in ("pending_missions", "task_launches"):
+            st.session_state.get(bucket, {}).pop(int(current["id"]), None)
         st.session_state[f"notice_{workspace}"] = f"Chat cleared: {moved} message(s) archived and out of context."
         st.rerun()
-    if delete.button("Delete chat", key=f"delete_thread_{workspace}", use_container_width=True,
+    if delete.button("Delete", key=f"delete_thread_{workspace}", use_container_width=True,
                      help="Remove this chat, its archive, and its summaries after a confirmation. Locked artifacts stay."):
         st.session_state[f"confirm_delete_{workspace}"] = int(current["id"])
         st.rerun()
@@ -892,22 +895,24 @@ def send_label(base: str) -> str:
     return f"{base} · Heavy Mode (up to 3 passes)" if active_mode() == "heavy" else base
 
 
-def chat_placeholder(workspace: str, project_scope: str, ready: bool) -> str:
-    if not ready:
+def chat_placeholder(workspace: str, ready: bool) -> str:
+    """Constant per workspace: on Streamlit 1.32 the widget id includes the placeholder, so a changing one wipes an unsent draft."""
+    if not ready:  # no draft can exist while the bar is disabled
         return "Paste an API key in the sidebar (🔑 API keys) to start chatting"
     if workspace == "task_finder":
-        mission = thread_mission(active_thread(project_scope, "task_finder"))
-        base = "Continue the mission…" if mission else "Describe a mission to decompose into workstreams…"
-    elif workspace == "chat_bot":
-        base = "Ask the developer bot" + (" · attach files with the paperclip" if CHAT_INPUT_ACCEPTS_FILES else "") + "…"
-    elif workspace == "repository":
-        base = "Discuss the repository work: the diff, the next change, a review…"
-    else:
-        base = "Message Normal Chat…"
-    return base + (" · Heavy Mode (up to 3 passes)" if active_mode() == "heavy" else "")
+        return "Describe a mission, or continue the current one…"
+    if workspace == "chat_bot":
+        return "Ask the developer bot" + (" · attach files with the paperclip" if CHAT_INPUT_ACCEPTS_FILES else "") + "…"
+    if workspace == "repository":
+        return "Discuss the repository work: the diff, the next change, a review…"
+    return "Message Normal Chat…"
 
 
-def render_chat_bar(workspace: str, project_scope: str) -> Optional[ChatSubmission]:
+def mode_caption() -> str:
+    return " Heavy Mode is on: each send runs up to 3 passes (draft → review → synthesis)." if active_mode() == "heavy" else ""
+
+
+def render_chat_bar(workspace: str) -> Optional[ChatSubmission]:
     """The one chat bar, pinned to the bottom of the screen; it always sends to the selected workspace.
 
     It must be created at the top level of the script (not inside a column or tab) to stay pinned.
@@ -916,7 +921,7 @@ def render_chat_bar(workspace: str, project_scope: str) -> Optional[ChatSubmissi
     extra: Dict[str, Any] = {}
     if workspace == "chat_bot" and CHAT_INPUT_ACCEPTS_FILES:
         extra = {"accept_file": "multiple", "file_type": CHAT_FILE_TYPES}
-    value = st.chat_input(chat_placeholder(workspace, project_scope, ready), key=f"chat_bar_{workspace}", disabled=not ready, **extra)
+    value = st.chat_input(chat_placeholder(workspace, ready), key=f"chat_bar_{workspace}", disabled=not ready, **extra)
     if not value:
         return None
     if isinstance(value, str):
@@ -960,10 +965,7 @@ def render_workspace_switch() -> str:
 
 def render_normal_chat(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
     st.subheader("Normal Chat")
-    st.caption(
-        "A single-pass terminal for quick text, planning, and coding questions."
-        + (" Heavy Mode is on: each send runs draft → review → synthesis." if active_mode() == "heavy" else "")
-    )
+    st.caption("A single-pass terminal for quick text, planning, and coding questions." + mode_caption())
     render_thread_bar(project_scope, "normal_chat", ledger)
     render_history(project_scope, "Conversation", workspace="normal_chat")
     dispatch_chat(project_scope, "normal_chat", submission, ledger)
@@ -971,7 +973,7 @@ def render_normal_chat(project_scope: str, ledger: QuotaLedger, submission: Opti
 
 def render_chat_bot(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
     st.subheader("Chat Bot")
-    st.caption("Continuous developer mode with explicit, consented codebase file injections.")
+    st.caption("Continuous developer mode with explicit, consented codebase file injections." + mode_caption())
     render_thread_bar(project_scope, "chat_bot", ledger)
     staged: List[Any] = []
     if CHAT_INPUT_ACCEPTS_FILES:
@@ -1004,7 +1006,6 @@ def execute_mission(
         thread_id = int(migration["new_thread_id"])
     task_mode = active_mode()
     append_message(project_scope, "user", f"{MISSION_PREFIX}{goal}", mode=task_mode, workspace="task_finder", task_type="plan")
-    set_thread_mission(thread_id, goal)
     progress = st.progress(0.0, text="Starting workstreams…")
     request_lock = get_task_request_lock()
     token_budget = int(st.session_state.get("max_tokens", 2048))
@@ -1046,6 +1047,9 @@ def execute_mission(
             failures.append((str(step["title"]), str(exc)[:600]))
             log_route("task_finder", step_type, "failed", task_mode, started, str(exc)[:160])
         progress.progress(finished / len(plan), text=f"{succeeded} succeeded · {failed} failed · {finished}/{len(plan)} done")
+    if succeeded:
+        # Pinned only once there is something to continue from; an all-failed launch leaves the next message free to be a new mission.
+        set_thread_mission(thread_id, goal)
     return {"thread_id": thread_id, "goal": goal, "steps": len(plan), "succeeded": succeeded, "failed": failed, "failures": failures}
 
 
@@ -1107,7 +1111,7 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
     st.caption(
         "Describe a mission in the chat bar; it is decomposed into workstreams you can edit before launch. "
         "Steps run one at a time to respect free-tier limits, and every result lands in this chat so the mission "
-        "continues as a conversation."
+        "continues as a conversation." + mode_caption()
     )
     thread = render_thread_bar(project_scope, "task_finder", ledger)
     thread_id = int(thread["id"])
@@ -1369,14 +1373,15 @@ st.caption(
 scope = st.session_state.project_scope
 workspace = render_workspace_switch()
 # Created at the top level on purpose: inside a column or tab the chat bar would render inline instead of pinned.
-submission = render_chat_bar(workspace, scope)
+submission = render_chat_bar(workspace)
 
-left_panel, right_panel = st.columns([0.55, 0.45], gap="large")
-with left_panel:
-    WORKSPACE_RENDERERS[workspace](scope, ledger, submission)
+WORKSPACE_RENDERERS[workspace](scope, ledger, submission)
 
-with right_panel:
+st.divider()
+# One column: a side panel squeezed the chat to a sliver at iPad width. The canvas opens itself when markup arrives.
+with st.expander("Live preview canvas", expanded=bool(st.session_state.get("preview_source"))):
     render_preview_panel()
+with st.expander("Routing log & last decision", expanded=False):
     render_routing_log()
     decision = st.session_state.get("last_decision")
     if decision:
