@@ -16,17 +16,58 @@ def db(tmp_path, monkeypatch):
     yield vault
 
 
-def test_rolling_window_keeps_newest_200_per_scope(db):
+def test_rolling_window_texturizes_and_archives_instead_of_deleting(db):
     for index in range(205):
-        db.append_message("alpha", "user", f"alpha-{index}")
+        db.append_message("alpha", "user", f"alpha-{index}. Decided to fix bug in core/app.py")
     for index in range(3):
         db.append_message("beta", "user", f"beta-{index}")
     alpha = db.recent_messages("alpha")
+    archived = db.archived_messages("alpha")
+    summaries = db.recent_summaries("alpha")
     beta = db.recent_messages("beta")
-    assert len(alpha) == 200
-    assert alpha[0]["content"] == "alpha-5"
-    assert alpha[-1]["content"] == "alpha-204"
+    # Active window never exceeds the cap and evicts in one coherent block.
+    assert db.MESSAGE_WINDOW - db.TEXTURIZE_BATCH <= len(alpha) <= db.MESSAGE_WINDOW
+    assert len(alpha) + len(archived) == 205
+    assert alpha[-1]["content"].startswith("alpha-204")
+    assert archived[0]["content"].startswith("alpha-0")
+    # One summary covers exactly the archived block, and raw text is preserved.
+    assert len(summaries) == 1
+    assert summaries[0]["message_count"] == len(archived)
+    assert summaries[0]["covers_from_id"] == archived[0]["id"]
+    assert summaries[0]["covers_to_id"] == archived[-1]["id"]
+    assert "core/app.py" in summaries[0]["content"]
+    # Other scopes are untouched.
     assert [row["content"] for row in beta] == ["beta-0", "beta-1", "beta-2"]
+    assert db.archived_messages("beta") == []
+
+
+def test_context_block_includes_summaries_after_eviction(db):
+    for index in range(201):
+        db.append_message("scope", "user", f"turn {index}")
+    block = db.context_block("scope")
+    assert block.startswith("[TEXTURIZED SUMMARY of")
+    assert "USER: turn 200" in block
+
+
+def test_retexturize_summary_replaces_content(db):
+    for index in range(201):
+        db.append_message("scope", "user", f"turn {index}")
+    summary = db.recent_summaries("scope")[0]
+    db.retexturize_summary(summary["id"], "Model summary with token sk-abcdefghijklmnopqrstuvwxyz", method="model")
+    refreshed = db.recent_summaries("scope")[0]
+    assert refreshed["method"] == "model"
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in refreshed["content"]
+
+
+def test_artifact_export_and_search(db):
+    artifact_id, version = db.save_artifact("scope", "router.py", "orchestrator/router.py", "def route():\n    pass\n", "python")
+    filename, body = db.export_artifact(artifact_id)
+    assert filename == "router.v1.py"
+    assert body.startswith("def route()")
+    assert [row["id"] for row in db.search_artifacts("scope", "route")] == [artifact_id]
+    assert db.search_artifacts("scope", "nothing-matches") == []
+    with pytest.raises(KeyError):
+        db.export_artifact(999)
 
 
 def test_messages_are_redacted_before_persistence(db):

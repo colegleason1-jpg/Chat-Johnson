@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-13
 **Branch:** `claude/ai-nonlinear-logic-arch-jakbpm` (currently identical to `main`)
-**Status:** approved 2026-09-13 (decisions A–D). Phase 0 and Phase 1 executed in this branch.
+**Status:** approved 2026-09-13 (decisions A–D). Phases 0, 1, and 2 executed in this branch. Phase 3 needs your provider keys.
 
 ---
 
@@ -104,7 +104,12 @@ streaming in Normal Chat / Chat Bot, `CORTEX_*_MODEL` overrides, and the session
 - SQLite tests: 201st message rolls, artifact versions are immutable, project scopes isolate.
 - Env overrides for Cortex model ids (`CORTEX_GEMINI_MODEL`, etc.). Wire `st.write_stream` for chat panels.
 
-### Phase 2 · Memory and texturization
+### Phase 2 · Memory and texturization — DONE
+*Delivered:* the destructive SQLite trigger is gone. When a scope passes 200 active messages the
+oldest block of 40 is texturized into a `summaries` row (deterministic, zero quota) and moved to
+`message_archive`; nothing raw is deleted. Summaries lead the prompt context. `retexturize_summary`
+lets a free model refine a summary later. Artifacts gained search and versioned download.
+
 - Add `summaries` table. Before eviction, texturize the oldest block into a compact summary via the
   cheapest free endpoint; keep summaries in the context block.
 - Artifact export (download, copy to repo path) and artifact search in the sidebar.

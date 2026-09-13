@@ -16,7 +16,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 DEFAULT_DB_PATH = "chat_johnson_vault.db"
@@ -63,18 +63,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_artifact_version
 CREATE INDEX IF NOT EXISTS idx_artifact_scope_time
     ON artifact_store(project_scope, created_at DESC, id DESC);
 
-CREATE TRIGGER IF NOT EXISTS message_history_rolling_cap
-AFTER INSERT ON message_history
-BEGIN
-    DELETE FROM message_history
-    WHERE id IN (
-        SELECT id
-        FROM message_history
-        WHERE project_scope = NEW.project_scope
-        ORDER BY timestamp DESC, id DESC
-        LIMIT -1 OFFSET 200
-    );
-END;
+CREATE TABLE IF NOT EXISTS message_archive (
+    id INTEGER PRIMARY KEY,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    timestamp REAL NOT NULL,
+    token_count INTEGER NOT NULL,
+    project_scope TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL DEFAULT 'normal',
+    archived_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_scope_time
+    ON message_archive(project_scope, timestamp ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_scope TEXT NOT NULL,
+    covers_from_id INTEGER NOT NULL,
+    covers_to_id INTEGER NOT NULL,
+    message_count INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    method TEXT NOT NULL DEFAULT 'extractive',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_summaries_scope_time
+    ON summaries(project_scope, created_at DESC, id DESC);
+
+-- Older databases carried a destructive trigger; the application now
+-- texturizes (summarize + archive) before evicting from the active window.
+DROP TRIGGER IF EXISTS message_history_rolling_cap;
 """
 
 
@@ -119,7 +139,7 @@ def append_message(
     provider: str = "",
     mode: str = "normal",
 ) -> int:
-    """Insert a scoped message; the SQLite trigger retains the newest 200."""
+    """Insert a scoped message, then texturize + archive anything beyond the window."""
     safe_role = role if role in {"user", "assistant", "system"} else "user"
     safe_content = redact_secrets(content)
     with _open_database() as connection:
@@ -139,7 +159,141 @@ def append_message(
                 mode[:40],
             ),
         )
-        return int(cursor.lastrowid)
+        message_id = int(cursor.lastrowid)
+    enforce_window(project_scope)
+    return message_id
+
+
+TEXTURIZE_BATCH = 40  # evict in blocks so each summary covers a coherent stretch
+
+
+def extractive_summary(rows: Sequence[sqlite3.Row], max_characters: int = 1_800) -> str:
+    """Deterministic, zero-quota texturization of an evicted message block.
+
+    Keeps the first sentence of every user turn and any lines that look like
+    decisions, file names, or code identifiers, then truncates to a budget.
+    An LLM pass can later replace this text via :func:`retexturize_summary`.
+    """
+    keep: List[str] = []
+    for row in rows:
+        content = str(row["content"]).strip()
+        if not content:
+            continue
+        first_line = content.splitlines()[0].strip()
+        first_sentence = re.split(r"(?<=[.!?])\s+", first_line, maxsplit=1)[0][:220]
+        keep.append(f"{row['role']}: {first_sentence}")
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped == first_sentence:
+                continue
+            if re.search(r"(?i)\b(decid|agree|must|never|always|todo|fix|bug|error)\b", stripped) or re.search(
+                r"[\w/.-]+\.(py|js|ts|md|json|yml|yaml|toml|sql)\b", stripped
+            ):
+                keep.append(f"  - {stripped[:160]}")
+            if sum(len(item) + 1 for item in keep) > max_characters:
+                break
+    text = "\n".join(keep)
+    return text[:max_characters]
+
+
+def enforce_window(project_scope: str) -> Optional[int]:
+    """Texturize and archive the oldest messages once the scope exceeds the window.
+
+    Returns the new summary id when eviction happened, else ``None``. Raw
+    messages are never lost: they move to ``message_archive`` and a summary of
+    the block is inserted into ``summaries`` in the same transaction.
+    """
+    scope = project_scope.strip() or "default"
+    with _open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        total = int(connection.execute(
+            "SELECT COUNT(*) FROM message_history WHERE project_scope = ?", (scope,)
+        ).fetchone()[0])
+        if total <= MESSAGE_WINDOW:
+            connection.commit()
+            return None
+        overflow = total - MESSAGE_WINDOW
+        batch = max(overflow, min(TEXTURIZE_BATCH, total))
+        rows = connection.execute(
+            """
+            SELECT * FROM message_history
+            WHERE project_scope = ?
+            ORDER BY timestamp ASC, id ASC
+            LIMIT ?
+            """,
+            (scope, batch),
+        ).fetchall()
+        if not rows:
+            connection.commit()
+            return None
+        summary_text = extractive_summary(rows)
+        ids = [int(row["id"]) for row in rows]
+        cursor = connection.execute(
+            """
+            INSERT INTO summaries
+                (project_scope, covers_from_id, covers_to_id, message_count, content, method, created_at)
+            VALUES (?, ?, ?, ?, ?, 'extractive', ?)
+            """,
+            (scope, min(ids), max(ids), len(ids), summary_text, time.time()),
+        )
+        summary_id = int(cursor.lastrowid)
+        now = time.time()
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO message_archive
+                (id, role, content, timestamp, token_count, project_scope, provider, mode, archived_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    int(row["id"]), row["role"], row["content"], row["timestamp"], row["token_count"],
+                    row["project_scope"], row["provider"], row["mode"], now,
+                )
+                for row in rows
+            ],
+        )
+        placeholders = ",".join("?" for _ in ids)
+        connection.execute(f"DELETE FROM message_history WHERE id IN ({placeholders})", ids)
+        connection.commit()
+        return summary_id
+
+
+def recent_summaries(project_scope: str, limit: int = 5) -> List[sqlite3.Row]:
+    with _open_database() as connection:
+        return list(
+            connection.execute(
+                """
+                SELECT * FROM (
+                    SELECT * FROM summaries WHERE project_scope = ?
+                    ORDER BY created_at DESC, id DESC LIMIT ?
+                ) ORDER BY created_at ASC, id ASC
+                """,
+                (project_scope.strip() or "default", max(1, min(int(limit), 50))),
+            ).fetchall()
+        )
+
+
+def archived_messages(project_scope: str, limit: int = 500) -> List[sqlite3.Row]:
+    """Raw history that left the active window; available for authorized retrieval."""
+    with _open_database() as connection:
+        return list(
+            connection.execute(
+                """
+                SELECT * FROM message_archive WHERE project_scope = ?
+                ORDER BY timestamp ASC, id ASC LIMIT ?
+                """,
+                (project_scope.strip() or "default", max(1, min(int(limit), 5000))),
+            ).fetchall()
+        )
+
+
+def retexturize_summary(summary_id: int, new_content: str, method: str = "model") -> None:
+    """Replace an extractive summary with a richer one (for example from a free model)."""
+    with _open_database() as connection:
+        connection.execute(
+            "UPDATE summaries SET content = ?, method = ? WHERE id = ?",
+            (redact_secrets(new_content)[:6_000], method[:40], int(summary_id)),
+        )
 
 
 def recent_messages(project_scope: str, limit: int = MESSAGE_WINDOW) -> List[sqlite3.Row]:
@@ -164,10 +318,17 @@ def recent_messages(project_scope: str, limit: int = MESSAGE_WINDOW) -> List[sql
 def context_block(project_scope: str, max_characters: int = 24_000) -> str:
     """Build a bounded prompt context from the active project's local window."""
     rows = recent_messages(project_scope, MESSAGE_WINDOW)
-    if not rows:
+    summaries = recent_summaries(project_scope, 5)
+    if not rows and not summaries:
         return "(no prior messages in this project scope)"
     lines: List[str] = []
     used = 0
+    for summary in summaries:
+        line = f"[TEXTURIZED SUMMARY of {summary['message_count']} earlier messages]\n{summary['content']}"
+        if used + len(line) + 1 > max_characters // 3:
+            break
+        lines.append(line)
+        used += len(line) + 1
     for row in rows:
         line = f"{row['role'].upper()}: {row['content']}"
         if used + len(line) + 1 > max_characters:
@@ -261,6 +422,43 @@ def save_artifact(
         )
         connection.commit()
         return int(cursor.lastrowid), version
+
+
+def artifact_by_id(artifact_id: int) -> Optional[sqlite3.Row]:
+    with _open_database() as connection:
+        return connection.execute("SELECT * FROM artifact_store WHERE id = ?", (int(artifact_id),)).fetchone()
+
+
+def search_artifacts(project_scope: str, query: str, limit: int = 20) -> List[sqlite3.Row]:
+    """Case-insensitive search over name, path, and structural summary."""
+    needle = f"%{query.strip()}%"
+    with _open_database() as connection:
+        return list(
+            connection.execute(
+                """
+                SELECT id, name, file_path, version, structural_summary, created_at
+                FROM artifact_store
+                WHERE project_scope = ?
+                  AND (name LIKE ? OR file_path LIKE ? OR structural_summary LIKE ?)
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (project_scope.strip() or "default", needle, needle, needle, max(1, min(int(limit), 100))),
+            ).fetchall()
+        )
+
+
+def export_artifact(artifact_id: int) -> Tuple[str, str]:
+    """Return (suggested_filename, body) for a download or copy-out."""
+    row = artifact_by_id(artifact_id)
+    if row is None:
+        raise KeyError(f"artifact {artifact_id} not found")
+    filename = row["file_path"].split("/")[-1] if row["file_path"] else row["name"]
+    if not filename:
+        filename = f"artifact-{row['id']}.txt"
+    stem, dot, ext = filename.rpartition(".")
+    filename = f"{stem}.v{row['version']}.{ext}" if dot else f"{filename}.v{row['version']}"
+    return filename, str(row["code_body"])
 
 
 def recent_artifacts(project_scope: str, limit: int = 8) -> List[sqlite3.Row]:

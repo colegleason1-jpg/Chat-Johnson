@@ -73,11 +73,15 @@ from orchestrator.router import (
 from orchestrator.vault import (
     MESSAGE_WINDOW,
     append_message,
+    archived_messages,
     context_block,
+    export_artifact,
     initialize_database,
     recent_artifacts,
     recent_messages,
+    recent_summaries,
     save_artifact,
+    search_artifacts,
 )
 
 initialize_database()
@@ -761,13 +765,35 @@ with st.sidebar:
     if not configured_provider_names():
         st.warning("No provider keys detected. Add keys through the Keys/API keys tab; this app never stores them in SQLite.")
     st.divider()
-    artifacts = recent_artifacts(st.session_state.project_scope, 6)
     st.subheader("Locked artifacts")
+    artifact_query = st.text_input("Search artifacts", key="artifact_query", placeholder="name, path, or summary")
+    artifacts = (
+        search_artifacts(st.session_state.project_scope, artifact_query, 12)
+        if artifact_query.strip()
+        else recent_artifacts(st.session_state.project_scope, 6)
+    )
     if artifacts:
         for artifact in artifacts:
+            filename, body = export_artifact(int(artifact["id"]))
             st.caption(f"v{artifact['version']} · {artifact['name']} · {artifact['structural_summary'][:100]}")
+            st.download_button(
+                f"⬇ {filename}",
+                data=body,
+                file_name=filename,
+                key=f"download-artifact-{artifact['id']}",
+                use_container_width=True,
+            )
     else:
         st.caption("No artifacts in this scope yet.")
+    st.divider()
+    st.subheader("Memory")
+    active_count = len(recent_messages(st.session_state.project_scope, MESSAGE_WINDOW))
+    archive_count = len(archived_messages(st.session_state.project_scope, 5000))
+    summary_rows = recent_summaries(st.session_state.project_scope, 50)
+    st.caption(
+        f"Active window {active_count}/{MESSAGE_WINDOW} · archived {archive_count} · "
+        f"summaries {len(summary_rows)}. Raw history is texturized and archived, never deleted."
+    )
 
 st.markdown("<div class='eyebrow'>Sovereign local-first execution workspace</div>", unsafe_allow_html=True)
 st.title("Chat Johnson Master Studio")
