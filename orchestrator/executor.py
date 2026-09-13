@@ -15,6 +15,7 @@ from .config import PROVIDERS, Settings, get_settings
 from .decomposer import decompose
 from .memory import StepRecord, TaskMemory
 from .patches import (
+    changed_files,
     PATCH_INSTRUCTIONS,
     apply_file_blocks,
     apply_unified_diffs,
@@ -64,7 +65,7 @@ class Orchestrator:
                 memory.refresh_summary(self._cheap_summarizer)
         finally:
             if sandbox_path:
-                self._log_event("sandbox_diff", diff=sandbox.diff_vs_base(sandbox_path))
+                self._log_event("sandbox_diff", diff=sandbox.diff_vs_base(sandbox_path, repo_path))
 
         # 4) verification report
         report = {
@@ -75,7 +76,7 @@ class Orchestrator:
             "memory": memory.context_block(),
             "ingest": ingest_stats,
             "ledger": {p: self.ledger.usage(p) for p in self.ledger._limits},
-            "diff": sandbox.diff_vs_base(sandbox_path) if sandbox_path else "",
+            "diff": sandbox.diff_vs_base(sandbox_path, repo_path) if sandbox_path else "",
         }
         return report
 
@@ -129,7 +130,7 @@ class Orchestrator:
         applied, failed = apply_unified_diffs(sandbox_path, diffs) if diffs else ([], [])
 
         # guardrail: every generated .py must parse
-        changed = written + sandbox.changed_files(sandbox_path)
+        changed = written + changed_files(sandbox_path)
         errors = sandbox.validate_python_files(sandbox_path, changed)
         if errors:
             return "FAILED: syntax guardrail:\n" + "\n".join(errors)

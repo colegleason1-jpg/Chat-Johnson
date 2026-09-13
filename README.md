@@ -84,9 +84,9 @@ code block (versioned save to SQLite), output token budget slider, per-project s
 
 ## Threads and the thread-health agent
 
-Every project scope holds any number of **threads**. The sidebar lets you switch, start a new one,
-rename, or **Clear thread** (messages move to the archive; keys are untouched). Each thread has its
-own 200-message window and its own texturized summaries.
+Every workspace tab holds any number of **threads**. The thread bar at the top of each tab lets you
+switch, start a new one, rename, or **Clear chat** (messages move to the archive; keys are untouched).
+Each thread has its own 200-message window and its own texturized summaries.
 
 Before every send, a zero-quota **health sweep** measures the active thread: message count, estimated
 tokens in the live window, stacked summaries, repeated prompts, and error loops. When a threshold
@@ -170,9 +170,8 @@ and Normal mode never uses it. Close the tab and it is gone.
 
 ## Deploying on Streamlit Community Cloud
 
-- Point the app at **this repository, the branch you want to run, and `app.py`**. The
-  `main` branch does not yet carry the key panel; use `claude/ai-nonlinear-logic-arch-jakbpm`
-  until it is merged.
+- Point the app at **this repository, the branch you want to run, and `app.py`**. The working
+  branch `claude/ai-nonlinear-logic-arch-jakbpm` is ahead of `main` until its pull request merges.
 - Dependencies come from the lowercase `requirements.txt`; `.python-version` requests 3.12.
 - Keys pasted in the sidebar are scoped to your own browser session. Other visitors to the same
   app URL do not see them and must paste their own.

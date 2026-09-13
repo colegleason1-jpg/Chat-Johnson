@@ -777,7 +777,7 @@ def list_endpoint_models(endpoint: str | CortexEndpoint, timeout: int = 20) -> L
     return discovery.list_models(selected.kind, selected.base_url, _endpoint_key(selected), timeout=timeout)
 
 
-def _model_is_usable(selected: CortexEndpoint, model_id: str, timeout: int = 20) -> bool:
+def _model_is_usable(selected: CortexEndpoint, model_id: str, timeout: int = 20, ledger: Optional[QuotaLedger] = None) -> bool:
     """One-token, non-streaming call: True on 2xx or a transient status, False if this key cannot use the model."""
     if requests is None:
         return False
@@ -785,7 +785,11 @@ def _model_is_usable(selected: CortexEndpoint, model_id: str, timeout: int = 20)
         url, headers, payload = build_cortex_request(
             selected, [{"role": "user", "content": "ping"}], max_tokens=8, temperature=0.0, stream=False, model_id=model_id
         )
+        if ledger is not None:
+            ledger.record_attempt(_vendor(selected))
+        started = time.monotonic()
         response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        record_telemetry(selected.name, time.monotonic() - started, int(response.status_code) < 400)
     except (ProviderError, requests.RequestException):
         return False
     status = int(response.status_code)
@@ -801,7 +805,13 @@ def _model_is_usable(selected: CortexEndpoint, model_id: str, timeout: int = 20)
     return not discovery.looks_like_unusable_model(status, body) and status < 500
 
 
-def discover_endpoint_model(endpoint: str | CortexEndpoint, timeout: int = 20, exclude: Tuple[str, ...] = ()) -> Optional[str]:
+def discover_endpoint_model(
+    endpoint: str | CortexEndpoint,
+    timeout: int = 20,
+    exclude: Tuple[str, ...] = (),
+    ledger: Optional[QuotaLedger] = None,
+    max_candidates: int = discovery.MAX_VALIDATION_CANDIDATES,
+) -> Optional[str]:
     """Pick a live, key-usable replacement id from the vendor list and cache it for this process."""
     selected = _as_endpoint(endpoint)
     return discovery.discover(
@@ -811,7 +821,8 @@ def discover_endpoint_model(endpoint: str | CortexEndpoint, timeout: int = 20, e
         _endpoint_key(selected),
         timeout=timeout,
         exclude=exclude,
-        validate=lambda candidate: _model_is_usable(selected, candidate, timeout=min(timeout, 20)),
+        validate=lambda candidate: _model_is_usable(selected, candidate, timeout=min(timeout, 20), ledger=ledger),
+        max_candidates=max_candidates,
     )
 
 
@@ -882,7 +893,9 @@ def _resilient_post(
         original = len(tried) == 1
         if not key_override and not rediscovered and discovery.looks_like_retired_model(status, last_error):
             rediscovered = True
-            replacement = discover_endpoint_model(selected, timeout=min(timeout, 20), exclude=tuple(tried))
+            replacement = discover_endpoint_model(
+                selected, timeout=min(timeout, 20), exclude=tuple(tried), ledger=ledger, max_candidates=1 if probe else discovery.MAX_VALIDATION_CANDIDATES
+            )
             if replacement and replacement not in tried:
                 model_id = replacement
                 continue
@@ -890,7 +903,7 @@ def _resilient_post(
             # A discovered or sibling id this key cannot use (OAuth-only, allowlisted, gone):
             # drop it from the cache and move to the next validated candidate.
             discovery.DISCOVERED.pop(discovery.vendor_for(selected.name), None)
-            replacement = discover_endpoint_model(selected, timeout=min(timeout, 20), exclude=tuple(tried))
+            replacement = discover_endpoint_model(selected, timeout=min(timeout, 20), exclude=tuple(tried), ledger=ledger)
             if replacement and replacement not in tried:
                 model_id = replacement
                 continue
@@ -1190,7 +1203,7 @@ def key_fingerprint(secret: str) -> str:
     return f"{prefix}…({len(cleaned)} chars)"
 
 
-def probe_endpoint(endpoint: str | CortexEndpoint, timeout: int = 20) -> Dict[str, Any]:
+def probe_endpoint(endpoint: str | CortexEndpoint, timeout: int = 20, ledger: Optional[QuotaLedger] = None) -> Dict[str, Any]:
     """Send a one-token request to an endpoint and report the real HTTP outcome.
 
     Returns a redacted dict: {"endpoint", "model", "ok", "status", "detail", "key"}.
@@ -1216,7 +1229,7 @@ def probe_endpoint(endpoint: str | CortexEndpoint, timeout: int = 20) -> Dict[st
     try:
         response, used_model = _resilient_post(
             selected, [{"role": "user", "content": "ping"}], 8, 0.0, stream=False, system_prompt="",
-            timeout=timeout, probe=True,
+            timeout=timeout, ledger=ledger, probe=True,
         )
     except ProviderError as exc:
         text = str(exc)
@@ -1240,7 +1253,7 @@ def probe_endpoint(endpoint: str | CortexEndpoint, timeout: int = 20) -> Dict[st
     return result
 
 
-def probe_legacy_provider(name: str, timeout: int = 20) -> Dict[str, Any]:
+def probe_legacy_provider(name: str, timeout: int = 20, ledger: Optional[QuotaLedger] = None) -> Dict[str, Any]:
     """One-token call through the legacy client for a configured non-Cortex provider."""
     from .config import provider_api_key  # local import: keep module import order stable
 
@@ -1254,7 +1267,9 @@ def probe_legacy_provider(name: str, timeout: int = 20) -> Dict[str, Any]:
         return result
     settings = get_settings()
     settings.request_timeout = timeout
-    settings.max_retries_per_call = 2
+    settings.max_retries_per_call = 1
+    if ledger is not None:
+        ledger.record_attempt(discovery.vendor_for(name))
     try:
         chat(name, [{"role": "user", "content": "ping"}], 8, 0.0, settings)
     except ProviderError as exc:
@@ -1285,12 +1300,14 @@ def probe_legacy_provider(name: str, timeout: int = 20) -> Dict[str, Any]:
 LEGACY_ONLY_PROVIDERS = ("nvidia", "openrouter", "cerebras", "mistral")
 
 
-def probe_all_endpoints(timeout: int = 20) -> List[Dict[str, Any]]:
-    """Probe the strict Cortex endpoints, then every legacy provider that has a key."""
-    rows = [probe_endpoint(endpoint, timeout=timeout) for endpoint in CORTEX_ENDPOINTS.values()]
+def probe_all_endpoints(timeout: int = 20, ledger: Optional[QuotaLedger] = None) -> List[Dict[str, Any]]:
+    """Probe the strict Cortex endpoints, then every legacy provider that has a key. Every call is metered."""
+    if ledger is not None:
+        _ensure_cortex_ledger(ledger)
+    rows = [probe_endpoint(endpoint, timeout=timeout, ledger=ledger) for endpoint in CORTEX_ENDPOINTS.values()]
     for name in LEGACY_ONLY_PROVIDERS:
         if name in PROVIDERS:
-            rows.append(probe_legacy_provider(name, timeout=timeout))
+            rows.append(probe_legacy_provider(name, timeout=timeout, ledger=ledger))
     return rows
 
 

@@ -154,6 +154,7 @@ def discover(
     timeout: int = 20,
     exclude: Tuple[str, ...] = (),
     validate: Optional[Callable[[str], bool]] = None,
+    max_candidates: int = MAX_VALIDATION_CANDIDATES,
 ) -> Optional[str]:
     """Pick a live model for this vendor, cache it, and return it (or None).
 
@@ -168,7 +169,7 @@ def discover(
         return None
     chosen: Optional[str] = None
     if validate is not None:
-        for candidate in ranked[:MAX_VALIDATION_CANDIDATES]:
+        for candidate in ranked[: max(1, int(max_candidates))]:
             try:
                 if validate(candidate):
                     chosen = candidate

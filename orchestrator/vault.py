@@ -172,7 +172,7 @@ def _active_thread_id(
     ws = _workspace(workspace)
     row = connection.execute(
         """
-        SELECT id FROM threads WHERE project_scope = ? AND workspace = ? AND status = 'active'
+        SELECT id FROM threads WHERE project_scope = ? AND workspace = ? AND status IN ('active', 'migrated')
         ORDER BY updated_at DESC, id DESC LIMIT 1
         """,
         (scope, ws),
@@ -255,11 +255,13 @@ def create_thread(
 
 
 def switch_thread(thread_id: int) -> None:
-    """Make ``thread_id`` the scope's current thread (it becomes the most recently updated)."""
+    """Make ``thread_id`` the workspace's current thread without touching its status.
+
+    A migrated thread stays labelled migrated (its digest chain is not forked);
+    it simply becomes the one the workspace reads and appends to.
+    """
     with _open_database() as connection:
-        connection.execute(
-            "UPDATE threads SET status = 'active', updated_at = ? WHERE id = ?", (time.time(), int(thread_id))
-        )
+        connection.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (time.time(), int(thread_id)))
 
 
 def rename_thread(thread_id: int, title: str) -> None:
@@ -388,7 +390,7 @@ def extractive_summary(rows: Sequence[sqlite3.Row], max_characters: int = 1_800)
             stripped = line.strip()
             if stripped == first_sentence:
                 continue
-            if re.search(r"(?i)\b(decid|agree|must|never|always|todo|fix|bug|error)\b", stripped) or re.search(
+            if re.search(r"(?i)\b(?:decid\w*|agree\w*|must|never|always|todo|fix\w*|bug\w*|error\w*)\b", stripped) or re.search(
                 r"[\w/.-]+\.(py|js|ts|md|json|yml|yaml|toml|sql)\b", stripped
             ):
                 keep.append(f"  - {stripped[:160]}")
@@ -560,16 +562,21 @@ def context_block(
         return "(no prior messages in this project scope)"
     lines: List[str] = []
     used = 0
+    # Independent budgets: digest <= 1/4, summaries <= 1/4, the live window gets the rest.
+    digest_budget = max_characters // 4
+    summary_budget = max_characters // 4
     if digest:
-        line = "[THREAD VISION DIGEST inherited from the previous thread]\n" + digest[: max_characters // 3]
+        line = "[THREAD VISION DIGEST inherited from the previous thread]\n" + digest[:digest_budget]
         lines.append(line)
         used += len(line) + 1
+    summary_used = 0
     for summary in summaries:
         line = f"[TEXTURIZED SUMMARY of {summary['message_count']} earlier messages]\n{summary['content']}"
-        if used + len(line) + 1 > max_characters // 3:
+        if summary_used + len(line) + 1 > summary_budget:
             break
         lines.append(line)
-        used += len(line) + 1
+        summary_used += len(line) + 1
+    used += summary_used
     for row in rows:
         line = f"{row['role'].upper()}: {row['content']}"
         if used + len(line) + 1 > max_characters:
@@ -722,12 +729,14 @@ def recent_artifacts(project_scope: str, limit: int = 8) -> List[sqlite3.Row]:
 # Thread health sweep and optimized migration
 # =============================================================================
 
-HEALTH_MESSAGE_LIMIT = 120        # active messages before a thread is considered heavy
-HEALTH_TOKEN_LIMIT = 18_000       # estimated tokens in the active window
+HEALTH_MESSAGE_LIMIT = 300        # active + archived messages before a thread is considered heavy (> MESSAGE_WINDOW,
+                                  # so at least one texturized block exists before migration)
+HEALTH_TOKEN_LIMIT = 18_000       # estimated tokens in the live window
 HEALTH_SUMMARY_LIMIT = 2          # texturized blocks already stacked on this thread
+MIN_DIGEST_MESSAGES = 4           # a thread needs this many real messages before it can be migrated at all
 DIGEST_MAX_CHARACTERS = 5_000
 
-_DECISION_RE = re.compile(r"(?i)\b(decid|agree|must|never|always|constraint|require|rule|policy|approved)\b")
+_DECISION_RE = re.compile(r"(?i)\b(?:decid\w*|agree\w*|decision\w*|constraint\w*|requir\w*|polic\w*|approv\w*|must|never|always|rule)\b")
 _OPEN_RE = re.compile(r"(?i)\b(todo|next step|open question|unresolved|pending|follow[- ]up|blocked)\b|\?\s*$")
 _FACT_RE = re.compile(r"[\w/.-]+\.(py|js|ts|md|json|yml|yaml|toml|sql|html|css)\b|\b\d+(\.\d+)?\s*(%|rpm|tpm|tokens|ms|s)\b", re.I)
 
@@ -754,24 +763,33 @@ def thread_health(project_scope: str, thread_id: Optional[int] = None, workspace
         repeated = len(user_turns) - len(set(user_turns))
     repetition = repeated / len(user_turns) if user_turns else 0.0
     error_turns = sum(1 for row in rows if row["role"] == "assistant" and row["content"].startswith(("Provider error", "Task failed")))
-    pressure = max(
-        len(rows) / HEALTH_MESSAGE_LIMIT,
-        tokens / HEALTH_TOKEN_LIMIT,
-        len(summaries) / HEALTH_SUMMARY_LIMIT if HEALTH_SUMMARY_LIMIT else 0.0,
-    )
+    total_messages = len(rows) + len(archived)
+    # Context load is the migration criterion; the gauge shows exactly this number.
+    load_terms = {
+        "messages": total_messages / HEALTH_MESSAGE_LIMIT,
+        "tokens": tokens / HEALTH_TOKEN_LIMIT,
+        "summaries": len(summaries) / HEALTH_SUMMARY_LIMIT,
+    }
+    pressure = max(load_terms.values())
     reasons: List[str] = []
-    if len(rows) >= HEALTH_MESSAGE_LIMIT:
-        reasons.append(f"{len(rows)} active messages")
+    if total_messages >= HEALTH_MESSAGE_LIMIT:
+        reasons.append(f"{total_messages} messages on this thread (live + archived)")
     if tokens >= HEALTH_TOKEN_LIMIT:
         reasons.append(f"~{tokens} tokens in the live window")
     if len(summaries) >= HEALTH_SUMMARY_LIMIT:
         reasons.append(f"{len(summaries)} texturized blocks stacked")
+    # Diagnosis, not remedy: these never trigger a migration (which would clear the
+    # window, reset the counters, and re-arm during the very outage they measure).
+    advisories: List[str] = []
     if repetition >= 0.25 and len(user_turns) >= 8:
-        reasons.append(f"{int(repetition * 100)}% repeated prompts")
+        advisories.append(f"{int(repetition * 100)}% repeated prompts; rephrase or start a new thread")
     if error_turns >= 5:
-        reasons.append(f"{error_turns} error replies in the window")
+        advisories.append(f"{error_turns} provider errors in the window; check keys or switch provider")
+    exempt = False
     if int(thread["generation"]) > 1 and len(rows) < MIN_MESSAGES_AFTER_MIGRATION:
-        reasons = []  # a just-migrated successor is exempt until it has real history
+        exempt = True  # a just-migrated successor is exempt until it has real history
+    if len(rows) + len(archived) < MIN_DIGEST_MESSAGES:
+        exempt = True  # nothing worth compressing yet
     return {
         "thread_id": resolved,
         "title": thread["title"],
@@ -784,8 +802,11 @@ def thread_health(project_scope: str, thread_id: Optional[int] = None, workspace
         "repetition": round(repetition, 3),
         "error_turns": error_turns,
         "pressure": round(min(pressure, 2.0), 3),
-        "recommend_migration": bool(reasons),
+        "recommend_migration": bool(reasons) and not exempt,
+        "can_migrate": not exempt,
+        "exempt": exempt,
         "reasons": reasons,
+        "advisories": advisories,
     }
 
 
@@ -837,7 +858,7 @@ def build_vision_digest(
                 open_items.append(stripped)
             elif _FACT_RE.search(stripped):
                 facts.append(stripped)
-    artifacts = recent_artifacts(scope, 20)
+    artifacts = [a for a in recent_artifacts(scope, 40) if not str(a["name"]).endswith("-digest.md")][:20]
     parts: List[str] = [f"# Vision digest · {thread['title']} (generation {int(thread['generation'])})"]
     if inherited:
         parts.append("## Inherited from earlier threads\n" + inherited[:1_200])
@@ -878,8 +899,17 @@ def migrate_thread(
     scope = project_scope.strip() or "default"
     thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope, workspace)
     old_id = int(thread["id"])
+    real_messages = [
+        row for row in list(recent_messages(scope, MESSAGE_WINDOW, thread_id=old_id)) + list(archived_messages(scope, 5000, thread_id=old_id))
+        if row["role"] != "system"
+    ]
+    if len(real_messages) < MIN_DIGEST_MESSAGES:
+        raise ValueError(f"thread #{old_id} has only {len(real_messages)} message(s); nothing worth compressing yet")
     digest = build_vision_digest(scope, old_id)
     method = "extractive"
+    if refine is not None and len(digest) < 400:
+        refine = None
+        method = "extractive (digest too short to spend a model call on)"
     if refine is not None:
         try:
             refined = str(refine(digest)).strip()

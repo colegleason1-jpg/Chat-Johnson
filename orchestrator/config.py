@@ -7,6 +7,7 @@ The orchestrator only uses providers whose key is present.
 from __future__ import annotations
 
 import os
+import tempfile
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Dict, Mapping
@@ -110,7 +111,7 @@ PROVIDERS: Dict[str, ProviderConfig] = {
     ),
     "nvidia": ProviderConfig(
         name="nvidia",
-        label="NVIDIA NIM (DeepSeek-class reasoning)",
+        label="NVIDIA NIM",
         env_key="NVIDIA_API_KEY",
         base_url="https://integrate.api.nvidia.com/v1",
         default_model="meta/llama-3.3-70b-instruct",
@@ -185,7 +186,7 @@ class Settings:
     max_retries_per_call: int = 3     # provider HTTP retries
     repo_ingest_budget: int = 700_000 # ~tokens of repo context fed to big models
     memory_path: str = ".orchestrator/memory.json"
-    staging_root: str = ".orchestrator/worktrees"
+    staging_root: str = field(default_factory=lambda: os.path.join(tempfile.gettempdir(), "chat_johnson_worktrees"))
     request_timeout: int = 120
     enabled: Dict[str, bool] = field(default_factory=dict)
 

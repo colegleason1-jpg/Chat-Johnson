@@ -14,16 +14,11 @@ The app is intentionally local-first:
 """
 from __future__ import annotations
 
-import contextvars
 import hashlib
 import sqlite3
-import hmac
-import html
 import os
 import re
-import secrets
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlencode
@@ -89,7 +84,9 @@ from orchestrator.router import (
 # =============================================================================
 
 from orchestrator.connectors import ROADMAP_FEATURES, connector_status
+from orchestrator.github_auth import mint_state, verify_state
 from orchestrator.missions import MISSION_TEMPLATES, classify_mission, task_plan
+from orchestrator.preview import extract_preview_source, safe_preview_document
 from orchestrator.vault import (
     MESSAGE_WINDOW,
     WORKSPACES as VAULT_WORKSPACES,
@@ -274,6 +271,10 @@ def health_sweep(
     health = thread_health(project_scope, workspace=workspace)
     if not force and not (health["recommend_migration"] and st.session_state.get("auto_migrate", True)):
         return None
+    if not health["can_migrate"]:
+        if force:
+            raise ValueError("Nothing worth compressing yet: this thread needs a few real messages first.")
+        return None
     refine = (lambda digest: model_refine_digest(digest, ledger)) if configured_provider_names() else None
     result = migrate_thread(project_scope, refine=refine, workspace=workspace)
     result["reasons"] = health["reasons"]
@@ -281,74 +282,9 @@ def health_sweep(
     return result
 
 
-def extract_preview_source(text: str) -> str:
-    blocks = re.findall(r"```(?P<language>[^\n`]*)\n(?P<body>.*?)```", text, flags=re.DOTALL)
-    for language, body in blocks:
-        normalized = language.strip().lower()
-        if normalized.startswith(("html", "htm", "css", "javascript", "js")) or re.search(r"<\s*(?:!doctype|html|main|section|div|button)\b", body, re.I):
-            return body.strip()
-    if re.search(r"<\s*(?:!doctype|html|main|section|div|button)\b", text, re.I):
-        return text.strip()
-    return ""
-
-
 # =============================================================================
 # Safe dual-panel preview and artifact rendering
 # =============================================================================
-
-_PREVIEW_CSS = """
-:root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
-* { box-sizing: border-box; }
-body { margin: 0; min-height: 100vh; padding: 22px; color: #e8eefc; background: #10182a; }
-.preview-shell { max-width: 900px; margin: 0 auto; padding: 26px; border: 1px solid #263858;
-  border-radius: 20px; background: linear-gradient(145deg, #172541, #111a2c);
-  box-shadow: 0 18px 45px rgba(0,0,0,.24); }
-.preview-shell h1, .preview-shell h2 { margin-top: 0; color: #f4f7ff; }
-.preview-shell button { border: 0; border-radius: 10px; padding: 10px 16px; color: #08111f;
-  background: #67e8c2; font-weight: 700; cursor: pointer; }
-.preview-shell button:hover { background: #9af5db; }
-.notice { margin-top: 16px; color: #a9b7d3; font-size: 12px; }
-"""
-
-
-def safe_preview_document(source: str) -> str:
-    """Create a no-network HTML preview document from model/user markup."""
-    value = source.strip()
-    if not value:
-        value = (
-            "<div class='preview-shell'><h1>Preview canvas</h1>"
-            "<p>Generated interface markup will appear here.</p>"
-            "<button type='button'>Example control</button></div>"
-        )
-    value = re.sub(r"(?is)<(script|iframe|object|embed|form|base|link)\b[^>]*>.*?</\1\s*>", "", value)
-    value = re.sub(r"(?is)<(script|iframe|object|embed|form|base|link)\b[^>]*/?>", "", value)
-    value = re.sub(r"(?is)\s+on[a-z0-9_-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", "", value)
-    value = re.sub(r"(?is)\s+(?:href|src)\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", "", value)
-    if not re.search(r"<\s*(?:!doctype|html|body|main|section|div|article|style)\b", value, re.I):
-        value = f"<pre>{html.escape(value)}</pre>"
-    if not re.search(r"<\s*style\b", value, re.I):
-        value = f"<style>{_PREVIEW_CSS}</style>{value}"
-    notice = "<p class='notice' data-preview-status>Preview sandbox: generated scripts, remote resources, frames, forms, and event handlers are disabled. Local preview controls remain available.</p>"
-    runtime = """
-    <script>
-    (() => {
-      const status = document.querySelector('[data-preview-status]');
-      document.querySelectorAll('button').forEach((button) => {
-        button.addEventListener('click', () => {
-          if (status) status.textContent = 'Local preview interaction captured.';
-        });
-      });
-    })();
-    </script>
-    """
-    if "preview-shell" not in value:
-        value = f"<div class='preview-shell'>{value}{notice}</div>"
-    return (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none'\">"
-        f"</head><body>{value}{runtime}</body></html>"
-    )
-
 
 _EXTENSION_LANGUAGES = {
     "py": "python", "js": "javascript", "ts": "typescript", "tsx": "typescript", "jsx": "javascript", "json": "json",
@@ -464,20 +400,20 @@ def github_oauth_url() -> str:
     client_id = os.environ.get("GITHUB_CLIENT_ID", "").strip()
     redirect_uri = os.environ.get("GITHUB_REDIRECT_URI", "").strip()
     scope = os.environ.get("GITHUB_OAUTH_SCOPE", "read:user").strip() or "read:user"
-    state = st.session_state.get("github_oauth_state")
-    if not state:
-        state = secrets.token_urlsafe(32)
-        st.session_state.github_oauth_state = state
+    # Signed, time-limited state: the redirect back from GitHub lands in a fresh
+    # Streamlit session, so session memory cannot be the CSRF check.
+    state = mint_state(os.environ.get("GITHUB_CLIENT_SECRET", "").strip())
     return GITHUB_AUTHORIZE_URL + "?" + urlencode(
         {"client_id": client_id, "redirect_uri": redirect_uri, "scope": scope, "state": state}
     )
 
 
 def exchange_github_code(code: str, expected_state: str, received_state: str) -> str:
-    if not expected_state or not received_state or not hmac.compare_digest(expected_state, received_state):
-        raise ValueError("GitHub OAuth state validation failed")
     client_id = os.environ.get("GITHUB_CLIENT_ID", "").strip()
     client_secret = os.environ.get("GITHUB_CLIENT_SECRET", "").strip()
+    valid, why = verify_state(client_secret, received_state)
+    if not valid:
+        raise ValueError(f"GitHub OAuth state validation failed: {why}")
     redirect_uri = os.environ.get("GITHUB_REDIRECT_URI", "").strip()
     if not client_id or not client_secret or not redirect_uri:
         raise ValueError("GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and GITHUB_REDIRECT_URI are required")
@@ -541,16 +477,17 @@ def render_repository_work(project_scope: str, ledger: QuotaLedger) -> None:
     if oauth_ready:
         url = github_oauth_url()
         try:
-            st.link_button("Authorize read-only GitHub access", url)
+            st.link_button("Authorize GitHub identity check (scope read:user, profile only)", url)
         except AttributeError:
-            st.markdown(f"[Authorize read-only GitHub access]({url})")
+            st.markdown(f"[Authorize GitHub identity check (scope read:user, profile only)]({url})")
+        st.caption("This reads your GitHub profile only. No repository is read, written, committed, or pushed by this app.")
     else:
         st.warning("Configure GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and GITHUB_REDIRECT_URI in the environment to enable the OAuth skeleton.")
 
     token = st.session_state.get("github_token", "")
     if token:
         st.success("Session-only GitHub connection is active.")
-        if st.button("Check GitHub identity", key="github_identity"):
+        if st.button("Verify GitHub identity (profile only)", key="github_identity"):
             try:
                 identity = github_api_get(token, "/user")
                 st.json({"login": identity.get("login"), "name": identity.get("name"), "public_repos": identity.get("public_repos")})
@@ -562,7 +499,10 @@ def render_repository_work(project_scope: str, ledger: QuotaLedger) -> None:
 
     st.divider()
     st.markdown("**Local sandbox pipeline**")
-    repo_path = st.text_input("Repository path", value=os.getcwd(), key="repo_path")
+    repo_path = st.text_input(
+        "Repository path", value="", key="repo_path",
+        placeholder="Absolute path to a local git repository (never the deployed app's own checkout)",
+    )
     repo_goal = st.text_area(
         "Requested repository change",
         height=100,
@@ -573,17 +513,26 @@ def render_repository_work(project_scope: str, ledger: QuotaLedger) -> None:
         "Run sandboxed repository pipeline",
         type="primary",
         key="run_repo_pipeline",
-        disabled=not bool(repo_goal.strip() and configured_provider_names()),
+        disabled=not bool(repo_goal.strip() and repo_path.strip() and configured_provider_names()),
     )
     if run_repo:
+        app_root = str(Path(__file__).resolve().parent)
         if not os.path.isdir(repo_path):
             st.error("Repository path does not exist.")
+        elif os.path.realpath(repo_path) == os.path.realpath(app_root):
+            st.error("Refusing to run the pipeline on the studio's own checkout; point it at another repository.")
         else:
             with st.status("Ingesting, patching, and verifying…", expanded=True) as status:
                 try:
                     report = Orchestrator(ledger=ledger).run(repo_goal, repo_path=repo_path)
                     status.update(label="Pipeline completed", state="complete")
-                    st.success(f"Sandbox branch: {report['branch']}")
+                    if report["branch"] == "(copy-mode)":
+                        st.warning(
+                            "git worktree was unavailable, so the sandbox is a copied tree under the temp directory. "
+                            "The diff below is computed against your source tree; nothing was committed."
+                        )
+                    else:
+                        st.success(f"Sandbox branch: {report['branch']}")
                     st.json(report["ingest"], expanded=False)
                     if report.get("diff"):
                         st.code(report["diff"][:20_000], language="diff")
@@ -594,7 +543,7 @@ def render_repository_work(project_scope: str, ledger: QuotaLedger) -> None:
     st.divider()
     with st.form("repository_chat_form", clear_on_submit=True):
         repo_prompt = st.text_area("Discuss the repository work", height=100, placeholder="Ask about the diff, plan the next change, or request a review…")
-        repo_submitted = st.form_submit_button("Send", type="primary")
+        repo_submitted = st.form_submit_button(send_label("Send"), type="primary")
     if repo_submitted:
         if not configured_provider_names():
             st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
@@ -703,8 +652,10 @@ def run_generation(
         mode=mode,
         workspace=workspace,
     )
-    st.session_state.preview_source = extract_preview_source(answer)
-    st.session_state.preview_editor = st.session_state.preview_source
+    extracted = extract_preview_source(answer)
+    if extracted:  # never wipe what the operator typed into the canvas
+        st.session_state.preview_source = extracted
+        st.session_state.preview_editor = extracted
     st.session_state.last_decision = decision
     return assistant_id
 
@@ -776,16 +727,20 @@ def render_thread_controls(project_scope: str, workspace: str, ledger: QuotaLedg
         health = thread_health(project_scope, workspace=workspace)
         gauge_left, gauge_right = st.columns([0.7, 0.3], gap="small")
         with gauge_left:
-            st.progress(min(float(health["pressure"]), 1.0), text=f"Thread health · pressure {health['pressure']:.2f}")
+            st.progress(min(float(health["pressure"]), 1.0), text=f"Context load {min(health['pressure'], 1.0):.0%} of the migration threshold")
             st.caption(
                 f"gen {health['generation']} · {health['messages']} msgs · ~{health['tokens']} tokens · "
                 f"{health['summaries']} summaries · {health['archived']} archived"
             )
         with gauge_right:
-            if st.button("Migrate now", key=f"migrate_{workspace}", use_container_width=True,
-                         help="Compress this thread into a locked vision digest and continue in a fresh optimized thread."):
-                if health_sweep(project_scope, ledger, force=True, workspace=workspace):
-                    st.rerun()
+            if st.button("Migrate now", key=f"migrate_{workspace}", use_container_width=True, disabled=not health["can_migrate"],
+                         help="Compress this thread into a locked vision digest and continue in a fresh optimized thread. "
+                              "Disabled until the thread has a few real messages (or right after a migration)."):
+                try:
+                    if health_sweep(project_scope, ledger, force=True, workspace=workspace):
+                        st.rerun()
+                except ValueError as exc:
+                    st.info(str(exc))
             with st.popover("Rename"):
                 title_key = f"thread_title_{workspace}_{current['id']}"
                 new_title = st.text_input("Title", value=current["title"], key=title_key)
@@ -794,6 +749,8 @@ def render_thread_controls(project_scope: str, workspace: str, ledger: QuotaLedg
                     st.rerun()
         if health["recommend_migration"]:
             st.warning("Migration recommended: " + ", ".join(health["reasons"]))
+        for note in health.get("advisories", []):
+            st.info(note)
         last_migration = st.session_state.get("last_migration")
         if last_migration and int(last_migration.get("new_thread_id", -1)) == int(current["id"]):
             st.caption(
@@ -803,13 +760,21 @@ def render_thread_controls(project_scope: str, workspace: str, ledger: QuotaLedg
     return current
 
 
+def send_label(base: str) -> str:
+    """Buttons say what they will do: Heavy Mode turns any send into three passes."""
+    return f"{base} · Heavy Mode (3 passes)" if active_mode() == "heavy" else base
+
+
 def render_normal_chat(project_scope: str, ledger: QuotaLedger) -> None:
     st.subheader("Normal Chat")
-    st.caption("A low-overhead single-pass terminal for quick text, planning, and coding questions.")
+    st.caption(
+        "A single-pass terminal for quick text, planning, and coding questions."
+        + (" Heavy Mode is on: each send runs draft → review → synthesis." if active_mode() == "heavy" else "")
+    )
     render_thread_controls(project_scope, "normal_chat", ledger)
     with st.form("normal_chat_form", clear_on_submit=True):
         prompt = st.text_area("Message", height=120, placeholder="Ask a focused question…")
-        submitted = st.form_submit_button("Send normal request", type="primary")
+        submitted = st.form_submit_button(send_label("Send"), type="primary")
     if submitted:
         if not configured_provider_names():
             st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
@@ -837,7 +802,7 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger) -> None:
             height=130,
             placeholder="Review the injected files, explain the issue, or emit complete fenced file blocks.",
         )
-        submitted = st.form_submit_button("Send to Chat Bot", type="primary")
+        submitted = st.form_submit_button(send_label("Send to Chat Bot"), type="primary")
     if submitted:
         if not configured_provider_names():
             st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
@@ -893,7 +858,7 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
         type="primary",
         key="launch_task_futures",
         disabled=not bool(goal.strip() and configured_provider_names()),
-        help="Runs each workstream in order through the router; results are saved to this thread.",
+        help="Runs the workstreams strictly in order, each one seeing the results before it; results are saved to this thread.",
     )
     results_store: Dict[int, Dict[int, Tuple[str, str, str, str]]] = st.session_state.setdefault("task_results", {})
     if execute and plan:
@@ -911,8 +876,8 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
 
         def worker(step: Mapping[str, Any]) -> Tuple[int, str, str, str]:
             messages = build_prompt_messages(project_scope, str(step["description"]), workspace="task_finder")
-            # The lock covers the full selection/request/ledger-record cycle: steps are
-            # serialized so several futures cannot overspend one free-tier key.
+            # The lock covers the full selection/request/ledger-record cycle so a
+            # concurrent send from another tab cannot overspend one free-tier key.
             with request_lock:
                 answer, decision = generate_mode(
                     task_mode,
@@ -926,24 +891,23 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
             return int(step["id"]), answer, decision.provider, decision.model
 
         succeeded = failed = 0
-        with ThreadPoolExecutor(max_workers=min(3, len(plan))) as executor:
-            futures = {executor.submit(contextvars.copy_context().run, worker, step): step for step in plan}
-            for finished, future in enumerate(as_completed(futures), start=1):
-                step = futures[future]
-                try:
-                    step_id, answer, provider, model = future.result()
-                    answer = strip_reasoning_tags(answer)
-                    results[step_id] = (answer, provider, model, str(step["title"]))
-                    step["status"] = "complete"
-                    succeeded += 1
-                    append_message(project_scope, "user", f"[{step['title']}] {step['description']}", mode=task_mode, workspace="task_finder")
-                    append_message(project_scope, "assistant", answer, provider=f"{provider}/{model}", mode=task_mode, workspace="task_finder")
-                except Exception as exc:
-                    step["status"] = "failed"
-                    failed += 1
-                    # Shown in the results list, never written into the thread's context.
-                    results[int(step["id"])] = (f"Task failed: {exc}", "", "", str(step["title"]))
-                progress.progress(finished / len(plan), text=f"{succeeded} succeeded · {failed} failed · {finished}/{len(plan)} done")
+        for finished, step in enumerate(plan, start=1):
+            # Strictly in plan order; the prompt is built right before the call so
+            # every step sees the results of the steps before it.
+            try:
+                step_id, answer, provider, model = worker(step)
+                answer = strip_reasoning_tags(answer)
+                results[step_id] = (answer, provider, model, str(step["title"]))
+                step["status"] = "complete"
+                succeeded += 1
+                append_message(project_scope, "user", f"[{step['title']}] {step['description']}", mode=task_mode, workspace="task_finder")
+                append_message(project_scope, "assistant", answer, provider=f"{provider}/{model}", mode=task_mode, workspace="task_finder")
+            except Exception as exc:
+                step["status"] = "failed"
+                failed += 1
+                # Shown in the results list, never written into the thread's context.
+                results[int(step["id"])] = (f"Task failed: {exc}", "", "", str(step["title"]))
+            progress.progress(finished / len(plan), text=f"{succeeded} succeeded · {failed} failed · {finished}/{len(plan)} done")
         results_store[thread_id] = results
         if failed == 0:
             st.success(f"All {succeeded} workstream(s) finished. Continue the mission below; every result is in this thread's memory.")
@@ -967,7 +931,7 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger) -> None:
             "Continue the mission", height=100,
             placeholder="Ask a follow-up, refine a workstream, or steer the next step. The workstream results are already in context.",
         )
-        follow_submitted = st.form_submit_button("Send", type="primary")
+        follow_submitted = st.form_submit_button(send_label("Send"), type="primary")
     if follow_submitted:
         if not configured_provider_names():
             st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
@@ -1067,9 +1031,9 @@ with st.sidebar:
                 st.session_state.pop(f"byok_{env_name}", None)
             st.info("Session keys cleared. Environment variables, if any, remain in effect.")
             st.rerun()
-        if st.button("Test keys (one tiny request per configured endpoint)", key="probe_keys", use_container_width=True):
+        if st.button("Test keys (1 small call per configured provider; metered)", key="probe_keys", use_container_width=True):
             with st.spinner("Probing endpoints…"):
-                probe_rows = probe_all_endpoints()
+                probe_rows = probe_all_endpoints(ledger=get_quota_ledger())
             for row in probe_rows:
                 marker = "✅" if row["ok"] else ("⚪" if row["detail"] == "no key configured" else "❌")
                 status = f" · HTTP {row['status']}" if row["status"] else ""

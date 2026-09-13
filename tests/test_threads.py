@@ -58,24 +58,63 @@ def test_clear_thread_archives_and_keeps_keys_out_of_scope(db):
     assert db.active_thread("s")["id"] == thread_id  # same thread, now empty
 
 
-def test_health_recommends_migration_on_load(db):
+def test_health_recommends_migration_on_load_only_after_texturization(db):
     fill(db, "s", 10)
     calm = db.thread_health("s")
     assert calm["recommend_migration"] is False and calm["pressure"] < 1.0
-    fill(db, "s", 120)
+    fill(db, "s", 200)  # 210 total: past the 200 window, so a texturized block exists, but under the 300 limit
+    mid = db.thread_health("s")
+    assert mid["summaries"] >= 1 and mid["recommend_migration"] is False
+    fill(db, "s", 100)  # 310 total
     heavy = db.thread_health("s")
     assert heavy["recommend_migration"] is True
-    assert any("active messages" in reason for reason in heavy["reasons"])
+    assert any("messages on this thread" in reason for reason in heavy["reasons"])
+    assert heavy["pressure"] >= 1.0  # the gauge and the recommendation are the same predicate
 
 
-def test_health_flags_repetition_and_error_loops(db):
+def test_error_loops_and_repetition_are_advisory_not_migration_triggers(db):
     for _ in range(10):
         db.append_message("s", "user", "same question again")
         db.append_message("s", "assistant", "Provider error: boom")
     health = db.thread_health("s")
     assert health["repetition"] > 0.8
     assert health["error_turns"] == 10
-    assert health["recommend_migration"] is True
+    assert health["recommend_migration"] is False  # migrating would clear the window and re-arm the trigger
+    assert any("provider errors" in note for note in health["advisories"])
+    assert any("repeated prompts" in note for note in health["advisories"])
+
+
+def test_migration_refuses_threads_with_nothing_to_compress(db):
+    db.append_message("s", "user", "hi")
+    with pytest.raises(ValueError):
+        db.migrate_thread("s")
+
+
+def test_selecting_a_migrated_thread_keeps_it_migrated(db):
+    fill(db, "s", 30)
+    result = db.migrate_thread("s")
+    old = result["old_thread_id"]
+    db.switch_thread(old)
+    assert db.active_thread("s")["id"] == old
+    assert db.thread_by_id(old)["status"] == "migrated"
+
+
+def test_digest_regex_matches_real_decision_sentences(db):
+    db.append_message("s", "user", "We decided to cap Groq at 8000 tpm and we require tests for every change.")
+    db.append_message("s", "assistant", "Agreed. The policy is approved.")
+    fill(db, "s", 4)
+    digest = db.build_vision_digest("s")
+    assert "## Decisions and constraints" in digest
+    assert "We decided to cap Groq" in digest
+
+
+def test_context_budgets_keep_summaries_after_migration(db):
+    fill(db, "s", 205, text="turn {i}: we decided to keep orchestrator/app.py stable")
+    db.migrate_thread("s")
+    fill(db, "s", 201, text="new turn {i}")  # force a texturized block on the successor
+    context = db.context_block("s")
+    assert "[THREAD VISION DIGEST" in context
+    assert "[TEXTURIZED SUMMARY" in context
 
 
 def test_vision_digest_keeps_decisions_facts_open_items_and_artifacts(db):

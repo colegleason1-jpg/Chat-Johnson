@@ -63,7 +63,37 @@ def commit_sandbox(sandbox_path: str, message: str) -> bool:
     return code == 0
 
 
-def diff_vs_base(sandbox_path: str) -> str:
+def _copy_mode_diff(source_root: str, sandbox_path: str, limit_bytes: int = 200_000) -> str:
+    """Unified diff of text files that differ between a copied sandbox and its source tree."""
+    import difflib
+
+    chunks: List[str] = []
+    total = 0
+    for root, dirs, files in os.walk(sandbox_path):
+        dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", ".orchestrator", "node_modules"}]
+        for name in files:
+            new_path = os.path.join(root, name)
+            rel = os.path.relpath(new_path, sandbox_path)
+            old_path = os.path.join(source_root, rel)
+            try:
+                new_text = open(new_path, encoding="utf-8").read()
+                old_text = open(old_path, encoding="utf-8").read() if os.path.exists(old_path) else ""
+            except (UnicodeDecodeError, OSError):
+                continue
+            if new_text == old_text:
+                continue
+            diff = "".join(difflib.unified_diff(
+                old_text.splitlines(True), new_text.splitlines(True), fromfile=f"a/{rel}", tofile=f"b/{rel}"
+            ))
+            total += len(diff)
+            chunks.append(diff)
+            if total > limit_bytes:
+                chunks.append(f"... diff truncated at {limit_bytes} bytes ...\n")
+                return "".join(chunks)
+    return "".join(chunks) or "(copy-mode sandbox: no text files differ from the source tree)"
+
+
+def diff_vs_base(sandbox_path: str, source_root: Optional[str] = None) -> str:
     """Unified diff of everything changed in the sandbox (copy-mode: all files)."""
     is_git = os.path.isdir(os.path.join(sandbox_path, ".git"))
     if is_git:
@@ -71,6 +101,8 @@ def diff_vs_base(sandbox_path: str) -> str:
         code2, patch = _run(["git", "diff", "HEAD", "--", "."], cwd=sandbox_path)
         if code == 0 and code2 == 0:
             return f"{out}\n\n{patch}" if out or patch else "(no changes)"
+    if source_root and os.path.isdir(source_root):
+        return _copy_mode_diff(source_root, sandbox_path)
     return "(copy-mode sandbox: inspect files directly)"
 
 
