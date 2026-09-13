@@ -129,25 +129,52 @@ class CortexEndpoint:
     model_env: str = ""
 
 
+# Live model ids discovered after a vendor retired the default. Process-wide
+# because a retirement is a property of the vendor, not of a session.
+_DISCOVERED_MODELS: Dict[str, str] = {}
+
+# Preference order when discovering a replacement from a vendor's model list.
+MODEL_PREFERENCES: Dict[str, Tuple[str, ...]] = {
+    "google_ai_studio": (
+        "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.1-flash", "gemini-3-flash",
+        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.1-pro", "gemini-2.5-pro",
+    ),
+    "groq": ("openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"),
+    "huggingface": ("Qwen/Qwen2.5-Coder-32B-Instruct", "Qwen/Qwen3-Coder-30B-A3B-Instruct"),
+}
+
+_RETIRED_MARKERS = ("not found", "decommissioned", "deprecated", "does not exist", "not supported", "no longer")
+
+
 def endpoint_model(endpoint: "CortexEndpoint") -> str:
-    """Resolve the model id at call time so retired ids can be overridden by env."""
+    """Resolve the model id at call time: env override > discovered live id > default."""
     if endpoint.model_env:
         override = os.environ.get(endpoint.model_env, "").strip()
         if override:
             return override
-    return endpoint.model
+    return _DISCOVERED_MODELS.get(endpoint.name) or endpoint.model
+
+
+def looks_like_retired_model(status_code: int, body: str) -> bool:
+    lowered = body.lower()
+    return status_code in (400, 404, 410) and any(marker in lowered for marker in _RETIRED_MARKERS)
 
 
 # These are deliberate routing ceilings from the Project Seth / Chat Johnson
 # design. They are conservative policy limits, not guarantees from vendors.
+# Model ids age out (Groq retired llama-3.3-70b-versatile on 2026-08-16 and
+# Google retired gemini-1.5-pro / gemini-2.0-flash), so ``endpoint_model``
+# honours an env override first, then a live id discovered from the vendor's
+# model list after a retirement error, then this default. Groq's free plan
+# for gpt-oss-120b is 30 RPM / 8K TPM, hence the tighter TPM ceiling.
 CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
     "google_ai_studio": CortexEndpoint(
         name="google_ai_studio",
-        label="Google AI Studio / Gemini 1.5 Pro",
+        label="Google AI Studio / Gemini Flash",
         env_keys=("GEMINI_API_KEY",),
         base_url="https://generativelanguage.googleapis.com/v1beta",
         kind="gemini",
-        model="gemini-1.5-pro",
+        model="gemini-2.5-flash",
         rpm_limit=2,
         tpm_limit=32_000,
         speed_score=0.48,
@@ -157,13 +184,13 @@ CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
     ),
     "groq": CortexEndpoint(
         name="groq",
-        label="Groq / Llama 3.3 70B",
+        label="Groq / gpt-oss-120b",
         env_keys=("GROQ_API_KEY",),
         base_url="https://api.groq.com/openai/v1",
         kind="openai",
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         rpm_limit=30,
-        tpm_limit=15_000,
+        tpm_limit=8_000,
         speed_score=1.00,
         context_score=0.58,
         strengths=("code_patch", "quick_text", "chat"),
@@ -681,6 +708,60 @@ def append_system_prompt(messages: Sequence[Mapping[str, str]], system_prompt: s
     return [{"role": "system", "content": instruction}, *normalized]
 
 
+def list_endpoint_models(endpoint: str | CortexEndpoint, timeout: int = 20) -> List[str]:
+    """Return generation-capable model ids from the vendor's model list (needs a key)."""
+    selected = _as_endpoint(endpoint)
+    key = _endpoint_key(selected)
+    if requests is None or not key:
+        return []
+    try:
+        if selected.kind == "gemini":
+            response = requests.get(
+                f"{selected.base_url}/models",
+                headers={"x-goog-api-key": key},
+                params={"pageSize": 200},
+                timeout=timeout,
+            )
+            if response.status_code != 200:
+                return []
+            models = []
+            for row in response.json().get("models", []):
+                methods = row.get("supportedGenerationMethods", [])
+                if "generateContent" in methods:
+                    models.append(str(row.get("name", "")).split("/", 1)[-1])
+            return [name for name in models if name]
+        response = requests.get(
+            f"{selected.base_url}/models",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            return []
+        return [str(row.get("id", "")) for row in response.json().get("data", []) if row.get("id")]
+    except (requests.RequestException, ValueError, AttributeError):
+        return []
+
+
+def discover_endpoint_model(endpoint: str | CortexEndpoint, timeout: int = 20) -> Optional[str]:
+    """Pick a live replacement id from the vendor list and cache it for this process."""
+    selected = _as_endpoint(endpoint)
+    available = list_endpoint_models(selected, timeout=timeout)
+    if not available:
+        return None
+    chosen: Optional[str] = None
+    for preferred in MODEL_PREFERENCES.get(selected.name, ()):
+        if preferred in available:
+            chosen = preferred
+            break
+    if chosen is None and selected.kind == "gemini":
+        flash = [name for name in available if "flash" in name and "image" not in name and "tts" not in name and "live" not in name]
+        chosen = sorted(flash)[-1] if flash else None
+    if chosen is None:
+        chosen = available[0]
+    _DISCOVERED_MODELS[selected.name] = chosen
+    return chosen
+
+
 def build_cortex_request(
     endpoint: str | CortexEndpoint,
     messages: Sequence[Mapping[str, str]],
@@ -777,43 +858,46 @@ def cortex_stream(
     system_prompt: str = "",
     timeout: Optional[int] = None,
 ) -> Iterator[str]:
-    """Yield generated text chunks from a MILP-selected provider endpoint."""
+    """Yield generated text chunks from a MILP-selected provider endpoint.
+
+    If the vendor reports the configured model id as retired, the model list is
+    consulted once, a live id is cached, and the request is retried once.
+    """
     if requests is None:
         raise ProviderError("requests is required for provider HTTP execution")
     selected = _as_endpoint(endpoint)
-    url, headers, payload = build_cortex_request(
-        selected, messages, max_tokens, temperature, stream=True, system_prompt=system_prompt
-    )
-    try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=timeout or int(os.environ.get("CHAT_JOHNSON_TIMEOUT", "120")),
-            stream=True,
-        )
-    except requests.RequestException as exc:
-        raise ProviderError(f"{selected.name} network error: {exc}") from exc
+    effective_timeout = timeout or int(os.environ.get("CHAT_JOHNSON_TIMEOUT", "120"))
+    secret = _endpoint_key(selected)
 
-    try:
+    for attempt in (1, 2):
+        url, headers, payload = build_cortex_request(
+            selected, messages, max_tokens, temperature, stream=True, system_prompt=system_prompt
+        )
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=effective_timeout, stream=True)
+        except requests.RequestException as exc:
+            raise ProviderError(f"{selected.name} network error: {exc}") from exc
+
         if response.status_code >= 400:
             detail = response.text[:400]
-            secret = _endpoint_key(selected)
+            response.close()
             if secret:
                 detail = detail.replace(secret, "[REDACTED_SECRET]")
+            if attempt == 1 and looks_like_retired_model(response.status_code, detail):
+                previous = endpoint_model(selected)
+                replacement = discover_endpoint_model(selected, timeout=min(effective_timeout, 20))
+                if replacement and replacement != previous:
+                    continue
             raise ProviderError(f"{selected.name} HTTP {response.status_code}: {detail}")
-        emitted = False
-        for payload_item in _iter_sse_payloads(response):
-            chunk = _extract_stream_text(selected, payload_item)
-            if chunk:
-                emitted = True
-                yield chunk
-        if not emitted:
-            # Some compatible gateways return one JSON object even when stream
-            # mode is requested. The response has already been consumed safely.
-            return
-    finally:
-        response.close()
+
+        try:
+            for payload_item in _iter_sse_payloads(response):
+                chunk = _extract_stream_text(selected, payload_item)
+                if chunk:
+                    yield chunk
+        finally:
+            response.close()
+        return
 
 
 def _estimate_tokens(messages: Sequence[Mapping[str, str]], output: str = "") -> int:
@@ -829,18 +913,27 @@ def cortex_generate(
     temperature: float = 0.2,
     system_prompt: str = "",
 ) -> Tuple[str, "RouteDecision"]:
-    """Run Cortex 2 selection, then consume the Cortex 1 generation stream."""
+    """Run Cortex 2 selection, then consume the Cortex 1 generation stream.
+
+    Every endpoint failure is retained so the final error names each provider
+    and its real HTTP status instead of a generic "no headroom" message.
+    """
     estimated_tokens = _estimate_tokens(messages) + max_tokens
     excluded: set[str] = set()
     attempted: List[str] = []
-    last_error: Optional[Exception] = None
+    failures: Dict[str, str] = {}
     for _ in range(len(CORTEX_ENDPOINTS)):
-        decision = select_milp_endpoint(
-            task_type,
-            estimated_tokens,
-            ledger=ledger,
-            excluded=excluded,
-        )
+        try:
+            decision = select_milp_endpoint(
+                task_type,
+                estimated_tokens,
+                ledger=ledger,
+                excluded=excluded,
+            )
+        except ProviderError as selection_error:
+            if failures:
+                break  # every keyed endpoint was already tried; report those errors below
+            raise selection_error
         endpoint = decision.endpoint
         attempted.append(endpoint.name)
         try:
@@ -867,11 +960,10 @@ def cortex_generate(
             return text, route_decision
         except ProviderError as exc:
             excluded.add(endpoint.name)
-            last_error = exc
+            failures[endpoint.name] = str(exc)
 
-    raise ProviderError(
-        f"all Cortex endpoints failed; attempted={attempted}; last_error={last_error}"
-    )
+    detail = "; ".join(f"{name}: {error}" for name, error in failures.items()) or "no keyed endpoint"
+    raise ProviderError(f"all Cortex endpoints failed -> {detail}")
 
 
 class CortexStream:
@@ -933,6 +1025,65 @@ def stream_generation(
 ) -> Iterator[str]:
     """Select one endpoint with MILP and expose its live text stream."""
     return iter(CortexStream(task_type, messages, ledger, max_tokens, temperature, system_prompt))
+
+
+# =============================================================================
+# Connection probe (for the sidebar "Test keys" button)
+# =============================================================================
+
+def probe_endpoint(endpoint: str | CortexEndpoint, timeout: int = 20) -> Dict[str, Any]:
+    """Send a one-token request to an endpoint and report the real HTTP outcome.
+
+    Returns a redacted dict: {"endpoint", "model", "ok", "status", "detail"}.
+    The key never appears in the result.
+    """
+    selected = _as_endpoint(endpoint)
+    result: Dict[str, Any] = {"endpoint": selected.name, "model": endpoint_model(selected), "ok": False, "status": None, "detail": ""}
+    if requests is None:
+        result["detail"] = "requests library missing"
+        return result
+    if not _endpoint_key(selected):
+        result["detail"] = "no key configured"
+        return result
+    healed = ""
+    for attempt in (1, 2):
+        try:
+            url, headers, payload = build_cortex_request(
+                selected, [{"role": "user", "content": "ping"}], max_tokens=8, temperature=0.0, stream=False
+            )
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except ProviderError as exc:
+            result["detail"] = str(exc)
+            return result
+        except requests.RequestException as exc:
+            result["detail"] = f"network error: {type(exc).__name__}"
+            return result
+        body = response.text[:300].replace(_endpoint_key(selected), "[REDACTED_SECRET]")
+        if attempt == 1 and looks_like_retired_model(response.status_code, body):
+            previous = endpoint_model(selected)
+            replacement = discover_endpoint_model(selected, timeout=timeout)
+            if replacement and replacement != previous:
+                healed = f" (auto-switched from retired {previous} to {replacement})"
+                result["model"] = replacement
+                continue
+        break
+    result["status"] = int(response.status_code)
+    if response.status_code == 200:
+        result["ok"] = True
+        result["detail"] = "reachable" + healed
+    elif response.status_code in (401, 403):
+        result["detail"] = f"key rejected: {body}"
+    elif response.status_code == 404:
+        result["detail"] = f"model id not found (override with {selected.model_env}): {body}"
+    elif response.status_code == 429:
+        result["detail"] = f"rate limited: {body}"
+    else:
+        result["detail"] = body
+    return result
+
+
+def probe_all_endpoints(timeout: int = 20) -> List[Dict[str, Any]]:
+    return [probe_endpoint(endpoint, timeout=timeout) for endpoint in CORTEX_ENDPOINTS.values()]
 
 
 # =============================================================================
@@ -1090,13 +1241,16 @@ def generate(
     normalized_type = task_type if task_type in TASK_TYPES else classify(messages[-1].get("content", ""))
     estimated_tokens = _estimate_tokens(messages) + max_tokens
     tried: List[str] = []
+    failures: Dict[str, str] = {}
     for name in candidates(normalized_type, settings_value.providers_available()):
         if PROVIDERS[name].context_window < estimated_tokens or not ledger.has_headroom(name, estimated_tokens):
+            failures[name] = "skipped: no quota headroom or context too small"
             continue
         tried.append(name)
         try:
             text, tokens = chat(name, messages, max_tokens, temperature, settings_value)
-        except ProviderError:
+        except ProviderError as exc:
+            failures[name] = str(exc)
             continue
         ledger.record(name, tokens)
         config = PROVIDERS[name]
@@ -1106,9 +1260,9 @@ def generate(
             normalized_type,
             f"legacy strength={normalized_type in config.strengths}; tried={tried}",
         )
+    detail = "; ".join(f"{name}: {error}" for name, error in failures.items())
     raise ProviderError(
-        "no legacy provider available: "
-        + (f"tried {tried}" if tried else "check API keys / quota ledger")
+        "no legacy provider available -> " + (detail if detail else "no provider has a key")
     )
 
 

@@ -62,9 +62,9 @@ throw away working, tested code. The right move is to harden, clean, and extend.
 4. **No tests cover the new engine.** Cortex 1/2/3, Heavy Mode, SQLite window, Artifact Lock, redaction,
    and the GitHub OAuth state check all have zero tests. This is the main crash-recovery risk: without
    tests, a future corruption is invisible.
-5. **Model IDs will age out.** `gemini-1.5-pro` has been retired by Google for new projects; the Cortex
-   endpoint table hardcodes it with no env override. Same exposure for the Hugging Face router model.
-   The 2 RPM / 32k TPM ceiling should stay as policy, the model id must be configurable.
+5. **Model IDs will age out.** *Resolved 2026-09-13:* env override → live discovery from the vendor
+   model list after a retirement error → default. Defaults moved to `gemini-2.5-flash` and
+   `openai/gpt-oss-120b`; Groq TPM ceiling tightened to its free-plan 8K. Ceilings stay policy.
 6. **Heavy Mode spec conflict.** The directive names o1/o3-mini chains. OpenAI has no free tier, which
    violates the BYOK free-only invariant in the Bible. Current code runs Heavy Mode as a bounded
    draft → critique → synthesis loop over the free endpoints, which honors the invariant.

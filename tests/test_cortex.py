@@ -199,7 +199,7 @@ def test_build_request_gemini_and_openai_shapes(all_keys):
     url, headers, payload = build_cortex_request("groq", messages, 100, 0.1, stream=False)
     assert url.endswith("/chat/completions")
     assert headers["Authorization"] == "Bearer groq-secret-key"
-    assert payload["model"] == "llama-3.3-70b-versatile"
+    assert payload["model"] == "openai/gpt-oss-120b"
     assert payload["stream"] is False
 
 
@@ -209,7 +209,7 @@ def test_model_id_override_from_environment(all_keys, monkeypatch):
     url, _, _ = build_cortex_request("google_ai_studio", [{"role": "user", "content": "x"}], 10, 0.1, stream=False)
     assert "/models/gemini-2.5-pro:" in url
     monkeypatch.delenv("CORTEX_GEMINI_MODEL")
-    assert endpoint_model(CORTEX_ENDPOINTS["google_ai_studio"]) == "gemini-1.5-pro"
+    assert endpoint_model(CORTEX_ENDPOINTS["google_ai_studio"]) == "gemini-2.5-flash"
 
 
 def test_cortex_generate_streams_records_ledger_and_reports_decision(all_keys, monkeypatch):
@@ -343,3 +343,155 @@ def test_normal_mode_never_touches_paid_slot(all_keys, monkeypatch):
     slot = PaidReasoningSlot(api_key="sk-session", enabled=True)
     router.generate_mode("normal", "quick_text", [{"role": "user", "content": "q"}], QuotaLedger({}), max_tokens=16, paid_slot=slot)
     assert all("openai.com" not in url for url in urls)
+
+
+# ----------------------------------------------------------------------------
+# Error surfacing and connection probe
+# ----------------------------------------------------------------------------
+
+def test_cortex_generate_reports_every_real_failure(all_keys, monkeypatch):
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        if "groq" in url:
+            return FakeResponse(status_code=401, text="invalid api key")
+        if "googleapis" in url:
+            return FakeResponse(status_code=404, text="model not found")
+        return FakeResponse(status_code=503, text="hf busy")
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    with pytest.raises(ProviderError) as excinfo:
+        cortex_generate("quick_text", [{"role": "user", "content": "hi"}], max_tokens=16)
+    message = str(excinfo.value)
+    assert "groq: groq HTTP 401" in message
+    assert "google_ai_studio: google_ai_studio HTTP 404" in message
+    assert "huggingface: huggingface HTTP 503" in message
+    assert "no BYOK endpoint" not in message
+
+
+def test_legacy_generate_reports_every_real_failure(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    for name in ("NVIDIA_API_KEY", "OPENROUTER_API_KEY", "CEREBRAS_API_KEY", "MISTRAL_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    def fake_chat(provider, messages, max_tokens, temperature, settings):
+        raise ProviderError(f"HTTP 401 from {provider}")
+
+    monkeypatch.setattr(router, "chat", fake_chat)
+    with pytest.raises(ProviderError) as excinfo:
+        router.generate("chat", [{"role": "user", "content": "hi"}], QuotaLedger({n: (30, 100000) for n in router.PROVIDERS}), max_tokens=16)
+    message = str(excinfo.value)
+    assert "groq: HTTP 401 from groq" in message
+    assert "gemini: HTTP 401 from gemini" in message
+
+
+def test_probe_reports_status_without_leaking_key(all_keys, monkeypatch):
+    def fake_post(url, headers=None, json=None, timeout=None):
+        assert json.get("max_tokens") == 8 or json.get("generationConfig", {}).get("maxOutputTokens") == 8
+        if "groq" in url:
+            return FakeResponse(status_code=200, text="{}")
+        if "googleapis" in url:
+            return FakeResponse(status_code=404, text="gemini-secret-key model gone")
+        return FakeResponse(status_code=401, text="nope")
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    results = {row["endpoint"]: row for row in router.probe_all_endpoints()}
+    assert results["groq"]["ok"] is True and results["groq"]["status"] == 200
+    assert results["google_ai_studio"]["ok"] is False and results["google_ai_studio"]["status"] == 404
+    assert "CORTEX_GEMINI_MODEL" in results["google_ai_studio"]["detail"]
+    assert "gemini-secret-key" not in str(results)
+    assert "key rejected" in results["huggingface"]["detail"]
+
+
+def test_probe_without_key_does_not_call_network(monkeypatch):
+    for name in ("GROQ_API_KEY",):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call")))
+    row = router.probe_endpoint("groq")
+    assert row["ok"] is False and row["detail"] == "no key configured"
+
+
+# ----------------------------------------------------------------------------
+# Live model discovery after a vendor retirement
+# ----------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def clear_discovery():
+    router._DISCOVERED_MODELS.clear()
+    yield
+    router._DISCOVERED_MODELS.clear()
+
+
+class FakeGet:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+def test_retired_groq_model_is_discovered_and_retried(all_keys, monkeypatch):
+    posts: List[str] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        posts.append(json["model"])
+        if json["model"] == "openai/gpt-oss-120b":
+            return FakeResponse(lines=sse({"choices": [{"delta": {"content": "alive"}}]}))
+        return FakeResponse(status_code=400, text='{"error":{"message":"The model `x` has been decommissioned","code":"model_decommissioned"}}')
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return FakeGet(200, {"data": [{"id": "openai/gpt-oss-20b"}, {"id": "openai/gpt-oss-120b"}]})
+
+    monkeypatch.setenv("CORTEX_GROQ_MODEL", "")
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    monkeypatch.setattr(router.requests, "get", fake_get)
+    # Force the default to a retired id to simulate a stale deployment.
+    stale = router.CORTEX_ENDPOINTS["groq"]
+    monkeypatch.setitem(router.CORTEX_ENDPOINTS, "groq", router.CortexEndpoint(**{**stale.__dict__, "model": "llama-3.3-70b-versatile"}))
+    text = "".join(router.cortex_stream("groq", [{"role": "user", "content": "x"}]))
+    assert text == "alive"
+    assert posts == ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"]
+    assert endpoint_model(router.CORTEX_ENDPOINTS["groq"]) == "openai/gpt-oss-120b"
+
+
+def test_gemini_discovery_prefers_newest_flash(all_keys, monkeypatch):
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return FakeGet(200, {"models": [
+            {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/gemini-3.5-flash", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/gemini-3.5-flash-image", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/embedding-001", "supportedGenerationMethods": ["embedContent"]},
+        ]})
+
+    monkeypatch.setattr(router.requests, "get", fake_get)
+    assert router.discover_endpoint_model("google_ai_studio") == "gemini-3.5-flash"
+    assert endpoint_model(router.CORTEX_ENDPOINTS["google_ai_studio"]) == "gemini-3.5-flash"
+
+
+def test_env_override_beats_discovery(all_keys, monkeypatch):
+    router._DISCOVERED_MODELS["groq"] = "discovered-id"
+    monkeypatch.setenv("CORTEX_GROQ_MODEL", "pinned-id")
+    assert endpoint_model(router.CORTEX_ENDPOINTS["groq"]) == "pinned-id"
+
+
+def test_non_retirement_errors_do_not_trigger_discovery(all_keys, monkeypatch):
+    monkeypatch.setattr(router.requests, "post", lambda *a, **k: FakeResponse(status_code=401, text="bad key"))
+    monkeypatch.setattr(router.requests, "get", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no discovery")))
+    with pytest.raises(ProviderError):
+        list(router.cortex_stream("groq", [{"role": "user", "content": "x"}]))
+
+
+def test_probe_reports_auto_switch(all_keys, monkeypatch):
+    def fake_post(url, headers=None, json=None, timeout=None):
+        if json.get("model") == "openai/gpt-oss-120b":
+            return FakeResponse(status_code=200, text="{}")
+        return FakeResponse(status_code=404, text="model not found")
+
+    monkeypatch.setattr(router.requests, "post", fake_post)
+    monkeypatch.setattr(router.requests, "get", lambda *a, **k: FakeGet(200, {"data": [{"id": "openai/gpt-oss-120b"}]}))
+    stale = router.CORTEX_ENDPOINTS["groq"]
+    monkeypatch.setitem(router.CORTEX_ENDPOINTS, "groq", router.CortexEndpoint(**{**stale.__dict__, "model": "dead-model"}))
+    row = router.probe_endpoint("groq")
+    assert row["ok"] is True
+    assert row["model"] == "openai/gpt-oss-120b"
+    assert "auto-switched from retired dead-model" in row["detail"]

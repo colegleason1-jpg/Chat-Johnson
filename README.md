@@ -75,8 +75,19 @@ code block (versioned save to SQLite), output token budget slider, per-project s
 Keys are read from the process environment at call time. They are never written to SQLite, logs,
 prompts, artifacts, or git.
 
-Optional model-id overrides for the strict Cortex endpoints (useful when a vendor retires an id):
-`CORTEX_GEMINI_MODEL`, `CORTEX_GROQ_MODEL`, `CORTEX_HF_MODEL`. The RPM/TPM ceilings stay fixed.
+### Model ids and retirements
+
+Vendors retire model ids without warning (Groq shut down `llama-3.3-70b-versatile` on 2026-08-16;
+Google retired `gemini-1.5-pro` and `gemini-2.0-flash`). The router resolves each endpoint's model
+at call time in this order:
+
+1. an env override: `CORTEX_GEMINI_MODEL`, `CORTEX_GROQ_MODEL`, `CORTEX_HF_MODEL`;
+2. a live id discovered from the vendor's model list after a "retired / not found" error
+   (cached for the process, preferring the newest Flash / gpt-oss ids);
+3. the built-in default (`gemini-2.5-flash`, `openai/gpt-oss-120b`, `Qwen/Qwen2.5-Coder-32B-Instruct`).
+
+The RPM/TPM ceilings never change with the id. The sidebar **Test keys** button sends one tiny
+request per configured endpoint and reports the real HTTP status, including any auto-switch.
 
 ### Paid reasoning slot (optional, session-only)
 

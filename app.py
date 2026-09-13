@@ -75,6 +75,7 @@ from orchestrator.router import (
     classify,
     cortex_available,
     generate_mode,
+    probe_all_endpoints,
 )
 
 
@@ -743,7 +744,9 @@ ledger = get_quota_ledger()
 with st.sidebar:
     st.markdown("<div class='eyebrow'>Chat Johnson · Gen 2</div>", unsafe_allow_html=True)
     st.title("Control deck")
-    with st.expander("🔑 API keys (BYOK, session only)", expanded=not configured_provider_names()):
+    if "byok_expanded" not in st.session_state:
+        st.session_state.byok_expanded = not configured_provider_names()
+    with st.expander("🔑 API keys (BYOK, session only)", expanded=st.session_state.byok_expanded):
         st.caption(
             "Paste free-tier keys here to use the studio like a normal user. They are scoped to "
             "this browser session only, override environment variables, and are never written "
@@ -783,6 +786,13 @@ with st.sidebar:
                 st.session_state.pop(f"byok_{env_name}", None)
             st.info("Session keys cleared. Environment variables, if any, remain in effect.")
             st.rerun()
+        if st.button("Test keys (one tiny request per configured endpoint)", key="probe_keys", use_container_width=True):
+            with st.spinner("Probing endpoints…"):
+                probe_rows = probe_all_endpoints()
+            for row in probe_rows:
+                marker = "✅" if row["ok"] else ("⚪" if row["detail"] == "no key configured" else "❌")
+                status = f" · HTTP {row['status']}" if row["status"] else ""
+                st.caption(f"{marker} **{row['endpoint']}** · {row['model']}{status} · {row['detail']}")
     project_input = st.text_input("Active project scope", value=st.session_state.project_scope, key="project_scope_input")
     st.session_state.project_scope = project_input.strip() or "chat-johnson"
     st.checkbox(
