@@ -797,6 +797,18 @@ def export_artifact(artifact_id: int) -> Tuple[str, str]:
     return filename, str(row["code_body"])
 
 
+def health_check() -> Dict[str, Any]:
+    """Zero-cost liveness for the ?health=1 view and the smoke drive: schema present, counts readable."""
+    try:
+        with _open_database() as connection:
+            threads = int(connection.execute("SELECT COUNT(*) FROM threads").fetchone()[0])
+            messages = int(connection.execute("SELECT COUNT(*) FROM message_history").fetchone()[0])
+            artifacts = int(connection.execute("SELECT COUNT(*) FROM artifact_store").fetchone()[0])
+        return {"ok": True, "path": str(database_path()), "threads": threads, "messages": messages, "artifacts": artifacts, "error": ""}
+    except Exception as exc:
+        return {"ok": False, "path": str(database_path()), "threads": 0, "messages": 0, "artifacts": 0, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def export_thread(thread_id: int) -> Dict[str, Any]:
     """Everything one chat holds, for review or hand-off: thread row, archived + live messages in order, summaries, digest.
 

@@ -24,7 +24,7 @@ def test_every_target_generates_a_valid_kit(target, cloud):
     assert errors == []
     assert not any(re.search(r"\[\[[a-z_]+\]\]", item.body) for item in files), "unfilled placeholder"
     runbook = next(item for item in files if item.path == "docs/RUNBOOK.md").body
-    assert "demo-app" in runbook and "/?health=1" in next(item for item in files if item.path == "scripts/smoke_test.sh").body
+    assert "demo-app" in runbook and "/_stcore/health" in next(item for item in files if item.path == "scripts/smoke_test.sh").body
 
 
 def test_kubernetes_kit_has_the_whole_pipeline():

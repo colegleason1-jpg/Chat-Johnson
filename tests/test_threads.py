@@ -296,3 +296,12 @@ def test_export_thread_includes_summaries_and_inherited_digest(db):
     result = db.migrate_thread(scope)
     successor = db.export_thread(result["new_thread_id"])
     assert successor["digest"] and "Inherited vision digest" in db.thread_transcript(result["new_thread_id"])[1]
+
+
+def test_health_check_reports_counts_and_survives_a_broken_path(db, monkeypatch):
+    fill(db, "h", 3)
+    state = db.health_check()
+    assert state["ok"] is True and state["messages"] == 3 and state["threads"] >= 1 and state["error"] == ""
+    monkeypatch.setenv("CHAT_JOHNSON_DB_PATH", "/nonexistent-dir/for-sure/vault.db")
+    broken = db.health_check()
+    assert broken["ok"] is False and broken["error"]

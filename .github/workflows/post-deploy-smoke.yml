@@ -1,0 +1,38 @@
+name: post-deploy-smoke
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_url:
+        description: "Deployed app URL (defaults to the DEPLOY_URL repository variable)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "23 */12 * * *"
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Drive the live app
+        env:
+          DEPLOY_URL: ${{ inputs.deploy_url != '' && inputs.deploy_url || vars.DEPLOY_URL }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set +e
+          python scripts/smoke_drive.py
+          code=$?
+          if [ "$code" = "2" ]; then
+            echo "::notice::DEPLOY_URL is not configured; set the repository variable to enable post-deploy checks."
+            exit 0
+          fi
+          exit $code

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
+import platform
 import sqlite3
 import os
 import re
@@ -107,6 +109,7 @@ from orchestrator.vault import (
     delete_thread,
     create_thread,
     export_artifact,
+    health_check,
     initialize_database,
     list_threads,
     migrate_thread,
@@ -176,7 +179,13 @@ def get_task_request_lock() -> threading.Lock:
 
 @st.cache_resource
 def build_marker() -> str:
-    """Short git commit of the running checkout, so a deploy can be verified at a glance."""
+    """Short git commit of the running checkout, so a deploy can be verified at a glance.
+
+    CHAT_JOHNSON_BUILD wins when set (platforms that strip .git, or a deploy job that knows the sha).
+    """
+    pinned = os.environ.get("CHAT_JOHNSON_BUILD", "").strip()
+    if pinned:
+        return pinned[:12]
     try:
         import subprocess
 
@@ -1313,6 +1322,26 @@ if "byok_keys" not in st.session_state:
 bind_session_keys(st.session_state.byok_keys)
 if "heavy_mode" not in st.session_state:
     st.session_state.heavy_mode = False
+
+if _query_value("health") == "1":
+    # Machine-readable liveness for the smoke drive and a human glance; no keys, no provider calls.
+    vault_state = health_check()
+    st.code(
+        json.dumps(
+            {
+                "status": "ok" if vault_state["ok"] else "degraded",
+                "build": build_marker(),
+                "streamlit": st.__version__,
+                "python": platform.python_version(),
+                "vault": vault_state,
+                "keyed_vendors": configured_provider_names(),
+                "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+            indent=2,
+        ),
+        language="json",
+    )
+    st.stop()
 
 ledger = get_quota_ledger()
 with st.sidebar:

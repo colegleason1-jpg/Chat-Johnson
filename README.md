@@ -82,7 +82,8 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | Cross-thread semantic search | Roadmap · artifact search is text matching |
 | Capability card in every prompt (what the app can and cannot do) and memory as real chat turns | Implemented |
 | Deploy Kit (Repository Work): CI/CD workflow, Dockerfile, Helm chart, Terraform skeleton, serverless template, observability, rollback script, runbook; offline validation; zip download; lock as artifacts | Implemented · generation only, nothing is pushed or applied |
-| Post-deploy checks for this app, session-only GitHub push, app observability | Planned · `docs/DEPLOY_AUTOMATION_PLAN.md` |
+| Post-deploy checks for this app: `?health=1` JSON view, `scripts/smoke_drive.py`, `post-deploy-smoke` workflow, `docs/RUNBOOK.md` | Implemented · set the `DEPLOY_URL` repository variable to arm the workflow |
+| Session-only GitHub push, app observability | Planned · `docs/DEPLOY_AUTOMATION_PLAN.md` |
 
 Controls: **Heavy Mode** toggle (multi-pass, more tokens, longer wait), **Artifact Lock** beside every
 code block (versioned save to SQLite), output token budget slider, per-project scope.

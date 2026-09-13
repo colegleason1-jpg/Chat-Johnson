@@ -30,7 +30,7 @@ push only on a button press); the automation lives **inside Repository Work**; t
   Prometheus values, rollback script, runbook, post-deploy smoke test; optional Heavy Mode
   refinement per file; offline validation (YAML, JSON, shell `-n`, Dockerfile rules); every
   file locked as an artifact; "Download kit (.zip)". Zero provider calls unless refinement is on.
-- **Phase 2 · Post-deploy checks for this app**: health view, smoke drive, post-deploy CI job,
+- **Phase 2 · Post-deploy checks for this app (shipped)**: health view, smoke drive, post-deploy CI job,
   runbook (`docs/RUNBOOK.md`: deploy, verify, rollback, key rotation).
 - **Phase 3 · GitHub push, session-only**: toggle + token, branch + PR via the GitHub REST API
   with `requests`, revert PR; boundary text in README, sidebar, and the capability card updated
