@@ -11,7 +11,7 @@ def test_rank_requires_every_keyword_in_any_order_and_prefers_word_starts():
     repos = ["Chazzzer/Chat-Johnson", "Chazzzer/johnson-notes", "other/chatter", "Chazzzer/deploy-kit"]
     assert keyword_rank("johnson chat", repos) == ["Chazzzer/Chat-Johnson"]
     assert keyword_rank("notes johnson", repos) == ["Chazzzer/johnson-notes"]
-    assert keyword_rank("johnson", repos) == ["Chazzzer/Chat-Johnson", "Chazzzer/johnson-notes"]
+    assert keyword_rank("johnson", repos) == ["Chazzzer/johnson-notes", "Chazzzer/Chat-Johnson"]  # earlier word-start match first
     assert keyword_rank("chat", repos)[0] == "Chazzzer/Chat-Johnson"  # word-start match beats the substring in "chatter"
     assert keyword_rank("", repos, limit=2) == repos[:2]
     assert keyword_rank("nothing", repos) == []
