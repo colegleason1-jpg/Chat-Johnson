@@ -12,7 +12,7 @@ import sys
 from typing import Tuple
 
 from .memory import TaskMemory
-from .patches import PATCH_INSTRUCTIONS, apply_file_blocks, parse_file_blocks
+from .patches import PATCH_INSTRUCTIONS, apply_file_blocks, parse_file_blocks, reject_snippets
 from .quota import QuotaLedger
 from .router import pipeline_generate as generate
 from .sandbox import validate_python_files
@@ -22,10 +22,13 @@ def run_pytest(sandbox_path: str, timeout: int = 300) -> Tuple[bool, str]:
     """Returns (passed, combined_output)."""
     if not os.path.isdir(os.path.join(sandbox_path, "tests")) and not _has_tests(sandbox_path):
         return True, "(no tests found — syntax guardrails only)"
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-x", "-q", "--no-header", "-p", "no:cacheprovider"],
-        cwd=sandbox_path, capture_output=True, text=True, timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "-x", "-q", "--no-header", "-p", "no:cacheprovider"],
+            cwd=sandbox_path, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"(pytest timed out after {timeout} s; the repository's tests may hang or need services)"
     output = (proc.stdout + "\n" + proc.stderr).strip()
     return proc.returncode == 0, output[-8000:]  # keep tail (tracebacks live there)
 
@@ -62,8 +65,12 @@ def repair_loop(
 ) -> Tuple[bool, int, str]:
     """Run tests; while failing, feed tracebacks to the router for fixes.
 
-    Returns (all_passed, rounds_used, final_output).
+    Returns (all_passed, rounds_used, final_output). With ``max_rounds`` at 0 the repository's
+    tests are not executed at all (syntax guardrails only), which is the default for fetched
+    GitHub trees: running a stranger's test suite is an explicit choice.
     """
+    if max_rounds <= 0:
+        return True, 0, "(tests not run: repair rounds set to 0; syntax guardrails only)"
     passed, output = run_pytest(sandbox_path)
     rounds = 0
     while not passed and rounds < max_rounds:
@@ -84,9 +91,10 @@ def repair_loop(
             )
         except Exception as exc:  # provider outage: stop the loop, report
             return False, rounds, f"{output}\n\n[repair loop aborted: {exc}]"
-        fixes = parse_file_blocks(text)
+        fixes, rejected = reject_snippets(sandbox_path, parse_file_blocks(text))
         if not fixes:
-            output = f"{output}\n\n[round {rounds}: model produced no parseable file blocks]"
+            reason = "; ".join(rejected) if rejected else "model produced no parseable file blocks"
+            output = f"{output}\n\n[round {rounds}: {reason}]"
             continue
         apply_file_blocks(sandbox_path, fixes)
         passed, output = run_pytest(sandbox_path)

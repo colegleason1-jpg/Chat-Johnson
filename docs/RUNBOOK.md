@@ -38,6 +38,11 @@
   push flow can read the changed files. Running a fetched repository's tests executes its code in
   the app's container; the box is off by default for GitHub sources.
 
+## Quota caps
+- Per-vendor daily token ceilings default to the `DAILY_CAPS` table; set `CHAT_JOHNSON_DAILY_<VENDOR>`
+  (for example `CHAT_JOHNSON_DAILY_GEMINI=2000000`, `0` = uncapped) on the host to change them.
+  The sidebar's BYOK channels show this minute's and today's usage and when a full window resets.
+
 ## Key rotation
 1. Create the new key at the vendor.
 2. Paste it in the sidebar (Apply keys) or update the environment secret for self-hosted runs.

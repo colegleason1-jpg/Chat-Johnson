@@ -114,4 +114,4 @@ def test_failed_steps_are_counted_and_named(tmp_path, monkeypatch):
     monkeypatch.setattr(executor_module, "pipeline_generate", boom)
     settings = Settings(staging_root=str(tmp_path / "staging"), max_test_rounds=0, memory_path=str(tmp_path / "mem.json"))
     report = Orchestrator(settings=settings, ledger=QuotaLedger({})).run("do it", repo_path=str(repo))
-    assert report["failed_steps"] == 1 and report["steps"][0]["provider"] == "none" and "no headroom" in report["steps"][0]["note"]
+    assert report["failed_steps"] == 1 and report["steps"][0]["provider"] == "none" and "free-tier window" in report["steps"][0]["note"]

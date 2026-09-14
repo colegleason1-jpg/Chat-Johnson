@@ -168,9 +168,30 @@ def provider_api_key(cfg: ProviderConfig) -> str:
     return resolve_secret(cfg.env_key)
 
 
+# Conservative free-tier daily token ceilings per vendor (tokens per rolling day). They are the hard
+# stop behind every budget; override with CHAT_JOHNSON_DAILY_<VENDOR>=<tokens> (0 = uncapped).
+DAILY_CAPS: Dict[str, int] = {
+    "gemini": 1_000_000,
+    "groq": 500_000,
+    "huggingface": 300_000,
+    "nvidia": 500_000,
+    "openrouter": 200_000,
+    "cerebras": 1_000_000,
+    "mistral": 500_000,
+}
+
+
+def daily_cap(vendor: str) -> int:
+    """Daily token cap for a vendor: environment override first, then the table; 0 means uncapped."""
+    override = _env(f"CHAT_JOHNSON_DAILY_{vendor.upper()}")
+    if override.isdigit():
+        return int(override)
+    return int(DAILY_CAPS.get(vendor, 0))
+
+
 def provider_model(cfg: ProviderConfig) -> str:
-    """Env override > live id discovered after a vendor retirement > default."""
-    override = _env(cfg.model_env) if cfg.model_env else ""
+    """Session override > env override > live id discovered after a vendor retirement > default."""
+    override = resolve_secret(cfg.model_env) if cfg.model_env else ""
     if override:
         return override
     from .discovery import discovered  # local import keeps config dependency-free at import time

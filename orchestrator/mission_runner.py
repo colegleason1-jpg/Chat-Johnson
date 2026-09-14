@@ -10,6 +10,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import vault
+from .errors import plain_error
 from .jobs import JobCancelled, JobContext, register_handler
 from .missions import assemble_deliverable, deliverable_slug, parse_length_target, text_measure
 from .prompting import build_prompt_messages
@@ -80,7 +81,7 @@ def run_mission_job(ctx: JobContext) -> Dict[str, Any]:
             raise
         except Exception as exc:
             failed += 1
-            failures.append((title, str(exc)[:600]))
+            failures.append((title, plain_error(exc)))
             _record(scope, step_type, "failed", mode, started, str(exc)[:160])
         ctx.progress(step=finished, total=total, succeeded=succeeded, failed=failed, text=f"{succeeded} succeeded · {failed} failed · {finished}/{total} done")
     if succeeded:

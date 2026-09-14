@@ -9,7 +9,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Tuple
+from typing import Deque, Dict, Optional, Tuple
 
 
 WINDOW_SECONDS = 60.0
@@ -32,18 +32,32 @@ class Bucket:
 class QuotaLedger:
     """Thread-safe per-provider rate accounting."""
 
-    def __init__(self, limits: Dict[str, Tuple[int, int]]):
-        # limits: provider -> (rpm_limit, tpm_limit)
+    def __init__(self, limits: Dict[str, Tuple[int, int]], daily_limits: Optional[Dict[str, int]] = None):
+        # limits: provider -> (rpm_limit, tpm_limit); daily_limits: provider -> tokens per rolling day (0 = uncapped)
         self._limits = dict(limits)
+        self._daily: Dict[str, int] = {name: int(value) for name, value in (daily_limits or {}).items()}
         self._buckets: Dict[str, Bucket] = {
             name: Bucket() for name in limits
         }
         self._lock = threading.Lock()
 
-    def register(self, provider: str, rpm_limit: int, tpm_limit: int) -> None:
+    def register(self, provider: str, rpm_limit: int, tpm_limit: int, daily_limit: Optional[int] = None) -> None:
         with self._lock:
             self._limits[provider] = (rpm_limit, tpm_limit)
+            if daily_limit is not None:
+                self._daily[provider] = int(daily_limit)
             self._buckets.setdefault(provider, Bucket())
+
+    def set_daily_limit(self, provider: str, tokens: int) -> None:
+        """Cap tokens per rolling day for a provider (0 removes the cap); the hard stop behind the treasury."""
+        with self._lock:
+            self._daily[provider] = max(0, int(tokens))
+            self._limits.setdefault(provider, (10**9, 10**9))
+            self._buckets.setdefault(provider, Bucket())
+
+    def daily_limit(self, provider: str) -> int:
+        with self._lock:
+            return int(self._daily.get(provider, 0))
 
     def tighten(self, provider: str, rpm_limit: int, tpm_limit: int) -> None:
         """Register, or lower existing limits to the stricter of the two policies.
@@ -90,17 +104,20 @@ class QuotaLedger:
             bucket = self._buckets[provider]
             self._prune(bucket, now)
             rpm, tpm = self._limits[provider]
+            daily = int(self._daily.get(provider, 0))
             tokens_60s = sum(t for _, t in bucket.tokens)
+            headroom = min(1 - len(bucket.requests) / max(rpm, 1), 1 - tokens_60s / max(tpm, 1))
+            if daily > 0:
+                headroom = min(headroom, 1 - bucket.daily_tokens / daily)
             return {
                 "rpm_used": len(bucket.requests),
                 "rpm_limit": rpm,
                 "tpm_used": tokens_60s,
                 "tpm_limit": tpm,
                 "daily_tokens": bucket.daily_tokens,
-                "headroom": min(
-                    1 - len(bucket.requests) / max(rpm, 1),
-                    1 - tokens_60s / max(tpm, 1),
-                ),
+                "daily_limit": daily,
+                "day_resets_in": max(0.0, DAY_SECONDS - (now - bucket.day_started_at)),
+                "headroom": headroom,
             }
 
     def has_headroom(self, provider: str, est_tokens: int) -> bool:
@@ -108,6 +125,7 @@ class QuotaLedger:
         return (
             u["rpm_used"] < u["rpm_limit"]
             and u["tpm_used"] + est_tokens <= u["tpm_limit"]
+            and (u["daily_limit"] <= 0 or u["daily_tokens"] + est_tokens <= u["daily_limit"])
         )
 
     def wait_seconds(self, provider: str, est_tokens: int) -> float:
@@ -128,7 +146,13 @@ class QuotaLedger:
                 if tokens_60s + est_tokens > tpm and bucket.tokens
                 else 0.0
             )
-            return max(0.0, need_req_wait, need_tok_wait)
+            daily = int(self._daily.get(provider, 0))
+            need_day_wait = (
+                DAY_SECONDS - (now - bucket.day_started_at)
+                if daily > 0 and bucket.daily_tokens + est_tokens > daily
+                else 0.0
+            )
+            return max(0.0, need_req_wait, need_tok_wait, need_day_wait)
 
     def record(self, provider: str, tokens: int, count_request: bool = True) -> None:
         """Charge `tokens` for one completed request (and one request unless already counted)."""

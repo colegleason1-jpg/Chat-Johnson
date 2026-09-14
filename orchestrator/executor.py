@@ -14,13 +14,14 @@ from . import sandbox
 from .config import PROVIDERS, Settings, get_settings
 from .decomposer import decompose
 from .memory import StepRecord, TaskMemory
+from .errors import plain_error
 from .patches import (
     changed_files,
     PATCH_INSTRUCTIONS,
     apply_file_blocks,
     apply_unified_diffs,
     parse_diff_blocks,
-    parse_file_blocks,
+    parse_file_blocks, reject_snippets,
 )
 from .quota import QuotaLedger
 from .repo_ingest import serialize_repo
@@ -115,7 +116,7 @@ class Orchestrator:
         try:
             text, decision = pipeline_generate(task_type, messages, self.ledger, max_tokens=self.settings.max_output_tokens)
         except Exception as exc:
-            record.status, record.note, record.provider = "failed", f"provider error: {exc}", "none"
+            record.status, record.note, record.provider = "failed", f"provider error: {plain_error(exc)}", "none"
             memory.add_step(record)
             self._log_event("step_failed", step_id=step["id"], error=str(exc))
             return
@@ -140,9 +141,11 @@ class Orchestrator:
         self, text: str, sandbox_path: str, goal: str, memory: TaskMemory, provider: str
     ) -> str:
         """Deterministic assembly + guardrails + pytest repair loop."""
-        file_blocks = parse_file_blocks(text)
+        file_blocks, rejected = reject_snippets(sandbox_path, parse_file_blocks(text))
         diffs = parse_diff_blocks(text)
         if not file_blocks and not diffs:
+            if rejected:
+                return "FAILED: " + "; ".join(rejected)
             return "FAILED: model output contained no file blocks or diffs"
 
         written = apply_file_blocks(sandbox_path, file_blocks)
@@ -157,13 +160,16 @@ class Orchestrator:
         passed, rounds, output = repair_loop(
             sandbox_path, goal, self.ledger, memory, self.settings.max_test_rounds
         )
-        sandbox.commit_sandbox(sandbox_path, f"orchestrator: {goal[:60]} ({provider})")
         if not passed:
+            # Left uncommitted on purpose: the diff stays reviewable, but nothing red becomes a commit.
             return f"FAILED after {rounds} repair round(s): {output[-800:]}"
+        sandbox.commit_sandbox(sandbox_path, f"orchestrator: {goal[:60]} ({provider})")
         note = f"applied {len(written)} file block(s), {len(applied)} diff(s)"
         if failed:
             note += f"; {len(failed)} diff failed: {failed[0][:120]}"
-        return note + f"; pytest green after {rounds} round(s)"
+        if rejected:
+            note += f"; skipped {len(rejected)} snippet block(s): {rejected[0][:120]}"
+        return note + (f"; pytest green after {rounds} round(s)" if rounds or "not run" not in output else "; tests not run")
 
     # ---------- prompt helpers ----------
 

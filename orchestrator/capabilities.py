@@ -15,15 +15,16 @@ IMPLEMENTED: Tuple[Tuple[str, str], ...] = (
     ("Normal Chat", "single-pass answers routed by a MILP solver across the operator's free-tier keys "
                     "(Gemini, Groq, Hugging Face; NVIDIA, OpenRouter, Cerebras, Mistral as fallback)"),
     ("Chat Bot", "developer chat with explicit file attachments; fenced file blocks can be locked as versioned artifacts"),
-    ("Task Finder", "deterministic decomposition of a mission into typed workstreams run in order under free-tier limits; "
-                    "results stay in the chat and the mission continues as a conversation"),
+    ("Task Finder", "deterministic decomposition of a mission into typed workstreams run in order as a background job; "
+                    "results land in the chat as each finishes and the mission continues as a conversation"),
+    ("Background jobs", "missions run on worker threads with progress, cancel, and questions to the operator; the UI stays usable"),
     ("Repository Work", "sandboxed pipeline on a GitHub repository fetched through the API (public, or private with the armed session "
                         "token) or a local path: ingest, plan, patch, optional pytest repair loop, reviewable diff and patch download; "
                         "the result can be pushed as a branch plus pull request through the session-only slot; the repository "
                         "conversation sees the fetched tree (file map and the highest-value files within the token budget) and "
                         "says so when nothing is loaded"),
-    ("Memory", "SQLite vault per project: per-workspace chats, 200-message windows, texturized summaries, vision digests, "
-               "locked artifacts, Markdown/JSON transcript export"),
+    ("Memory", "SQLite vault with a private scope per visitor (kept on the URL): per-workspace chats, 200-message windows, "
+               "texturized summaries, vision digests, locked artifacts, Markdown/JSON transcript export"),
     ("Heavy Mode", "draft, review, synthesis passes; an optional paid slot serves only the review pass and is armed per session"),
     ("Live preview canvas", "sanitized rendering of HTML/CSS mockups"),
 )
@@ -35,7 +36,7 @@ BOUNDARIES: Tuple[str, ...] = (
     "session, never stored), which pushes one commit to a new branch and opens a pull request when the operator presses "
     "the button; the default branch is never written to and a revert pull request can undo any push from the session",
     "cannot execute Docker, Terraform, Helm, kubectl, or cloud CLIs; it can write such files and check their syntax offline",
-    "free-tier only: every provider call is metered against per-vendor RPM and TPM ceilings",
+    "free-tier only: every provider call is metered against per-vendor RPM, TPM, and daily token ceilings",
 )
 
 

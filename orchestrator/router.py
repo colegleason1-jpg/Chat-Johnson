@@ -145,7 +145,7 @@ MODEL_PREFERENCES = {
 def endpoint_model(endpoint: "CortexEndpoint") -> str:
     """Resolve the model id at call time: env override > discovered live id > default."""
     if endpoint.model_env:
-        override = os.environ.get(endpoint.model_env, "").strip()
+        override = resolve_secret(endpoint.model_env)  # session overlay first, then the environment
         if override:
             return override
     return discovery.discovered(endpoint.name) or endpoint.model
@@ -1624,6 +1624,14 @@ def generate(
     )
 
 
+def _last_user_turn(messages: Sequence[Mapping[str, str]]) -> str:
+    """The newest user message, which is what the critique and synthesis passes need to see."""
+    for message in reversed(list(messages)):
+        if message.get("role") == "user":
+            return str(message.get("content", ""))
+    return str(messages[-1].get("content", "")) if messages else ""
+
+
 def _heavy_pipeline(
     one_pass: Callable[[str, List[dict], int], Tuple[str, RouteDecision]],
     task_type: str,
@@ -1637,6 +1645,9 @@ def _heavy_pipeline(
     critique pass; the draft and synthesis always run on free endpoints.
     """
     draft, draft_decision = one_pass(task_type, messages, max(256, max_tokens // 2))
+    # Only the operator's request travels with the draft: the system prompt, memory, and history
+    # already shaped the draft, and resending them tripled the cost of every Heavy send.
+    request = _last_user_turn(messages)
     critique_messages = [
         {
             "role": "system",
@@ -1646,7 +1657,7 @@ def _heavy_pipeline(
                 "private chain-of-thought."
             ),
         },
-        {"role": "user", "content": json.dumps({"request": messages, "candidate": draft})},
+        {"role": "user", "content": json.dumps({"request": request, "candidate": draft})},
     ]
     try:
         if paid_slot is not None and paid_slot.armed:
@@ -1674,7 +1685,7 @@ def _heavy_pipeline(
         },
         {
             "role": "user",
-            "content": json.dumps({"request": messages, "candidate": draft, "review": critique}),
+            "content": json.dumps({"request": request, "candidate": draft, "review": critique}),
         },
     ]
     try:

@@ -198,3 +198,16 @@ def test_launch_queues_the_mission_as_a_job_and_shows_the_strip(app, monkeypatch
     assert any("Mission #" in m.value and "queued" in m.value for m in app.markdown)
     assert any("Mission running in the background" in c.value for c in app.caption)
     assert vault.recent_messages("visitor-launch", 10, workspace="task_finder")[0]["content"].startswith("MISSION: ")
+
+
+def test_sidebar_has_key_guides_overrides_and_no_oauth(app):
+    app.run()
+    assert not app.exception
+    labels = [e.label for e in app.sidebar.expander]
+    assert any("How to get a free key" in label for label in labels)
+    assert any("Model overrides" in label for label in labels)
+    assert not any("GitHub identity" in label for label in labels)
+    app.text_input(key="model_override_CORTEX_GROQ_MODEL").input("llama-custom").run()
+    next(b for b in app.button if b.label == "Apply overrides").click().run()
+    assert app.session_state["byok_keys"].get("CORTEX_GROQ_MODEL") == "llama-custom"
+    assert any("Model overrides applied" in s.value for s in app.success)

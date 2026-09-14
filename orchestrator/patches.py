@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 FILE_BLOCK_RE = re.compile(
     r"```file:\s*(?P<path>[^\n`]+)\n(?P<body>.*?)```", re.DOTALL
@@ -122,6 +122,49 @@ def parse_file_blocks(text: str) -> Dict[str, str]:
             body += "\n"
         patches[path] = body
     return patches
+
+
+_ELISION_RE = re.compile(r"^\s*(?:#|//|/\*|<!--)?\s*(?:\.\.\.|…)\s*(?:rest|existing|unchanged|omitted|snip|same as before|remaining|other code)?", re.I | re.M)
+_TOPLEVEL_RE = re.compile(r"^(?:def |class |async def )", re.M)
+
+
+def looks_like_snippet(path: str, body: str, existing: Optional[str]) -> str:
+    """Why a fenced body must not replace ``path`` wholesale ("" when it is a complete file).
+
+    A model that answers with an excerpt ("... rest unchanged", a lone function from a module that
+    has several) would otherwise overwrite the whole file with the excerpt.
+    """
+    lines = [line for line in body.splitlines() if line.strip()]
+    if any(_ELISION_RE.match(line) and len(line.strip()) <= 60 for line in lines):
+        return f"{path}: block elides part of the file ('...'); a complete file is required"
+    if existing is None or not path.endswith(".py"):
+        return ""
+    had_defs = len(_TOPLEVEL_RE.findall(existing))
+    has_defs = len(_TOPLEVEL_RE.findall(body))
+    if had_defs >= 2 and has_defs < had_defs and len(body) < 0.4 * len(existing):
+        return f"{path}: block holds {has_defs} of the file's {had_defs} top-level definitions and is much shorter; looks like an excerpt"
+    return ""
+
+
+def reject_snippets(root: str, patches: Dict[str, str]) -> Tuple[Dict[str, str], List[str]]:
+    """Split parsed blocks into (safe to write, reasons for the rejected ones) against the files on disk."""
+    accepted: Dict[str, str] = {}
+    rejected: List[str] = []
+    for path, body in patches.items():
+        full = os.path.join(root, path)
+        existing: Optional[str] = None
+        if os.path.isfile(full):
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as handle:
+                    existing = handle.read()
+            except OSError:
+                existing = None
+        reason = looks_like_snippet(path, body, existing)
+        if reason:
+            rejected.append(reason)
+        else:
+            accepted[path] = body
+    return accepted, rejected
 
 
 def parse_diff_blocks(text: str) -> List[str]:

@@ -12,7 +12,7 @@ import hashlib
 import threading
 from typing import Dict, Tuple
 
-from .config import PROVIDERS, resolve_secret
+from .config import PROVIDERS, daily_cap, resolve_secret
 from .quota import QuotaLedger
 
 _REGISTRY: Dict[str, Tuple[QuotaLedger, threading.Lock]] = {}
@@ -43,7 +43,7 @@ def _entry() -> Tuple[QuotaLedger, threading.Lock]:
                 vendor = vendor_for(name)
                 rpm, tpm = limits.get(vendor, (cfg.rpm_limit, cfg.tpm_limit))
                 limits[vendor] = (min(rpm, cfg.rpm_limit), min(tpm, cfg.tpm_limit))
-            entry = (QuotaLedger(limits), threading.Lock())
+            entry = (QuotaLedger(limits, {vendor: daily_cap(vendor) for vendor in limits}), threading.Lock())
             _REGISTRY[fingerprint] = entry
     return entry
 

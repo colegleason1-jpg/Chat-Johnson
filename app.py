@@ -27,7 +27,6 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlencode
 
 
 # Keep the startup cleanup deliberately narrow and before any application
@@ -56,7 +55,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Chat Johnson · Master Studio", page_icon="🧠", layout="wide")
 
 try:
-    import requests
+    import requests  # noqa: F401  (the GitHub and provider adapters need it; a missing wheel should fail here)
     import numpy  # noqa: F401  (surface a broken scientific stack early, with a clear message)
 except ImportError as _import_error:  # pragma: no cover - only reachable on a broken deploy
     st.error(
@@ -68,6 +67,8 @@ except ImportError as _import_error:  # pragma: no cover - only reachable on a b
     st.stop()
 
 from orchestrator.config import PROVIDERS, bind_session_keys, get_settings, provider_model, resolve_secret
+from orchestrator.discovery import vendor_for
+from orchestrator.errors import plain_error
 from orchestrator.executor import Orchestrator
 from orchestrator import mission_runner  # noqa: F401  (registers the mission job handler)
 from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner
@@ -83,6 +84,7 @@ from orchestrator.router import (
     byok_status,
     classify,
     cortex_available,
+    cortex_wait_seconds,
     endpoint_model,
     generate_mode,
     probe_all_endpoints,
@@ -97,7 +99,6 @@ from orchestrator.router import (
 
 from orchestrator.connectors import ROADMAP_FEATURES, connector_status
 from orchestrator.deploykit import CLOUDS, LANGUAGES, TARGETS, KitSpec, generate_kit, kit_zip, summarize, validate_kit
-from orchestrator.github_auth import mint_state, verify_state
 from orchestrator.github_push import GitHubPushError, GitHubWriter, PushRecord, branch_name_for
 from orchestrator.github_repo import GitHubRepoError, collect_changed_files, fetch_tree, list_repositories, looks_like_owner_repo, qualify_repository, whoami
 from orchestrator.repo_ingest import repo_prompt_context
@@ -401,12 +402,8 @@ def render_preview_panel() -> None:
 
 
 # =============================================================================
-# GitHub OAuth/read-only repository skeleton
+# Query params and visitor scope
 # =============================================================================
-
-GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
-GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
-GITHUB_API_URL = "https://api.github.com"
 
 
 def _query_value(name: str) -> str:
@@ -437,60 +434,6 @@ def remember_scope(scope: str) -> None:
             st.query_params["scope"] = scope
     except Exception:  # very old Streamlit builds keep it in session state only
         pass
-
-
-def github_oauth_url() -> str:
-    client_id = os.environ.get("GITHUB_CLIENT_ID", "").strip()
-    redirect_uri = os.environ.get("GITHUB_REDIRECT_URI", "").strip()
-    scope = os.environ.get("GITHUB_OAUTH_SCOPE", "read:user").strip() or "read:user"
-    # Signed, time-limited state: the redirect back from GitHub lands in a fresh
-    # Streamlit session, so session memory cannot be the CSRF check.
-    state = mint_state(os.environ.get("GITHUB_CLIENT_SECRET", "").strip())
-    return GITHUB_AUTHORIZE_URL + "?" + urlencode(
-        {"client_id": client_id, "redirect_uri": redirect_uri, "scope": scope, "state": state}
-    )
-
-
-def exchange_github_code(code: str, expected_state: str, received_state: str) -> str:
-    client_id = os.environ.get("GITHUB_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("GITHUB_CLIENT_SECRET", "").strip()
-    valid, why = verify_state(client_secret, received_state)
-    if not valid:
-        raise ValueError(f"GitHub OAuth state validation failed: {why}")
-    redirect_uri = os.environ.get("GITHUB_REDIRECT_URI", "").strip()
-    if not client_id or not client_secret or not redirect_uri:
-        raise ValueError("GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and GITHUB_REDIRECT_URI are required")
-    response = requests.post(
-        GITHUB_TOKEN_URL,
-        data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "redirect_uri": redirect_uri,
-        },
-        headers={"Accept": "application/json"},
-        timeout=20,
-    )
-    if response.status_code >= 400:
-        raise ValueError(f"GitHub token exchange failed with HTTP {response.status_code}")
-    payload = response.json()
-    token = str(payload.get("access_token", ""))
-    if not token:
-        raise ValueError(str(payload.get("error_description", "GitHub did not return an access token")))
-    return token
-
-
-def github_api_get(token: str, path: str) -> Any:
-    if not path.startswith("/") or ".." in path:
-        raise ValueError("invalid GitHub API path")
-    response = requests.get(
-        GITHUB_API_URL + path,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-        timeout=20,
-    )
-    if response.status_code >= 400:
-        raise ValueError(f"GitHub API returned HTTP {response.status_code}")
-    return response.json()
 
 
 def render_repository_work(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
@@ -770,44 +713,6 @@ def render_github_tab() -> None:
     else:
         st.caption("Disarmed. Arm it in the sidebar (toggle + token) to list and read private repositories and to push results.")
     render_push_ledger()
-    st.divider()
-    code = _query_value("code")
-    received_state = _query_value("state")
-    token = st.session_state.get("github_token", "")
-    with st.expander("GitHub identity (optional, profile-only OAuth)", expanded=bool(token or (code and received_state))):
-        st.caption(
-            "Least-privilege OAuth skeleton: the token lives in session memory only, no SSH keys are collected, "
-            "and nothing is committed or pushed by it."
-        )
-        oauth_ready = all(os.environ.get(key, "").strip() for key in ("GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_REDIRECT_URI"))
-        if code and received_state and "github_token" not in st.session_state:
-            try:
-                st.session_state.github_token = exchange_github_code(code, str(st.session_state.get("github_oauth_state", "")), received_state)
-                token = st.session_state.github_token
-                st.success("GitHub authorization completed for this session.")
-            except (ValueError, requests.RequestException) as exc:
-                st.error(f"GitHub authorization was not completed: {exc}")
-        if oauth_ready:
-            url = github_oauth_url()
-            try:
-                st.link_button("Authorize GitHub identity check (scope read:user, profile only)", url)
-            except AttributeError:
-                st.markdown(f"[Authorize GitHub identity check (scope read:user, profile only)]({url})")
-            st.caption("This reads your GitHub profile only.")
-        else:
-            st.caption("Set GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and GITHUB_REDIRECT_URI in the environment to enable it.")
-        if token:
-            st.success("Session-only GitHub connection is active.")
-            if st.button("Verify GitHub identity (profile only)", key="github_identity"):
-                try:
-                    identity = github_api_get(token, "/user")
-                    st.json({"login": identity.get("login"), "name": identity.get("name"), "public_repos": identity.get("public_repos")})
-                except (ValueError, requests.RequestException) as exc:
-                    st.error(f"GitHub request failed: {exc}")
-            if st.button("Forget session connection", key="github_forget"):
-                st.session_state.pop("github_token", None)
-                st.session_state.pop("github_oauth_state", None)
-                st.rerun()
 
 
 def render_push_ledger() -> None:
@@ -997,6 +902,50 @@ INJECTION_BUDGET_CHARS = 120_000
 ROUTING_LOG_LIMIT = 40
 MISSION_PREFIX = "MISSION: "
 JOB_LABELS = {"mission": "Mission"}
+CHAT_MAX_WAIT_SECONDS = 65  # one free-tier window; longer waits surface as the plain error instead
+KEY_GUIDES = (
+    ("Google AI Studio (Gemini)", "https://aistudio.google.com/app/apikey", ("Sign in with a Google account", "Create API key", "Copy it into GEMINI_API_KEY")),
+    ("Groq Cloud", "https://console.groq.com/keys", ("Sign up (free)", "Create API Key", "Copy it into GROQ_API_KEY")),
+    ("Hugging Face", "https://huggingface.co/settings/tokens", ("Sign up (free)", "New token, read scope", "Copy it into HF_TOKEN")),
+    ("NVIDIA NIM", "https://build.nvidia.com/", ("Sign in", "Get API key on any model page", "Copy it into NVIDIA_API_KEY")),
+    ("OpenRouter", "https://openrouter.ai/keys", ("Sign up", "Create key (free models need no credit)", "Copy it into OPENROUTER_API_KEY")),
+    ("Cerebras", "https://cloud.cerebras.ai/", ("Sign up", "API keys → Create", "Copy it into CEREBRAS_API_KEY")),
+    ("Mistral", "https://console.mistral.ai/api-keys", ("Sign up, choose the free tier", "Create new key", "Copy it into MISTRAL_API_KEY")),
+)
+MODEL_OVERRIDE_FIELDS = (
+    ("Gemini model", ("CORTEX_GEMINI_MODEL", "GEMINI_MODEL")),
+    ("Groq model", ("CORTEX_GROQ_MODEL", "GROQ_MODEL")),
+    ("Hugging Face model", ("CORTEX_HF_MODEL",)),
+    ("NVIDIA model", ("NVIDIA_MODEL",)),
+    ("OpenRouter model", ("OPENROUTER_MODEL",)),
+    ("Cerebras model", ("CEREBRAS_MODEL",)),
+    ("Mistral model", ("MISTRAL_MODEL",)),
+)
+
+
+def _short_count(value: float) -> str:
+    value = float(value)
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(int(value))
+
+
+def usage_sentence(ledger: QuotaLedger, vendor: str) -> str:
+    """Plain usage line per vendor: this minute's requests and tokens, today's tokens, and when a full window resets."""
+    if not ledger.known(vendor):
+        return "No calls yet this session."
+    use = ledger.usage(vendor)
+    parts = [f"this minute {use['rpm_used']}/{use['rpm_limit']} requests, {_short_count(use['tpm_used'])}/{_short_count(use['tpm_limit'])} tokens"]
+    if use.get("daily_limit"):
+        parts.append(f"today {_short_count(use['daily_tokens'])}/{_short_count(use['daily_limit'])} tokens")
+    else:
+        parts.append(f"today {_short_count(use['daily_tokens'])} tokens")
+    wait = ledger.wait_seconds(vendor, 1)
+    if wait > 0:
+        parts.append(f"window full, resets in {int(wait) + 1} s")
+    return " · ".join(parts)
 
 
 def heavy_pass_tokens(budget: int) -> int:
@@ -1109,7 +1058,16 @@ def run_generation(
     scroll_to_bottom(user_message_id)
     live_box = st.empty()
     started = time.perf_counter()
+    request_lock = get_task_request_lock()
     try:
+        wait = cortex_wait_seconds(ledger, messages, max_tokens)
+        if 0 < wait <= CHAT_MAX_WAIT_SECONDS:
+            # Paced like missions and the pipeline: a full free-tier window is a short wait, not an error.
+            with live_box.container():
+                st.info(f"Free-tier window is full; sending in {int(wait) + 1} s…")
+            time.sleep(wait + 0.5)
+            live_box.empty()
+        request_lock.acquire()
         if mode == "normal" and cortex_available():
             # Normal mode streams token-by-token from the MILP-selected endpoint.
             try:
@@ -1137,11 +1095,19 @@ def run_generation(
             )
     except Exception as exc:
         live_box.empty()
-        # Shown, not persisted: vendor error bodies must never be re-injected into later prompts.
+        # Shown in plain words; the raw vendor body stays in the session's provider events only.
         st.session_state.setdefault("provider_events", []).append(str(exc)[:600])
         log_route(workspace, task_type, "failed", mode, started, str(exc)[:160])
-        st.error(f"Generation failed: {exc}")
+        st.error(plain_error(exc))
+        with st.expander("Technical detail", expanded=False):
+            st.code(str(exc)[:600])
         return user_message_id
+    finally:
+        if request_lock.locked():
+            try:
+                request_lock.release()
+            except RuntimeError:
+                pass
     live_box.empty()
     answer = strip_reasoning_tags(answer)
     assistant_id = append_message(
@@ -1732,10 +1698,15 @@ with st.sidebar:
         st.session_state.byok_expanded = not configured_provider_names()
     with st.expander("🔑 API keys (BYOK, session only)", expanded=st.session_state.byok_expanded):
         st.caption(
-            "Paste free-tier keys here to use the studio like a normal user. They are scoped to "
-            "this browser session only, override environment variables, and are never written "
-            "to SQLite, logs, artifacts, or git."
+            "Paste one or more free-tier keys. Each key is sent only to its own vendor, lives in this browser "
+            "session's memory, and is never written to the vault, logs, artifacts, or git. Closing the tab forgets it."
         )
+        with st.expander("How to get a free key (2 minutes each)", expanded=False):
+            for vendor, url, steps in KEY_GUIDES:
+                st.markdown(f"**{vendor}** · [open the key page]({url})")
+                st.caption(" → ".join(steps))
+            st.caption("Free tiers are metered per minute and per day; the app waits for the window instead of failing, "
+                       "and 'Test keys' below confirms each key with one tiny call.")
         key_fields = (
             ("GEMINI_API_KEY", "Google AI Studio (Gemini)"),
             ("GROQ_API_KEY", "Groq Cloud"),
@@ -1784,7 +1755,24 @@ with st.sidebar:
             for row in probe_rows:
                 marker = "✅" if row["ok"] else ("⚪" if row["detail"] == "no key configured" else "❌")
                 status = f" · HTTP {row['status']}" if row["status"] else ""
-                st.caption(f"{marker} **{row['endpoint']}** · {row['model']} · key {row['key']}{status} · {row['detail']}")
+                detail = row["detail"] if row["ok"] or row["detail"] == "no key configured" else plain_error(RuntimeError(f"{row['endpoint']} HTTP {row['status']}: {row['detail']}" if row["status"] else f"{row['endpoint']} {row['detail']}"))
+                st.caption(f"{marker} **{row['endpoint']}** · {row['model']} · key {row['key']}{status} · {detail}")
+        with st.expander("Model overrides (optional, session only)", expanded=False):
+            st.caption("Leave blank to let discovery pick a live model per vendor. A blank field clears an override.")
+            with st.form("model_override_form", clear_on_submit=False):
+                chosen: Dict[str, str] = {}
+                for label, env_names in MODEL_OVERRIDE_FIELDS:
+                    chosen[label] = st.text_input(label, key=f"model_override_{env_names[0]}", placeholder="model id, e.g. from the vendor's model list")
+                if st.form_submit_button("Apply overrides", use_container_width=True):
+                    for label, env_names in MODEL_OVERRIDE_FIELDS:
+                        value = chosen[label].strip()
+                        for env_name in env_names:
+                            if value:
+                                st.session_state.byok_keys[env_name] = value
+                            else:
+                                st.session_state.byok_keys.pop(env_name, None)
+                    bind_session_keys(st.session_state.byok_keys)
+                    st.success("Model overrides applied for this session.")
     st.caption(
         f"Private scope `{st.session_state.project_scope}` · chats, artifacts, and jobs are visible only on this browser. "
         "Bookmark the URL to come back to them."
@@ -1865,6 +1853,8 @@ with st.sidebar:
         css_class = "status-ready" if configured else "status-off"
         st.markdown(f"<span class='{css_class}'>{marker}</span> **{label}**", unsafe_allow_html=True)
         st.caption(detail)
+        if configured:
+            st.caption(usage_sentence(ledger, vendor_for(name)))
     if not configured_provider_names():
         st.warning("No provider keys detected. Paste them in the API keys panel above or set environment variables; this app never stores them in SQLite.")
     st.divider()

@@ -64,8 +64,8 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 - **Private scope per visitor**: chats, artifacts, jobs, and the routing log are keyed by a scope id
   minted for each browser session and kept on the URL (`?scope=`); bookmark it to come back. Nothing
   is shared between visitors of the same deployment.
-- **Repository Work**: least-privilege GitHub OAuth skeleton, the local sandboxed patch pipeline, and a
-  discussion thread for the change.
+- **Repository Work**: the hub connector (list, pick, connect, run, push through the session-only token), the
+  sandboxed patch pipeline, and a discussion thread that sees the connected repository.
 - **Chat Bot**: long-form developer chat with file uploads injected as context.
 - **Normal Chat**: single-pass chat.
 
@@ -79,7 +79,7 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | SQLite vault: per-workspace threads, 200-message windows, texturize-then-archive, artifacts | Implemented |
 | Thread-health agent with vision-digest migration | Implemented |
 | Repository sandbox pipeline with AST + pytest repair loop | Implemented (local) |
-| GitHub OAuth handshake | Skeleton (read-only identity check) |
+| GitHub identity | The session-only push token's login, shown in the sidebar; no OAuth app |
 | 10-cloud connector fabric | Roadmap · local SQLite is the only store; stubs listed in the sidebar |
 | Background Git-Streamer | Roadmap · not implemented |
 | Live SDK Document Scraper | Roadmap · not implemented |
@@ -184,6 +184,19 @@ HTTP status, key fingerprint, and any auto-switch. Probes count toward the vendo
 - **Quota ledger**: one bucket per vendor credential; every HTTP attempt (retries, rediscovery,
   probes) counts toward RPM; tokens are charged on success. A visitor's ledger is keyed by a
   non-reversible fingerprint of their applied keys, so visitors never throttle each other.
+  **Daily caps**: conservative per-vendor tokens-per-day ceilings (`DAILY_CAPS` in
+  `orchestrator/config.py`, override with `CHAT_JOHNSON_DAILY_<VENDOR>`) are the hard stop behind
+  every budget; the sidebar shows this minute's and today's usage per keyed vendor.
+- **Chat pacing and plain errors**: chat sends wait for a free-tier window like missions do, and every
+  failure is explained in one plain sentence (key rejected, window full and when it resets, model
+  retired, server error) with the raw detail folded away.
+- **Keys made easy**: the API keys panel links each vendor's key page with three steps, states where a
+  key goes (only to its vendor, session memory only), and offers per-vendor model overrides for the session.
+- **Heavy Mode payload**: the review and synthesis passes receive the operator's request and the draft,
+  not the whole system prompt and history, so a Heavy send costs about a third of what it did.
+- **Repository safety**: a fetched repository's tests never run unless repair rounds are enabled; a red
+  repair loop leaves the sandbox uncommitted; fenced blocks that look like excerpts ("… rest unchanged",
+  one function out of many) are refused instead of overwriting a file.
 
 ### Paid reasoning slot (optional, session-only)
 
@@ -198,8 +211,8 @@ and Normal mode never uses it. Close the tab and it is gone.
   every session. Nothing paid is reachable by default.
 - **Never trust one model with a repo rewrite.** Goals are split into small typed steps; the patcher
   accepts only complete FILE blocks or unified diffs and rejects placeholders.
-- **Quota ledger counts RPM and TPM.** Cortex 2 only selects endpoints with headroom; 429s fall
-  through the ranked list.
+- **Quota ledger counts RPM, TPM, and tokens per day.** Cortex 2 only selects endpoints with headroom;
+  429s fall through the ranked list.
 - **Working tree is sacred.** Every edit lands in a `git worktree` sandbox; you get a verified diff.
 - **Guardrails before handoff.** `ast.parse()` on every changed file, then pytest, then the traceback
   goes back to a reasoning model.
