@@ -109,6 +109,16 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   around it, back to latest), and **skills** in `skills/*.md` (front matter with keywords) are loaded
   into the prompt only when their keywords appear in the message; the answer caption names the skills
   applied. Shipped: deploy-kit, repository-patching, mission-writing, company-reporting.
+- **Spatial layout and web QA (batch D)**: a spatial mission (room, floor plan, arrangement…) asks the
+  model for one fenced `scene` JSON block (room, objects with size, mass, anchor), then a
+  deterministic numpy solver resolves it (floor snap, wall clamp, pairwise push-out along the
+  least-penetration axis with the lighter box moving more, everything clamped inside the room) and
+  a self-contained canvas preview shows the result (drag to rotate, wheel to zoom; no external
+  script, same strict CSP as the sanitized canvas). The scene is locked as a JSON artifact. Mission
+  steps can now carry an `executor` (`solver`, `webqa`) that runs without a model call. Web QA:
+  `webcheck` missions and Repository Work → Deploy Kit → "Check a deployed URL" run an HTTP check
+  (status, latency, expected text, health JSON) and a browser check where Chromium exists (the VM
+  worker), reported as unavailable elsewhere.
 - **Private scope per visitor**: chats, artifacts, jobs, and the routing log are keyed by a scope id
   minted for each browser session and kept on the URL (`?scope=`); bookmark it to come back. Nothing
   is shared between visitors of the same deployment.

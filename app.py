@@ -111,6 +111,8 @@ from orchestrator.github_repo import GitHubRepoError, collect_changed_files, fet
 from orchestrator.render_text import hold_fences, prepare_markdown
 from orchestrator.repo_ingest import repo_prompt_context
 from orchestrator.skills import select_skills
+from orchestrator.spatial_preview import scene_preview_document
+from orchestrator.webqa import browser_available, browser_check, check_markdown, check_url
 from orchestrator.missions import (
     MAX_SECTIONS,
     MISSION_TEMPLATES,
@@ -835,6 +837,22 @@ def render_deploy_kit(project_scope: str) -> None:
             files = generate_kit(spec)
             kit = {"spec": spec, "files": files, "findings": validate_kit(files)}
             st.session_state.deploy_kit = kit
+        with st.container(border=True):
+            st.markdown("**Check a deployed URL** · HTTP status, latency, expected text, and the health JSON; a browser check where Chromium exists.")
+            u1, u2 = st.columns([0.6, 0.4])
+            check_target = u1.text_input("URL", key="webqa_url", placeholder="https://your-app.example/?health=1")
+            expect_text = u2.text_input("Expected text (optional)", key="webqa_text", placeholder="Chat Johnson Master Studio")
+            b1, b2 = st.columns(2)
+            if b1.button("HTTP check", key="webqa_http", use_container_width=True, disabled=not check_target.strip()):
+                st.session_state.webqa_result = (check_url(check_target.strip(), expect_text=expect_text.strip()), None)
+            if b2.button("Browser check", key="webqa_browser", use_container_width=True, disabled=not check_target.strip(), help="Runs Chromium through the page; available on the VM worker, reported as unavailable elsewhere."):
+                steps = [{"expect_text": expect_text.strip()}] if expect_text.strip() else []
+                st.session_state.webqa_result = (check_url(check_target.strip(), expect_text=expect_text.strip()), browser_check(check_target.strip(), steps))
+            if st.session_state.get("webqa_result"):
+                http_result, browser_result = st.session_state.webqa_result
+                st.markdown(check_markdown(http_result, browser_result))
+            elif not browser_available():
+                st.caption("No browser in this environment: HTTP checks only. The VM worker image includes Chromium.")
         if not kit:
             return
         spec, files, findings = kit["spec"], kit["files"], kit["findings"]
@@ -1553,6 +1571,21 @@ def render_launch_summary(job: Dict[str, Any], thread_id: int, dismissed: set) -
         filename, body = export_artifact(int(result["deliverable_artifact"]))
         st.download_button("⬇ Download deliverable (.md)", data=body, file_name=filename, mime="text/markdown",
                            key=f"deliverable_{thread_id}_{result['deliverable_artifact']}")
+    if result.get("scene_artifact"):
+        filename, body = export_artifact(int(result["scene_artifact"]))
+        try:
+            scene = json.loads(body)
+        except ValueError:
+            scene = None
+        if scene:
+            report = result.get("scene_report") or scene.get("report") or {}
+            st.info(f"Layout resolved by the solver: {report.get('objects', '?')} object(s), overlaps {report.get('overlaps_before', '?')} → {report.get('overlaps_after', '?')}. Drag to rotate, wheel to zoom.")
+            components.html(scene_preview_document(scene), height=440, scrolling=False)
+            st.session_state.scene_preview = scene
+            st.download_button("⬇ Download scene (.json)", data=body, file_name=filename, mime="application/json", key=f"scene_{thread_id}_{result['scene_artifact']}")
+    if result.get("webqa"):
+        http = result["webqa"].get("http", {})
+        (st.success if http.get("ok") else st.error)(f"Web QA: {http.get('url', '')} → status {http.get('status')} in {http.get('elapsed_ms')} ms" + (f" · {http['error']}" if http.get("error") else ""))
     if result.get("truncated"):
         st.caption(f"{result['truncated']} workstream(s) stopped at the output budget; raise it in the sidebar for fuller results.")
     for title, error in result.get("failures", []):
@@ -2359,8 +2392,11 @@ WORKSPACE_RENDERERS[workspace](scope, ledger, submission)
 
 st.divider()
 # One column: a side panel squeezed the chat to a sliver at iPad width. The canvas opens itself when markup arrives.
-with st.expander("Live preview canvas", expanded=bool(st.session_state.get("preview_source"))):
+with st.expander("Live preview canvas", expanded=bool(st.session_state.get("preview_source") or st.session_state.get("scene_preview"))):
     render_preview_panel()
+    if st.session_state.get("scene_preview"):
+        st.caption("Last resolved scene (from a spatial mission).")
+        components.html(scene_preview_document(st.session_state["scene_preview"]), height=440, scrolling=False)
 with st.expander("Routing log, Ops stats & last decision", expanded=False):
     render_routing_log()
     decision = st.session_state.get("last_decision")

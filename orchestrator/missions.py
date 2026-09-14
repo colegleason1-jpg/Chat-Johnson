@@ -15,7 +15,7 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-MISSION_TEMPLATES: Dict[str, Tuple[Tuple[str, ...], List[Tuple[str, str, str]]]] = {
+MISSION_TEMPLATES: Dict[str, Tuple[Tuple[str, ...], List[Tuple[str, ...]]]] = {  # (title, task_type, description[, executor])
     "writing": (
         ("write", "writing", "essay", "article", "blog", "post", "story", "speech", "letter", "chapter", "draft",
          "memo", "newsletter", "compose", "report", "whitepaper", "documentation", "readme", "guide", "tutorial"),
@@ -66,6 +66,24 @@ MISSION_TEMPLATES: Dict[str, Tuple[Tuple[str, ...], List[Tuple[str, str, str]]]]
             ("First week actions", "quick_text", "List the concrete actions for the first week for: {goal}"),
         ],
     ),
+    "spatial": (
+        ("room", "layout", "floor plan", "floorplan", "furniture", "arrange", "arrangement", "scene", "3d", "spatial",
+         "warehouse layout", "stage", "set design", "place objects", "seating"),
+        [
+            ("Scene spec", "reasoning", "Describe the intent and constraints, then emit exactly one fenced ```scene JSON block "
+                                        "(room width/depth/height in metres; objects with name, size [w, d, h], mass in kg, anchor floor|wall|free) for: {goal}"),
+            ("Resolve the layout", "quick_text", "Run the deterministic layout solver on the scene block above: floor snap, wall clamp, collision push-out.", "solver"),
+            ("Walkthrough", "chat", "Using the resolved positions above, write a short walkthrough of the space for: {goal}. Note anything the solver had to move and why."),
+        ],
+    ),
+    "webcheck": (
+        ("check the site", "is the site up", "site up", "smoke test", "verify the deployment", "deployed url", "check url", "check the url",
+         "health check", "uptime", "is it live"),
+        [
+            ("Check the URL", "quick_text", "HTTP check of the URL named in the goal (status, latency, expected text, health JSON), plus a browser check where one exists: {goal}", "webqa"),
+            ("Findings", "quick_text", "Summarise the check above in plain words: what is up, what failed, and the one next action for: {goal}"),
+        ],
+    ),
     "general": (
         (),
         [
@@ -79,7 +97,7 @@ MISSION_TEMPLATES: Dict[str, Tuple[Tuple[str, ...], List[Tuple[str, str, str]]]]
 
 # On a tie, an explicitly research-shaped request keeps research workstreams; everything else that
 # names a thing to write is a writing mission.
-_TIE_ORDER = ("research", "writing", "code", "analysis", "plan", "general")
+_TIE_ORDER = ("research", "webcheck", "spatial", "writing", "code", "analysis", "plan", "general")
 
 MAX_SECTIONS = 12
 DEFAULT_TARGET_WORDS = 800
@@ -188,8 +206,10 @@ def task_plan(goal: str, count: int, max_tokens: int = 2048) -> List[Dict[str, A
         return _writing_plan(goal, max(1, min(MAX_SECTIONS, int(count))), max_tokens)
     templates = MISSION_TEMPLATES[kind][1]
     bounded = max(1, min(int(count), len(templates)))
-    return [
-        {
+    plan = []
+    for index, template in enumerate(templates[:bounded]):
+        title, task_type, description = template[0], template[1], template[2]
+        step: Dict[str, Any] = {
             "id": index + 1,
             "title": title,
             "type": task_type,
@@ -197,8 +217,10 @@ def task_plan(goal: str, count: int, max_tokens: int = 2048) -> List[Dict[str, A
             "status": "queued",
             "kind": kind,
         }
-        for index, (title, task_type, description) in enumerate(templates[:bounded])
-    ]
+        if len(template) > 3:
+            step["executor"] = template[3]  # a deterministic step (solver, webqa) instead of a model call
+        plan.append(step)
+    return plan
 
 
 def deliverable_slug(goal: str) -> str:

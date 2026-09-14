@@ -295,3 +295,21 @@ def test_navigator_focus_shows_the_window_around_a_message(app):
     assert not app.exception
     shown = [m.value for m in app.markdown if m.value.startswith("turn ")]
     assert "turn 39" in shown and "focus_normal_chat" not in app.session_state
+
+
+def test_finished_spatial_mission_renders_the_scene_preview(app):
+    from orchestrator import spatial, vault
+    app.query_params["scope"] = "visitor-scene"
+    app.query_params["ws"] = "task_finder"
+    app.run()
+    thread = int(vault.active_thread("visitor-scene", "task_finder")["id"])
+    placed = spatial.solve_layout(spatial.parse_scene({"room": [5, 4, 3], "objects": [{"name": "desk", "size": [1.6, 0.8, 0.75]}]}))
+    artifact_id, _ = vault.save_artifact("visitor-scene", "scene-1.json", "missions/scene-1.json", spatial.scene_json(placed), "json")
+    job_id = vault.enqueue_job("visitor-scene", "mission", {"goal": "room layout"}, thread_id=thread)
+    vault.claim_job("t", ("mission",))
+    vault.finish_job(job_id, "done", {"thread_id": thread, "goal": "room layout", "steps": 3, "succeeded": 3, "failed": 0, "truncated": 0, "failures": [], "scene_artifact": artifact_id, "scene_report": placed.report})
+    app.run()
+    assert not app.exception
+    assert any("Layout resolved by the solver" in i.value for i in app.info)
+    assert any(b.label.startswith("⬇ Download scene") for b in app.button) or "scene_preview" in app.session_state
+    assert app.session_state["scene_preview"]["objects"][0]["name"] == "desk"

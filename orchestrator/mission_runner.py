@@ -14,7 +14,9 @@ from .errors import plain_error
 from .jobs import JobCancelled, JobContext, register_handler
 from .missions import assemble_deliverable, deliverable_slug, parse_length_target, text_measure
 from .prompting import build_prompt_messages
-from .router import PaidReasoningSlot, cortex_wait_seconds, generate_mode, strip_reasoning_tags
+from .router import PaidReasoningSlot, RouteDecision, cortex_wait_seconds, generate_mode, strip_reasoning_tags
+from .spatial import SceneError, parse_scene_block, scene_json, scene_markdown, solve_layout
+from .webqa import browser_available, browser_check, check_markdown, check_url, first_url
 
 KIND = "mission"
 WORKSPACE = "task_finder"
@@ -36,6 +38,34 @@ def _record(scope: str, task_type: str, route: str, mode: str, started: float, r
         pass
 
 
+def run_executor(executor: str, step: Dict[str, Any], goal: str, outputs: List[Tuple[str, str]], scope: str, thread_id: int, extras: Dict[str, Any]) -> Tuple[str, RouteDecision]:
+    """Deterministic steps: the layout solver and the web QA check. No model call, no quota."""
+    if executor == "solver":
+        spec = None
+        for _, text in reversed(outputs):
+            spec = parse_scene_block(text)
+            if spec is not None:
+                break
+        if spec is None:
+            raise SceneError("no ```scene block was produced by the earlier steps; ask for the scene spec again")
+        placed = solve_layout(spec)
+        body = scene_json(placed)
+        artifact_id, _ = vault.save_artifact(scope, f"scene-{thread_id}.json", f"missions/scene-{thread_id}.json", body, "json")
+        extras["scene_artifact"] = int(artifact_id)
+        extras["scene_report"] = placed.report
+        answer = scene_markdown(placed) + "\n\n```scene\n" + body + "\n```"
+        return answer, RouteDecision("local-executor", "solver", str(step.get("type") or "quick_text"), "deterministic layout solver")
+    if executor == "webqa":
+        url = first_url(str(step.get("description", ""))) or first_url(goal) or first_url("\n".join(t for _, t in outputs))
+        if not url:
+            raise ValueError("no http(s) URL found in the mission; name the URL to check")
+        result = check_url(url)
+        browser = browser_check(url, [{"expect_text": "Chat Johnson"}] if "health=1" not in url else []) if browser_available() else {"available": False, "error": "no browser here"}
+        extras["webqa"] = {"http": result, "browser": browser}
+        return check_markdown(result, browser), RouteDecision("local-executor", "webqa", str(step.get("type") or "quick_text"), "web QA check")
+    raise ValueError(f"unknown executor {executor!r}")
+
+
 def run_mission_job(ctx: JobContext) -> Dict[str, Any]:
     """Run the workstreams strictly in order; each one sees the results before it. Failures are recorded, never stored as answers."""
     payload = ctx.payload
@@ -50,6 +80,7 @@ def run_mission_job(ctx: JobContext) -> Dict[str, Any]:
     succeeded = failed = truncated = 0
     failures: List[Tuple[str, str]] = []
     outputs: List[Tuple[str, str]] = []
+    extras: Dict[str, Any] = {}
     ctx.progress(step=0, total=total, succeeded=0, failed=0, text="Starting workstreams…")
     for finished, step in enumerate(plan, start=1):
         ctx.check_cancel()
@@ -57,16 +88,20 @@ def run_mission_job(ctx: JobContext) -> Dict[str, Any]:
         step_type = str(step.get("type") or "quick_text")
         title = str(step.get("title") or f"Step {finished}")
         try:
-            # Built right before the call so this step sees every result before it.
-            messages = build_prompt_messages(scope, str(step.get("description", "")), workspace=WORKSPACE, thread_id=thread_id, max_tokens=budget)
-            wait = cortex_wait_seconds(ctx.ledger, messages, budget)
-            if 0 < wait <= MISSION_MAX_WAIT_SECONDS:
-                ctx.progress(text=f"Waiting {int(wait) + 1}s for a free-tier window before step {finished}…")
-                ctx.sleep(wait + 0.5)
-            # The lock covers selection, request, and ledger record, so a chat send cannot overspend the same key.
-            with ctx.request_lock:
-                answer, decision = generate_mode(mode, step_type, messages, ctx.ledger, max_tokens=budget, temperature=0.2, paid_slot=paid_slot)
-            answer = strip_reasoning_tags(answer)
+            executor = str(step.get("executor") or "")
+            if executor:
+                answer, decision = run_executor(executor, step, goal, outputs, scope, thread_id, extras)
+            else:
+                # Built right before the call so this step sees every result before it.
+                messages = build_prompt_messages(scope, str(step.get("description", "")), workspace=WORKSPACE, thread_id=thread_id, max_tokens=budget)
+                wait = cortex_wait_seconds(ctx.ledger, messages, budget)
+                if 0 < wait <= MISSION_MAX_WAIT_SECONDS:
+                    ctx.progress(text=f"Waiting {int(wait) + 1}s for a free-tier window before step {finished}…")
+                    ctx.sleep(wait + 0.5)
+                # The lock covers selection, request, and ledger record, so a chat send cannot overspend the same key.
+                with ctx.request_lock:
+                    answer, decision = generate_mode(mode, step_type, messages, ctx.ledger, max_tokens=budget, temperature=0.2, paid_slot=paid_slot)
+                answer = strip_reasoning_tags(answer)
             vault.append_message(scope, "user", f"[{title}] {step.get('description', '')}", mode=mode, thread_id=thread_id, workspace=WORKSPACE, task_type=step_type)
             vault.append_message(
                 scope, "assistant", answer, provider=f"{decision.provider}/{decision.model}",
@@ -89,7 +124,7 @@ def run_mission_job(ctx: JobContext) -> Dict[str, Any]:
         vault.set_thread_mission(thread_id, goal)
     summary: Dict[str, Any] = {
         "thread_id": thread_id, "goal": goal, "steps": total, "succeeded": succeeded, "failed": failed,
-        "truncated": truncated, "failures": failures,
+        "truncated": truncated, "failures": failures, **extras,
     }
     sections = [answer for title, answer in outputs if title.lower().startswith("draft section")]
     if plan and plan[0].get("kind") == "writing" and sections:

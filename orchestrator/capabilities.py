@@ -16,16 +16,17 @@ IMPLEMENTED: Tuple[Tuple[str, str], ...] = (
                     "(Gemini, Groq, Hugging Face; NVIDIA, OpenRouter, Cerebras, Mistral as fallback)"),
     ("Chat Bot", "developer chat with explicit file attachments; fenced file blocks can be locked as versioned artifacts"),
     ("Task Finder", "deterministic decomposition of a mission into typed workstreams run in order as a background job; "
-                    "results land in the chat as each finishes and the mission continues as a conversation"),
+                    "results land in the chat as each finishes"),
     ("Background jobs", "missions run on worker threads with progress, cancel, and questions to the operator; the UI stays usable"),
-    ("Repository Work", "sandboxed pipeline on a GitHub repository fetched through the API (public, or private with the armed session "
-                        "token) or a local path: ingest, plan, patch, optional pytest repair loop, reviewable diff and patch download; "
-                        "the result can be pushed as a branch plus pull request through the session-only slot; the repository "
-                        "conversation sees the fetched tree (file map and the highest-value files within the token budget) and "
-                        "says so when nothing is loaded"),
-    ("Memory", "SQLite vault with a private scope per visitor (kept on the URL): per-workspace chats, 200-message windows, "
-               "texturized summaries, vision digests, locked artifacts, Markdown/JSON transcript export"),
-    ("Heavy Mode", "draft, review, synthesis passes; an optional paid slot serves only the review pass and is armed per session"),
+    ("Repository Work", "sandboxed pipeline on a GitHub repository (fetched through the API) or a local path: ingest, plan, patch, "
+                        "optional pytest repair loop, reviewable diff; pushable as a branch plus pull request through the session-only "
+                        "slot; the repository conversation sees the fetched tree and says so when nothing is loaded"),
+    ("Spatial layout", "a spatial mission turns a scene spec into a solver-resolved layout (floor snap, wall clamp, "
+                       "mass-weighted push-out) with a 3D preview"),
+    ("Web QA", "HTTP checks of a deployed URL (status, latency, text, health JSON); browser checks where Chromium exists"),
+    ("Memory", "SQLite vault with a private scope per visitor: per-workspace chats, 200-message windows, texturized summaries, "
+               "vision digests, locked artifacts, transcript export"),
+    ("Heavy Mode", "draft, review, synthesis passes; an optional paid slot serves only the review pass, armed per session"),
     ("Live preview canvas", "sanitized rendering of HTML/CSS mockups"),
 )
 
