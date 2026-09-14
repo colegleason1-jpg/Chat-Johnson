@@ -84,3 +84,23 @@ def serialize_repo(root: str, token_budget: int = 600_000) -> Tuple[str, Dict[st
         consumed += len(block)
     text = header + "".join(parts)
     return text, {"file_count": len(files), "est_tokens": len(text) // 4}
+
+
+def repo_prompt_context(root: str, max_chars: int, label: str = "") -> Tuple[str, Dict[str, int]]:
+    """The tree as chat context under a character budget: file map first, then the highest-value files.
+
+    ``serialize_repo`` scores entry points and configs highest, so the map is always present and the
+    contents fill whatever budget remains; a truncated file is marked as such.
+    """
+    budget_chars = max(2_000, int(max_chars))
+    body, stats = serialize_repo(root, token_budget=max(500, budget_chars // 4))
+    header = (
+        f"REPOSITORY CONTEXT ({label or os.path.basename(os.path.abspath(root))}; {stats['file_count']} files; "
+        "file map first, then the highest-value files within budget; other files exist but are not shown)\n"
+    )
+    text = header + body
+    if len(text) > budget_chars:
+        text = text[: budget_chars - 20].rstrip() + "\n... [truncated]\n"
+    stats["chars"] = len(text)
+    stats["est_tokens"] = len(text) // 4
+    return text, stats

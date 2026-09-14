@@ -83,6 +83,7 @@ from orchestrator.router import (
     generate_mode,
     probe_all_endpoints,
     prompt_context_chars,
+    repository_context_chars,
     strip_reasoning_tags,
 )
 
@@ -97,6 +98,7 @@ from orchestrator.deploykit import CLOUDS, LANGUAGES, TARGETS, KitSpec, generate
 from orchestrator.github_auth import mint_state, verify_state
 from orchestrator.github_push import GitHubPushError, GitHubWriter, PushRecord, branch_name_for
 from orchestrator.github_repo import GitHubRepoError, collect_changed_files, fetch_tree
+from orchestrator.repo_ingest import repo_prompt_context
 from orchestrator.missions import (
     MAX_SECTIONS,
     MISSION_TEMPLATES,
@@ -528,8 +530,39 @@ def render_repository_work(project_scope: str, ledger: QuotaLedger, submission: 
     with directions_tab:
         render_repo_directions()
     st.divider()
+    context, note, loaded = repository_context(int(st.session_state.get("max_tokens", 2048)))
+    (st.caption if loaded else st.info)(note)
     render_history(project_scope, "Repository conversation", workspace="repository")
-    dispatch_chat(project_scope, "repository", submission, ledger)
+    dispatch_chat(project_scope, "repository", submission, ledger, context, [note] if loaded else ())
+
+
+NO_REPOSITORY_CONTEXT = (
+    "REPOSITORY CONTEXT: none loaded. You cannot reach GitHub or the operator's disk on your own. If asked about "
+    "a repository, say that nothing is loaded and point to the Work tab: Fetch repository (GitHub) or a local path."
+)
+
+
+def repository_context(max_tokens: int) -> Tuple[str, str, bool]:
+    """(context for the prompt, note for the operator, loaded?) for the repository conversation.
+
+    The fetched tree (or the local path) is serialized once per (path, sha, budget) and cached in the
+    session, so a send never re-walks the tree.
+    """
+    fetched: Optional[Dict[str, Any]] = st.session_state.get("repo_fetched")
+    path = str(fetched["path"]) if fetched else str(st.session_state.get("repo_path", "") or "").strip()
+    if not path or not os.path.isdir(path):
+        return NO_REPOSITORY_CONTEXT, "No repository loaded: fetch one in the Work tab (or give a local path). The chat cannot reach GitHub on its own.", False
+    label = f"{fetched['owner']}/{fetched['repo']}@{str(fetched['sha'])[:7]}" if fetched else os.path.basename(path.rstrip("/"))
+    budget = repository_context_chars(max_tokens)
+    key = (path, str(fetched["sha"]) if fetched else "", budget)
+    cache = st.session_state.setdefault("repo_context_cache", {})
+    if cache.get("key") != key:
+        text, stats = repo_prompt_context(path, budget, label)
+        cache.clear()
+        cache.update({"key": key, "text": text, "stats": stats})
+    stats = cache["stats"]
+    note = f"Repository in context: {label} · {stats['file_count']} files · ~{stats['est_tokens']} tokens of file map and top files go with every message here."
+    return str(cache["text"]), note, True
 
 
 def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
@@ -558,9 +591,12 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
         if fetched:
             st.success(
                 f"Fetched {fetched['owner']}/{fetched['repo']} @ {fetched['ref']} ({str(fetched['sha'])[:7]}) · "
-                f"{fetched['files']} file(s) · {int(fetched['size_bytes']) // 1024} KB in a temporary sandbox."
+                f"{fetched['files']} file(s) · {int(fetched['size_bytes']) // 1024} KB in a temporary sandbox. "
+                "The conversation below the tabs now sees it."
             )
             repo_path = str(fetched["path"])
+        elif owner_repo.strip():
+            st.caption(f"Press **Fetch repository** to load {owner_repo.strip()} into the sandbox and the conversation.")
     else:
         repo_path = st.text_input(
             "Repository path", value="", key="repo_path",
@@ -721,9 +757,10 @@ reviewable result. It never touches your default branch, never stores a token, a
 **Sequence for a GitHub repository**
 1. In the sidebar, open *GitHub push (session only)*: switch it on, enter `owner/repo`, paste a fine-grained token with Contents and Pull requests write access (read access is enough to fetch a private repository). Nothing is stored.
 2. *Work* → Source *GitHub repository* → **Fetch repository**. The tree is downloaded through the GitHub API at one commit into a temporary sandbox; the commit and file count are shown.
-3. Describe the change and press **Run sandboxed pipeline**. The pipeline ingests the tree within a token budget, plans typed steps, asks the routed model for complete file blocks or unified diffs, applies them in the sandbox, and validates Python syntax. Tick *Run the repository's tests* only when you accept that the repository's own test suite executes here.
-4. Review the diff and the changed-file list. **Download patch** gives you the unified diff; **Push … and open a pull request** creates one commit on a new branch off the fetched ref and opens the pull request.
-5. The GitHub tab lists the push; **Open revert PR** restores the touched paths.
+3. The conversation below the tabs now sees the repository (file map and the highest-value files within the token budget): ask it to inspect, explain, or plan. Changes are made by the pipeline, not by the chat.
+4. Describe the change and press **Run sandboxed pipeline**. The pipeline ingests the tree within a token budget, plans typed steps, asks the routed model for complete file blocks or unified diffs, applies them in the sandbox, and validates Python syntax. Tick *Run the repository's tests* only when you accept that the repository's own test suite executes here.
+5. Review the diff and the changed-file list. **Download patch** gives you the unified diff; **Push … and open a pull request** creates one commit on a new branch off the fetched ref and opens the pull request.
+6. The GitHub tab lists the push; **Open revert PR** restores the touched paths.
 
 **Local path** works the same on a self-hosted run: point at a repository on the machine that runs the app; a git worktree is used when possible.
 

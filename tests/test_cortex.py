@@ -954,3 +954,14 @@ def test_finish_reason_stop_and_filter(all_keys, monkeypatch):
         {"choices": [{"delta": {"content": "partial"}, "finish_reason": "content_filter"}]})))
     _, decision = cortex_generate("quick_text", [{"role": "user", "content": "x"}], max_tokens=16)
     assert decision.finish == "filtered"
+
+
+def test_repository_context_chars_follows_the_widest_keyed_window(monkeypatch):
+    for name in ("GEMINI_API_KEY", "GROQ_API_KEY", "HF_TOKEN", "HUGGINGFACE_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    assert router.repository_context_chars(2048) == 24_000
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    assert router.repository_context_chars(2048) == 4 * (8_000 - 2048 - 1_500)
+    assert router.repository_context_chars(8192) == router.REPOSITORY_CONTEXT_MIN_CHARS
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    assert router.repository_context_chars(2048) == router.REPOSITORY_CONTEXT_MAX_CHARS

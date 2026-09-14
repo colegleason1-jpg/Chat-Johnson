@@ -577,6 +577,27 @@ def prompt_context_chars(max_tokens: int) -> int:
     return max(MIN_CONTEXT_CHARS, min(DEFAULT_CONTEXT_CHARS, cap))
 
 
+REPOSITORY_CONTEXT_MIN_CHARS = 4_000
+REPOSITORY_CONTEXT_MAX_CHARS = 60_000
+REPOSITORY_CONTEXT_RESERVE_TOKENS = 1_500
+
+
+def repository_context_chars(max_tokens: int) -> int:
+    """Characters of repository context the widest keyed endpoint can take alongside the output budget.
+
+    The solver already steers an oversized request away from a narrow endpoint (Groq's 8k TPM), so
+    this follows the widest window rather than the narrowest; 24k when no endpoint is keyed.
+    """
+    widest = 0
+    for endpoint in CORTEX_ENDPOINTS.values():
+        if endpoint.tpm_limit is None or not _endpoint_key(endpoint):
+            continue
+        widest = max(widest, 4 * (int(endpoint.tpm_limit) - int(max_tokens) - REPOSITORY_CONTEXT_RESERVE_TOKENS))
+    if widest <= 0:
+        return DEFAULT_CONTEXT_CHARS if not any(_endpoint_key(e) for e in CORTEX_ENDPOINTS.values()) else REPOSITORY_CONTEXT_MIN_CHARS
+    return max(REPOSITORY_CONTEXT_MIN_CHARS, min(REPOSITORY_CONTEXT_MAX_CHARS, widest))
+
+
 def cortex_wait_seconds(ledger: Optional[QuotaLedger], messages: Sequence[Mapping[str, str]], max_tokens: int) -> float:
     """Seconds until some keyed Cortex endpoint has RPM/TPM headroom for this request; 0 when one has it now."""
     if ledger is None:

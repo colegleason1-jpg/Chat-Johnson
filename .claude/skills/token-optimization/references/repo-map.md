@@ -20,7 +20,7 @@ Consult this map instead of sweeping the tree. Read only the files named for the
 | `orchestrator/patches.py` | FILE-block / unified-diff parsing and safe application, changed_files | parse_file_blocks, parse_diff_blocks, apply_file_blocks, apply_unified_diffs, changed_files |
 | `orchestrator/decomposer.py` | LLM JSON step planner for the repository pipeline | decompose |
 | `orchestrator/test_loop.py` | pytest + traceback repair loop | run_pytest, repair_loop |
-| `orchestrator/repo_ingest.py` | token-budgeted repository serialization | walk_repo, serialize_repo |
+| `orchestrator/repo_ingest.py` | token-budgeted repository serialization | walk_repo, serialize_repo, repo_prompt_context |
 | `orchestrator/memory.py` | task memory JSON for the repository pipeline | StepRecord, TaskMemory |
 | `research/project_seth_phase3.py` | isolated Phase 3 research engine (no routing dependency) | ProjectSethConfig, TrajectoryResult, TrackSummary, PairedDelta, SweepAggregate, validate_config, confidence_interval_95, format_float, control_coefficient, drift, noise_gate, quintic_smootherstep, transition_fraction, transition_rate |
 | `cli.py` | status / chat / run commands | cmd_status, cmd_chat, cmd_run, main |

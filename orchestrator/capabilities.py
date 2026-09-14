@@ -19,7 +19,9 @@ IMPLEMENTED: Tuple[Tuple[str, str], ...] = (
                     "results stay in the chat and the mission continues as a conversation"),
     ("Repository Work", "sandboxed pipeline on a GitHub repository fetched through the API (public, or private with the armed session "
                         "token) or a local path: ingest, plan, patch, optional pytest repair loop, reviewable diff and patch download; "
-                        "the result can be pushed as a branch plus pull request through the session-only slot"),
+                        "the result can be pushed as a branch plus pull request through the session-only slot; the repository "
+                        "conversation sees the fetched tree (file map and the highest-value files within the token budget) and "
+                        "says so when nothing is loaded"),
     ("Memory", "SQLite vault per project: per-workspace chats, 200-message windows, texturized summaries, vision digests, "
                "locked artifacts, Markdown/JSON transcript export"),
     ("Heavy Mode", "draft, review, synthesis passes; an optional paid slot serves only the review pass and is armed per session"),

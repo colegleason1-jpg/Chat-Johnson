@@ -92,3 +92,12 @@ def test_repository_work_has_four_tabs_directions_and_a_working_fetch(app, monke
     next(b for b in app.button if b.label == "Fetch repository").click().run()
     assert not app.exception
     assert any("Fetched me/proj @ main (abc1234)" in s.value for s in app.success), [s.value for s in app.success]
+    captions = "\n".join(c.value for c in app.caption)
+    assert "Repository in context: me/proj@abc1234 · 2 files" in captions
+
+
+def test_repository_chat_says_when_nothing_is_loaded(app):
+    app.query_params["ws"] = "repository"
+    app.run()
+    assert not app.exception
+    assert any("No repository loaded" in i.value for i in app.info)
