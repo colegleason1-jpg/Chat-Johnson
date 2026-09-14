@@ -98,7 +98,6 @@ from orchestrator.deploykit import CLOUDS, LANGUAGES, TARGETS, KitSpec, generate
 from orchestrator.github_auth import mint_state, verify_state
 from orchestrator.github_push import GitHubPushError, GitHubWriter, PushRecord, branch_name_for
 from orchestrator.github_repo import GitHubRepoError, collect_changed_files, fetch_tree, list_repositories, looks_like_owner_repo
-from orchestrator.keyword_search import keyword_rank
 from orchestrator.repo_ingest import repo_prompt_context
 from orchestrator.missions import (
     MAX_SECTIONS,
@@ -245,11 +244,12 @@ def session_paid_slot() -> PaidReasoningSlot:
 
 
 def github_push_status() -> Dict[str, Any]:
-    """Armed only when the toggle is on and both the repository and a token were pasted this session."""
+    """Armed when the toggle is on and a token was pasted this session; the target is the connected repository."""
     enabled = bool(st.session_state.get("github_push_enabled", False))
-    repo = str(st.session_state.get("github_push_repo", "") or "").strip()
     token = str(st.session_state.get("github_push_token", "") or "").strip()
-    return {"enabled": enabled, "repo": repo, "armed": enabled and bool(repo) and bool(token)}
+    fetched = st.session_state.get("repo_fetched") or {}
+    repo = f"{fetched['owner']}/{fetched['repo']}" if fetched else ""
+    return {"enabled": enabled, "repo": repo, "armed": enabled and bool(token), "connected": bool(repo)}
 
 
 def provider_status_rows() -> List[Tuple[str, str, str, bool]]:
@@ -554,11 +554,10 @@ def repository_context(max_tokens: int) -> Tuple[str, str, bool]:
     if not path or not os.path.isdir(path):
         slot = github_push_status()
         hint = (
-            f"press Connect in the Work tab to load {slot['repo']}" if slot["armed"] and looks_like_owner_repo(slot["repo"])
-            else "the sidebar slot needs owner/name, then press Connect in the Work tab" if slot["armed"]
-            else "connect one in the Work tab (or give a local path)"
+            "pick one from your list in the Work tab and press Connect" if slot["armed"]
+            else "arm the GitHub token in the sidebar to pick from your repositories, or enter a public owner/name in the Work tab and press Connect"
         )
-        return NO_REPOSITORY_CONTEXT, f"No repository loaded: {hint}. Arming a key does not download anything; the chat cannot reach GitHub on its own.", False
+        return NO_REPOSITORY_CONTEXT, f"No repository connected: {hint}. The chat cannot reach GitHub on its own.", False
     label = f"{fetched['owner']}/{fetched['repo']}@{str(fetched['sha'])[:7]}" if fetched else os.path.basename(path.rstrip("/"))
     budget = repository_context_chars(max_tokens)
     key = (path, str(fetched["sha"]) if fetched else "", budget)
@@ -580,59 +579,52 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
     repo_path = ""
     if source == "GitHub repository":
         token = str(st.session_state.get("github_push_token", "")) if push_state["armed"] else ""
-        c1, c2 = st.columns([0.6, 0.4], gap="small")
-        owner_repo = c1.text_input("Repository (owner/name)", value=push_state["repo"], key="repo_fetch_repo", placeholder="owner/repo")
-        ref = c2.text_input("Branch, tag, or commit", value="", key="repo_fetch_ref", placeholder="default branch")
-        valid = looks_like_owner_repo(owner_repo)
-        if owner_repo.strip() and not valid:
-            st.warning("Enter the repository as owner/name (for example Chazzzer/Chat-Johnson); a user name alone is not a repository.")
-        if token:
-            # The token's repositories are listed once per session (one API call) and searched by keyword from then on.
-            if "repo_choices" not in st.session_state or st.button("Refresh the repository list", key="repo_list", help="One API call; newest activity first."):
-                try:
-                    st.session_state.repo_choices = list_repositories(token)
-                except GitHubRepoError as exc:
-                    st.session_state.repo_choices = []
-                    st.error(f"Could not list repositories: {exc}")
-            choices: List[str] = st.session_state.get("repo_choices", [])
-            if choices:
-                query = st.text_input("Find a repository", key="repo_search", placeholder="keywords, any order (e.g. chat johnson)")
-                matches = keyword_rank(query, choices, limit=25)
-                if matches:
-                    pick = st.selectbox(f"{len(matches)} of {len(choices)} repositories match", matches, key=f"repo_pick_{len(matches)}_{matches[0]}")
-                    if st.button(f"Use {pick} and connect it", key="repo_use_pick", type="primary"):
-                        st.session_state.pending_repo_choice = pick
-                        st.session_state.pending_fetch = pick
-                        st.rerun()
-                else:
-                    st.caption("No repository matches those keywords.")
-        else:
-            st.caption("Public repositories only until GitHub push is armed in the sidebar (then private ones too, and the token can list them).")
-        auto = st.session_state.pop("pending_fetch", None)
-        connect = st.button(
-            f"Connect {owner_repo.strip()} (download into the sandbox and the conversation)" if valid else "Connect repository",
-            key="repo_fetch", type="primary", disabled=not valid,
-        )
-        if connect or auto:
-            target = auto or owner_repo
-            try:
-                with st.spinner("Downloading the tree through the GitHub API…"):
-                    tree = fetch_tree(target, "" if auto else ref, token)
-                fetched = tree.as_dict()
-                st.session_state.repo_fetched = fetched
-                st.session_state.pop("repo_last_report", None)
-                st.session_state.pop("repo_context_cache", None)
-            except (GitHubRepoError, GitHubPushError) as exc:
-                st.error(f"Connect failed: {exc}")
         if fetched:
-            st.success(
+            c1, c2 = st.columns([0.8, 0.2], gap="small")
+            c1.success(
                 f"Connected {fetched['owner']}/{fetched['repo']} @ {fetched['ref']} ({str(fetched['sha'])[:7]}) · "
-                f"{fetched['files']} file(s) · {int(fetched['size_bytes']) // 1024} KB in a temporary sandbox. "
-                "The conversation below the tabs now sees it."
+                f"{fetched['files']} file(s) · {int(fetched['size_bytes']) // 1024} KB. The conversation below sees it; pushes go here."
             )
+            if c2.button("Disconnect", key="repo_disconnect", use_container_width=True):
+                for key in ("repo_fetched", "repo_context_cache", "repo_last_report"):
+                    st.session_state.pop(key, None)
+                st.rerun()
             repo_path = str(fetched["path"])
-        elif valid:
-            st.caption(f"Arming the sidebar slot only stores the name and token for pushes; press **Connect** to load {owner_repo.strip()}.")
+        else:
+            if token:
+                # The token's repositories are listed once per session (one API call); the picker filters as you type.
+                if "repo_choices" not in st.session_state:
+                    try:
+                        st.session_state.repo_choices = list_repositories(token)
+                    except GitHubRepoError as exc:
+                        st.session_state.repo_choices = []
+                        st.error(f"Could not list repositories: {exc}")
+                choices: List[str] = st.session_state.get("repo_choices", [])
+                if choices:
+                    pick = st.selectbox("Repository", choices, key="repo_pick", help="Type to filter. Newest activity first.")
+                else:
+                    pick = st.text_input("Repository (owner/name)", key="repo_manual", placeholder="owner/repo")
+                if st.button("Refresh list", key="repo_list"):
+                    st.session_state.pop("repo_choices", None)
+                    st.rerun()
+            else:
+                pick = st.text_input("Public repository (owner/name)", key="repo_manual", placeholder="owner/repo")
+                st.caption("Arm GitHub push in the sidebar to pick from your repositories and read private ones.")
+            with st.expander("Advanced: branch, tag, or commit", expanded=False):
+                ref = st.text_input("Ref", value="", key="repo_fetch_ref", placeholder="default branch")
+            valid = looks_like_owner_repo(pick)
+            if pick.strip() and not valid:
+                st.warning("Enter owner/name, for example colegleason1-jpg/Chat-Johnson.")
+            if st.button(f"Connect {pick.strip()}" if valid else "Connect", key="repo_fetch", type="primary", disabled=not valid):
+                try:
+                    with st.spinner("Downloading the tree through the GitHub API…"):
+                        tree = fetch_tree(pick, ref, token)
+                    st.session_state.repo_fetched = tree.as_dict()
+                    for key in ("repo_last_report", "repo_context_cache"):
+                        st.session_state.pop(key, None)
+                    st.rerun()
+                except (GitHubRepoError, GitHubPushError) as exc:
+                    st.error(f"Connect failed: {exc}")
     else:
         repo_path = st.text_input(
             "Repository path", value="", key="repo_path",
@@ -685,7 +677,7 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
         st.code(diff[:20_000], language="diff")
         st.download_button("⬇ Download patch (.diff)", data=diff, file_name="chat-johnson-change.diff", mime="text/x-diff", key="repo_patch_download")
         if last["source"] == "GitHub repository" and last.get("fetched") and pairs:
-            if push_state["armed"]:
+            if push_state["armed"] and push_state["connected"]:
                 base = str(last["fetched"]["ref"])
                 default_branch = f"chat-johnson/{deliverable_slug(last['goal'])}-{str(last['fetched']['sha'])[:7]}"
                 branch = st.text_input("Branch name", value=default_branch, key="repo_push_branch")
@@ -707,7 +699,7 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
                     except GitHubPushError as exc:
                         st.error(f"Push failed: {exc}")
             else:
-                st.caption("Arm **GitHub push (session only)** in the sidebar to push this change as a branch with a pull request.")
+                st.caption("Arm **GitHub push (session only)** in the sidebar (and keep the repository connected) to push this change as a branch with a pull request.")
     with st.expander("Execution memory", expanded=False):
         st.text(report.get("memory", "") or "(empty)")
 
@@ -715,10 +707,12 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
 def render_github_tab() -> None:
     state = github_push_status()
     st.markdown("**Session-only push slot**")
-    if state["armed"]:
+    if state["armed"] and state["connected"]:
         st.success(f"Armed for {state['repo']}: pushes create a new branch and a pull request; the default branch is never written.")
+    elif state["armed"]:
+        st.info("Token armed. Connect a repository in the Work tab; pushes go to the connected repository.")
     else:
-        st.caption("Disarmed. Arm it in the sidebar (toggle + repository + token) to fetch private repositories and to push results.")
+        st.caption("Disarmed. Arm it in the sidebar (toggle + token) to list and read private repositories and to push results.")
     render_push_ledger()
     st.divider()
     code = _query_value("code")
@@ -772,7 +766,7 @@ def render_push_ledger() -> None:
         st.caption(f"{label} · {record.owner}/{record.repo} · branch {record.branch} · PR #{record.pr_number} · {record.pr_url}")
         if record.kind == "push" and state["armed"] and st.button("Open revert PR", key=f"ledger_revert_{index}"):
             try:
-                reverted = GitHubWriter(str(st.session_state.get("github_push_token", "")), state["repo"]).open_revert(record)
+                reverted = GitHubWriter(str(st.session_state.get("github_push_token", "")), f"{record.owner}/{record.repo}").open_revert(record)
                 pushes.append(reverted)
                 st.success(f"Revert pull request #{reverted.pr_number}: {reverted.pr_url}")
                 st.rerun()
@@ -791,8 +785,8 @@ reviewable result. It never touches your default branch, never stores a token, a
 4. **Directions** · this page.
 
 **Sequence for a GitHub repository**
-1. In the sidebar, open *GitHub push (session only)*: switch it on, enter `owner/repo`, paste a fine-grained token with Contents and Pull requests write access (read access is enough to fetch a private repository). Nothing is stored.
-2. *Work* → Source *GitHub repository* → **Connect**. Arming the slot only stores the name and token; Connect downloads the tree through the GitHub API at one commit into a temporary sandbox (or press *List repositories this token can see* and pick one). The commit and file count are shown.
+1. In the sidebar, open *GitHub push (session only)*: switch it on and paste a fine-grained token with Contents and Pull requests write access (read access is enough to connect a private repository). Nothing is stored.
+2. *Work* → Source *GitHub repository*: your repositories are listed; pick one (type to filter) and press **Connect**. The tree is downloaded through the GitHub API at one commit into a temporary sandbox; the commit and file count are shown. Without a token, enter a public `owner/name` instead. Pushes go to the connected repository.
 3. The conversation below the tabs now sees the repository (file map and the highest-value files within the token budget): ask it to inspect, explain, or plan. Changes are made by the pipeline, not by the chat.
 4. Describe the change and press **Run sandboxed pipeline**. The pipeline ingests the tree within a token budget, plans typed steps, asks the routed model for complete file blocks or unified diffs, applies them in the sandbox, and validates Python syntax. Tick *Run the repository's tests* only when you accept that the repository's own test suite executes here.
 5. Review the diff and the changed-file list. **Download patch** gives you the unified diff; **Push … and open a pull request** creates one commit on a new branch off the fetched ref and opens the pull request.
@@ -886,8 +880,8 @@ def render_kit_push(spec: KitSpec, files: Sequence[Any]) -> None:
     state = github_push_status()
     pairs = [(item.path, item.body) for item in files]
     pushes: List[PushRecord] = st.session_state.setdefault("kit_pushes", [])
-    if not state["armed"]:
-        st.caption("To push this kit as a branch with a pull request, arm **GitHub push (session only)** in the sidebar.")
+    if not (state["armed"] and state["connected"]):
+        st.caption("To push this kit as a branch with a pull request, arm **GitHub push (session only)** in the sidebar and connect a repository in the Work tab.")
     else:
         st.markdown(f"**Push to {state['repo']}** · one commit on a new branch, then a pull request. Nothing touches the default branch.")
         branch = st.text_input("Branch name", value=branch_name_for(spec.app_name, pairs), key="kit_branch")
@@ -911,7 +905,7 @@ def render_kit_push(spec: KitSpec, files: Sequence[Any]) -> None:
         st.caption(f"{label} · {record.owner}/{record.repo} · branch {record.branch} · PR #{record.pr_number} · {record.pr_url}")
         if record.kind == "push" and state["armed"] and st.button("Open revert PR", key=f"kit_revert_{index}"):
             try:
-                reverted = GitHubWriter(str(st.session_state.get("github_push_token", "")), state["repo"]).open_revert(record)
+                reverted = GitHubWriter(str(st.session_state.get("github_push_token", "")), f"{record.owner}/{record.repo}").open_revert(record)
                 pushes.append(reverted)
                 st.success(f"Revert pull request #{reverted.pr_number}: {reverted.pr_url}")
                 st.rerun()
@@ -1669,11 +1663,6 @@ if _query_value("health") == "1":
     st.stop()
 
 ledger = get_quota_ledger()
-_chosen_repo = st.session_state.pop("pending_repo_choice", None)
-if _chosen_repo:
-    # A pick made in Repository Work lands in the slot and the fetch field before those widgets render.
-    st.session_state.github_push_repo = _chosen_repo
-    st.session_state.repo_fetch_repo = _chosen_repo
 with st.sidebar:
     st.markdown(f"<div class='eyebrow'>Chat Johnson · Gen 2 · build {build_marker()}</div>", unsafe_allow_html=True)
     st.title("Control deck")
@@ -1783,15 +1772,14 @@ with st.sidebar:
             "when you press the button in Repository Work. The default branch is never written to."
         )
         st.checkbox("Enable GitHub push for this session", key="github_push_enabled", value=False)
-        st.text_input("Repository (owner/name)", key="github_push_repo", placeholder="owner/repo")
-        if st.session_state.get("github_push_repo", "").strip() and not looks_like_owner_repo(st.session_state.get("github_push_repo", "")):
-            st.warning("That is not owner/name. Enter it like Chazzzer/Chat-Johnson, or pick from the list in Repository Work → Work.")
         st.text_input("GitHub token (session memory only)", key="github_push_token", type="password", value="")
         push_state = github_push_status()
-        if push_state["armed"]:
+        if push_state["armed"] and push_state["connected"]:
             st.warning(f"ARMED: pushes go to {push_state['repo']} as new branches with pull requests.")
+        elif push_state["armed"]:
+            st.info("Token armed. Pick and connect a repository in Repository Work → Work; pushes go there.")
         elif push_state["enabled"]:
-            st.info("Toggle is on but the repository or token is missing; the slot stays disarmed.")
+            st.info("Toggle is on but no token was pasted; the slot stays disarmed.")
         else:
             st.caption("Disarmed. Nothing can be written to GitHub.")
     st.divider()

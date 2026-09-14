@@ -41,20 +41,43 @@ def test_health_view_prints_json_and_stops(app):
     assert not app.sidebar.title  # the page stopped before the control deck rendered
 
 
-@pytest.mark.skipif(Version(st.__version__) < Version("1.40"), reason="AppTest before 1.40 cannot read a radio that uses format_func")
+SKIP_OLD = pytest.mark.skipif(Version(st.__version__) < Version("1.40"), reason="AppTest before 1.40 cannot read a radio that uses format_func")
+
+
+def fake_github_get(url, headers=None, stream=False, timeout=None, allow_redirects=True):
+    from tests.test_github_repo import FakeResponse, make_tarball
+    if "/user/repos" in url:
+        return FakeResponse(200, [{"full_name": "me/proj"}, {"full_name": "me/other"}])
+    if url.endswith("/repos/me/proj"):
+        return FakeResponse(200, {"default_branch": "main"})
+    if url.endswith("/commits/main"):
+        return FakeResponse(200, {"sha": "abc1234def5678"})
+    return FakeResponse(200, raw=make_tarball(evil=False))
+
+
+def arm_and_connect(app, monkeypatch):
+    from orchestrator import github_repo as gr
+    monkeypatch.setattr(gr.requests, "get", fake_github_get)
+    app.query_params["ws"] = "repository"
+    app.run()
+    app.checkbox(key="github_push_enabled").check().run()
+    app.text_input(key="github_push_token").input("ghp_secret_token_123").run()
+    assert any("Token armed" in i.value for i in app.info)
+    assert app.selectbox(key="repo_pick").value == "me/proj"  # listed automatically from the token
+    next(b for b in app.button if b.label == "Connect me/proj").click().run()
+    assert not app.exception
+    assert any("Connected me/proj @ main (abc1234)" in s.value for s in app.success), [s.value for s in app.success]
+
+
+@SKIP_OLD
 def test_armed_github_push_sends_the_kit_and_lists_the_pull_request(app, monkeypatch):
     from orchestrator import github_push as gp
     from tests.test_github_push import make_fake
 
     calls = []
     monkeypatch.setattr(gp.requests, "request", make_fake(calls, existing=()))
-    app.query_params["ws"] = "repository"
-    app.run()
-    assert not app.exception
-    assert app.session_state["workspace_select"] == "repository"
-    app.checkbox(key="github_push_enabled").check().run()
-    app.text_input(key="github_push_repo").input("me/proj").run()
-    app.text_input(key="github_push_token").input("ghp_secret_token_123").run()
+    arm_and_connect(app, monkeypatch)
+    assert app.session_state["repo_fetched"]["owner"] == "me"
     assert any("ARMED: pushes go to me/proj" in w.value for w in app.warning)
     generate = next(b for b in app.button if b.label == "Generate kit")
     generate.click().run()
@@ -69,69 +92,29 @@ def test_armed_github_push_sends_the_kit_and_lists_the_pull_request(app, monkeyp
     assert any(p.endswith("/pulls") for _, p, _ in calls)
 
 
-@pytest.mark.skipif(Version(st.__version__) < Version("1.40"), reason="AppTest before 1.40 cannot read a radio that uses format_func")
-def test_repository_work_has_four_tabs_directions_and_a_working_fetch(app, monkeypatch):
+@SKIP_OLD
+def test_repository_work_has_four_tabs_directions_and_a_public_connect(app, monkeypatch):
     from orchestrator import github_repo as gr
-    from tests.test_github_repo import FakeResponse, make_tarball
-
-    def fake_get(url, headers=None, stream=False, timeout=None, allow_redirects=True):
-        if url.endswith("/repos/me/proj"):
-            return FakeResponse(200, {"default_branch": "main"})
-        if url.endswith("/commits/main"):
-            return FakeResponse(200, {"sha": "abc1234def5678"})
-        return FakeResponse(200, raw=make_tarball(evil=False))
-
-    monkeypatch.setattr(gr.requests, "get", fake_get)
+    monkeypatch.setattr(gr.requests, "get", fake_github_get)
     app.query_params["ws"] = "repository"
     app.run()
     assert not app.exception
     assert len(app.tabs) >= 4  # Work, Deploy Kit, GitHub, Directions
     markdown = "\n".join(m.value for m in app.markdown)
-    assert "What never happens here" in markdown and "Connect repository" in [b.label for b in app.button]
-    app.text_input(key="repo_fetch_repo").input("me/proj").run()
-    next(b for b in app.button if b.label.startswith("Connect me/proj")).click().run()
+    assert "What never happens here" in markdown and "Connect" in [b.label for b in app.button]
+    assert any("No repository connected" in i.value for i in app.info)
+    app.text_input(key="repo_manual").input("me/proj").run()
+    next(b for b in app.button if b.label == "Connect me/proj").click().run()
     assert not app.exception
     assert any("Connected me/proj @ main (abc1234)" in s.value for s in app.success), [s.value for s in app.success]
     captions = "\n".join(c.value for c in app.caption)
     assert "Repository in context: me/proj@abc1234 · 2 files" in captions
 
 
-def test_repository_chat_says_when_nothing_is_loaded(app):
-    app.query_params["ws"] = "repository"
-    app.run()
+@SKIP_OLD
+def test_disconnect_clears_the_connection(app, monkeypatch):
+    arm_and_connect(app, monkeypatch)
+    next(b for b in app.button if b.label == "Disconnect").click().run()
     assert not app.exception
-    assert any("No repository loaded" in i.value for i in app.info)
-
-
-@pytest.mark.skipif(Version(st.__version__) < Version("1.40"), reason="AppTest before 1.40 cannot read a radio that uses format_func")
-def test_user_name_alone_is_flagged_and_the_token_can_list_repositories(app, monkeypatch):
-    from orchestrator import github_repo as gr
-    from tests.test_github_repo import FakeResponse, make_tarball
-
-    def fake_get(url, headers=None, stream=False, timeout=None, allow_redirects=True):
-        if "/user/repos" in url:
-            return FakeResponse(200, [{"full_name": "Chazzzer/Chat-Johnson"}])
-        if url.endswith("/repos/Chazzzer/Chat-Johnson"):
-            return FakeResponse(200, {"default_branch": "main"})
-        if url.endswith("/commits/main"):
-            return FakeResponse(200, {"sha": "feedface0000"})
-        return FakeResponse(200, raw=make_tarball(evil=False))
-
-    monkeypatch.setattr(gr.requests, "get", fake_get)
-    app.query_params["ws"] = "repository"
-    app.run()
-    app.checkbox(key="github_push_enabled").check().run()
-    app.text_input(key="github_push_repo").input("Chazzzer").run()
-    app.text_input(key="github_push_token").input("ghp_secret_token_123").run()
-    warnings = [w.value for w in app.warning]
-    assert any("not owner/name" in w for w in warnings), warnings
-    assert any("No repository loaded" in i.value and "owner/name" in i.value for i in app.info)
-    # the token's repositories were listed automatically; keyword search narrows them
-    app.text_input(key="repo_search").input("chat johnson").run()
-    picker = next(s for s in app.selectbox if "repositories match" in s.label)
-    assert picker.value == "Chazzzer/Chat-Johnson" and picker.label.startswith("1 of 1")
-    next(b for b in app.button if b.label.startswith("Use Chazzzer/Chat-Johnson")).click().run()
-    assert not app.exception
-    assert app.session_state["github_push_repo"] == "Chazzzer/Chat-Johnson"
-    assert any("Connected Chazzzer/Chat-Johnson @ main (feedfac" in s.value for s in app.success), [s.value for s in app.success]
-    assert any("Repository in context: Chazzzer/Chat-Johnson@feedfac" in c.value for c in app.caption)
+    assert "repo_fetched" not in app.session_state or not app.session_state["repo_fetched"]
+    assert any("No repository connected" in i.value for i in app.info)
