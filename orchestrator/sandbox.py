@@ -113,6 +113,28 @@ def cleanup_worktree(repo_path: str, sandbox_path: str) -> None:
         shutil.rmtree(sandbox_path, ignore_errors=True)
 
 
+def prune_staging(staging_root: str, max_age_seconds: int = 2 * 3600) -> int:
+    """Remove sandboxes older than ``max_age_seconds``; returns how many were removed.
+
+    A finished run keeps its sandbox so the push flow can read the changed files; this sweep
+    (run start and job-runner start) is what reclaims the disk. Worktree registrations of a git
+    source repository are left to ``git worktree prune``.
+    """
+    if not os.path.isdir(staging_root):
+        return 0
+    removed = 0
+    now = time.time()
+    for name in os.listdir(staging_root):
+        path = os.path.join(staging_root, name)
+        try:
+            if os.path.isdir(path) and now - os.path.getmtime(path) > max_age_seconds:
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def validate_python_files(root: str, changed: Optional[List[str]] = None) -> List[str]:
     """ast.parse guardrail. Returns list of human-readable errors (empty = OK)."""
     errors: List[str] = []

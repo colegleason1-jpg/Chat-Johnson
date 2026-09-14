@@ -21,6 +21,7 @@ import platform
 import sqlite3
 import os
 import re
+import secrets as _secrets
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -68,7 +69,11 @@ except ImportError as _import_error:  # pragma: no cover - only reachable on a b
 
 from orchestrator.config import PROVIDERS, bind_session_keys, get_settings, provider_model, resolve_secret
 from orchestrator.executor import Orchestrator
+from orchestrator import mission_runner  # noqa: F401  (registers the mission job handler)
+from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner
+from orchestrator.prompting import build_prompt_messages as _build_prompt_messages
 from orchestrator.quota import QuotaLedger
+from orchestrator.quota_registry import get_quota_ledger, get_request_lock
 from orchestrator.router import (
     CORTEX_ENDPOINTS,
     TASK_TYPES,
@@ -78,11 +83,9 @@ from orchestrator.router import (
     byok_status,
     classify,
     cortex_available,
-    cortex_wait_seconds,
     endpoint_model,
     generate_mode,
     probe_all_endpoints,
-    prompt_context_chars,
     repository_context_chars,
     strip_reasoning_tags,
 )
@@ -92,7 +95,6 @@ from orchestrator.router import (
 # Local source of truth (orchestrator/vault.py)
 # =============================================================================
 
-from orchestrator.capabilities import capability_card
 from orchestrator.connectors import ROADMAP_FEATURES, connector_status
 from orchestrator.deploykit import CLOUDS, LANGUAGES, TARGETS, KitSpec, generate_kit, kit_zip, summarize, validate_kit
 from orchestrator.github_auth import mint_state, verify_state
@@ -102,25 +104,25 @@ from orchestrator.repo_ingest import repo_prompt_context
 from orchestrator.missions import (
     MAX_SECTIONS,
     MISSION_TEMPLATES,
-    assemble_deliverable,
     classify_mission,
     deliverable_slug,
     mission_hints,
     parse_length_target,
     task_plan,
-    text_measure,
     writing_sections,
 )
 from orchestrator.preview import extract_preview_source, safe_preview_document
 from orchestrator.vault import (
+    answer_job,
+    job_view,
+    list_jobs,
+    request_cancel,
     MESSAGE_WINDOW,
     WORKSPACES as VAULT_WORKSPACES,
     active_thread,
-    alternating_turns,
     append_message,
     archived_messages,
     clear_thread,
-    context_parts,
     delete_thread,
     create_thread,
     export_artifact,
@@ -138,62 +140,23 @@ from orchestrator.vault import (
     rename_thread,
     save_artifact,
     search_artifacts,
-    set_thread_mission,
     switch_thread,
     thread_health,
     thread_transcript,
 )
 
 initialize_database()
+# Background workers start once per process (CHAT_JOHNSON_JOB_WORKERS=0 keeps them idle, as the tests do).
+get_runner()
 
 
 # =============================================================================
 # Provider/runtime helpers
 # =============================================================================
 
-@st.cache_resource
-def _ledger_registry() -> Dict[str, Tuple[QuotaLedger, threading.Lock]]:
-    """Process-wide registry of ledgers, one per distinct credential set."""
-    return {}
-
-
-def credential_fingerprint() -> str:
-    """Non-reversible id of the keys in effect for this session (overlay + environment)."""
-    from orchestrator.config import resolve_secret as _resolve
-    from orchestrator.router import BYOK_ENV_KEYS
-
-    material = "|".join(
-        f"{env}:{hashlib.sha256(_resolve(env).encode()).hexdigest()[:16]}"
-        for names in BYOK_ENV_KEYS.values() for env in names if _resolve(env)
-    )
-    return hashlib.sha256(material.encode()).hexdigest()[:16] if material else "no-keys"
-
-
-def get_quota_ledger() -> QuotaLedger:
-    """The ledger for THIS visitor's keys. Two visitors with different keys never share a bucket.
-
-    Buckets are keyed by vendor (one credential = one bucket) and start from
-    the legacy registry's ceilings; Cortex tightens them to its stricter policy.
-    """
-    registry = _ledger_registry()
-    fingerprint = credential_fingerprint()
-    if fingerprint not in registry:
-        from orchestrator.discovery import vendor_for
-
-        limits: Dict[str, Tuple[int, int]] = {}
-        for name, cfg in PROVIDERS.items():
-            vendor = vendor_for(name)
-            rpm, tpm = limits.get(vendor, (cfg.rpm_limit, cfg.tpm_limit))
-            limits[vendor] = (min(rpm, cfg.rpm_limit), min(tpm, cfg.tpm_limit))
-        registry[fingerprint] = (QuotaLedger(limits), threading.Lock())
-    return registry[fingerprint][0]
-
-
 def get_task_request_lock() -> threading.Lock:
-    """Serialize Task Finder provider calls for this visitor's keys around quota check + record."""
-    registry = _ledger_registry()
-    get_quota_ledger()
-    return registry[credential_fingerprint()][1]
+    """Serialize provider calls for this visitor's keys around quota check + record; background jobs share it."""
+    return get_request_lock()
 
 
 @st.cache_resource
@@ -292,39 +255,18 @@ def provider_status_rows() -> List[Tuple[str, str, str, bool]]:
     return rows
 
 
-SYSTEM_PERSONA = (
-    "You are Chat Johnson, a careful software and strategy assistant. "
-    "Return useful, complete output, state uncertainty, and never claim "
-    "that generated code is flawless or that a scientific simulation proves "
-    "physical propulsion. Do not reveal private chain-of-thought."
-)
-
-
 def build_prompt_messages(
     project_scope: str,
     user_prompt: str,
     injected_context: str = "",
     workspace: Optional[str] = None,
+    thread_id: Optional[int] = None,
 ) -> List[Dict[str, str]]:
-    """System prompt (persona, capability card, compressed memory) followed by the live window as real turns.
-
-    Earlier turns go in as user/assistant messages rather than a text dump, so the model treats
-    them as conversation instead of imitating a transcript format.
-    """
-    # Sized so the request fits every keyed endpoint's TPM ceiling at the current output budget.
-    context_chars = prompt_context_chars(int(st.session_state.get("max_tokens", 2048)))
-    parts = context_parts(project_scope, max_characters=context_chars, workspace=workspace)
-    request = user_prompt.strip()
-    if injected_context.strip():
-        request = "USER-CONSENTED FILE INJECTIONS:\n" + injected_context + "\n\nCURRENT REQUEST:\n" + request  # budgeted per file
-    leading, turns = alternating_turns(parts["turns"], request)
-    memory = parts["memory"]
-    if leading:
-        memory = (memory + "\n" if memory else "") + "[EARLIER ASSISTANT REPLY]\n" + leading
-    system = f"{SYSTEM_PERSONA}\n\n{capability_card()}\n\nACTIVE PROJECT: {project_scope}"
-    if memory:
-        system += "\n\nPROJECT MEMORY (compressed earlier history, for reference only; never imitate its format):\n" + memory
-    return [{"role": "system", "content": system}, *turns]
+    """The shared prompt builder with this session's output budget."""
+    return _build_prompt_messages(
+        project_scope, user_prompt, injected_context, workspace=workspace, thread_id=thread_id,
+        max_tokens=int(st.session_state.get("max_tokens", 2048)),
+    )
 
 
 DIGEST_REFINE_PROMPT = (
@@ -475,6 +417,26 @@ def _query_value(name: str) -> str:
     except AttributeError:
         values = st.experimental_get_query_params()
         return str(values.get(name, [""])[0])
+
+
+SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def resolve_visitor_scope() -> str:
+    """A private scope per browser session: ``?scope=`` on the URL wins, else a fresh visitor id is minted."""
+    requested = _query_value("scope").strip()
+    if requested and SCOPE_RE.match(requested):
+        return requested
+    return f"visitor-{_secrets.token_hex(6)}"
+
+
+def remember_scope(scope: str) -> None:
+    """Keep the scope on the URL so a reload (and a bookmark) returns to the same chats."""
+    try:
+        if st.query_params.get("scope") != scope:
+            st.query_params["scope"] = scope
+    except Exception:  # very old Streamlit builds keep it in session state only
+        pass
 
 
 def github_oauth_url() -> str:
@@ -1034,7 +996,7 @@ CHAT_INPUT_ACCEPTS_FILES = "accept_file" in inspect.signature(st.chat_input).par
 INJECTION_BUDGET_CHARS = 120_000
 ROUTING_LOG_LIMIT = 40
 MISSION_PREFIX = "MISSION: "
-MISSION_MAX_WAIT_SECONDS = 65  # one free-tier window; longer waits surface as a failed step instead
+JOB_LABELS = {"mission": "Mission"}
 
 
 def heavy_pass_tokens(budget: int) -> int:
@@ -1291,7 +1253,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
     if clear.button("Clear chat", key=f"clear_thread_{workspace}", use_container_width=True,
                     help="Empty this chat. The messages move to the archive and leave the context; keys are untouched."):
         moved = clear_thread(int(current["id"]))
-        for bucket in ("pending_missions", "task_launches"):
+        for bucket in ("pending_missions",):
             st.session_state.get(bucket, {}).pop(int(current["id"]), None)
         st.session_state[f"notice_{workspace}"] = f"Chat cleared: {moved} message(s) archived and out of context."
         st.rerun()
@@ -1346,7 +1308,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
         yes, no = st.columns(2, gap="small")
         if yes.button("Yes, delete this chat", type="primary", key=f"delete_yes_{workspace}", use_container_width=True):
             counts = delete_thread(int(current["id"]))
-            for bucket in ("pending_missions", "task_launches"):
+            for bucket in ("pending_missions",):
                 st.session_state.get(bucket, {}).pop(int(current["id"]), None)
             st.session_state.pop(f"confirm_delete_{workspace}", None)
             st.session_state[f"notice_{workspace}"] = (
@@ -1471,82 +1433,102 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger, submission: Optiona
     dispatch_chat(project_scope, "chat_bot", submission, ledger, injected, injection_notes)
 
 
-def execute_mission(
-    project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, plan: Sequence[Dict[str, Any]]
-) -> Dict[str, Any]:
-    """Run the workstreams strictly in order; each one sees the results before it. Failures are shown, never stored."""
+def launch_mission(project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, plan: Sequence[Dict[str, Any]]) -> int:
+    """Queue the mission as a background job; the chat shows each result as it lands and the bar stays free."""
     migration = health_sweep(project_scope, ledger, workspace="task_finder")
     if migration:
         st.info(f"Thread health agent migrated to optimized chat #{migration['new_thread_id']} before launching.")
         thread_id = int(migration["new_thread_id"])
     task_mode = active_mode()
-    append_message(project_scope, "user", f"{MISSION_PREFIX}{goal}", mode=task_mode, workspace="task_finder", task_type="plan")
-    progress = st.progress(0.0, text="Starting workstreams…")
-    request_lock = get_task_request_lock()
-    token_budget = int(st.session_state.get("max_tokens", 2048))
-    paid_slot = session_paid_slot() if task_mode == "heavy" else None
-    succeeded = failed = truncated = 0
-    failures: List[Tuple[str, str]] = []
-    outputs: List[Tuple[str, str]] = []
-    for finished, step in enumerate(plan, start=1):
-        started = time.perf_counter()
-        step_type = str(step["type"])
-        try:
-            # The prompt is built right before the call so this step sees every result before it.
-            messages = build_prompt_messages(project_scope, str(step["description"]), workspace="task_finder")
-            wait = cortex_wait_seconds(ledger, messages, token_budget)
-            if 0 < wait <= MISSION_MAX_WAIT_SECONDS:
-                # Free-tier RPM windows (Gemini: 2 per minute) are paced, not tripped.
-                progress.progress((finished - 1) / len(plan), text=f"Waiting {int(wait) + 1}s for a free-tier window before step {finished}…")
-                time.sleep(wait + 0.5)
-            # The lock covers the full selection/request/ledger-record cycle so a
-            # concurrent send from another tab cannot overspend one free-tier key.
-            with request_lock:
-                answer, decision = generate_mode(
-                    task_mode, step_type, messages, ledger,
-                    max_tokens=token_budget, temperature=0.2, paid_slot=paid_slot,
-                )
-            answer = strip_reasoning_tags(answer)
-            append_message(
-                project_scope, "user", f"[{step['title']}] {step['description']}",
-                mode=task_mode, workspace="task_finder", task_type=step_type,
-            )
-            append_message(
-                project_scope, "assistant", answer, provider=f"{decision.provider}/{decision.model}",
-                mode=task_mode, workspace="task_finder", task_type=step_type,
-            )
-            log_route("task_finder", step_type, f"{decision.provider}/{decision.model}", task_mode, started, decision.reason, decision.finish)
-            st.session_state.last_decision = decision
-            outputs.append((str(step["title"]), answer))
-            succeeded += 1
-            truncated += int(decision.finish == "length")
-        except Exception as exc:
-            failed += 1
-            failures.append((str(step["title"]), str(exc)[:600]))
-            log_route("task_finder", step_type, "failed", task_mode, started, str(exc)[:160])
-        progress.progress(finished / len(plan), text=f"{succeeded} succeeded · {failed} failed · {finished}/{len(plan)} done")
-    if succeeded:
-        # Pinned only once there is something to continue from; an all-failed launch leaves the next message free to be a new mission.
-        set_thread_mission(thread_id, goal)
-    summary: Dict[str, Any] = {
-        "thread_id": thread_id, "goal": goal, "steps": len(plan), "succeeded": succeeded, "failed": failed,
-        "truncated": truncated, "failures": failures,
+    append_message(project_scope, "user", f"{MISSION_PREFIX}{goal}", mode=task_mode, thread_id=thread_id, workspace="task_finder", task_type="plan")
+    payload = {
+        "goal": goal, "plan": [dict(step) for step in plan], "mode": task_mode,
+        "max_tokens": int(st.session_state.get("max_tokens", 2048)),
+        "paid_model": str(st.session_state.get("paid_slot_model", "") or ""),
+        "paid_enabled": bool(st.session_state.get("paid_slot_enabled", False)),
     }
-    sections = [answer for title, answer in outputs if title.lower().startswith("draft section")]
-    if plan and plan[0].get("kind") == "writing" and sections:
-        # The deliverable is assembled deterministically and locked; the chat keeps the per-section record.
-        deliverable = assemble_deliverable(goal, sections)
-        slug = deliverable_slug(goal)
-        artifact_id, version = save_artifact(
-            project_scope, f"mission-{thread_id}-{slug}.md", f"missions/mission-{thread_id}-{slug}.md", deliverable, "markdown"
+    # Keys go to the runner's in-memory stash for this job only; the row never holds them.
+    job_secrets = dict(st.session_state.get("byok_keys", {}) or {})
+    if task_mode == "heavy" and st.session_state.get("paid_slot_key"):
+        job_secrets["paid_slot_key"] = str(st.session_state.get("paid_slot_key"))
+    return enqueue_job(project_scope, mission_runner.KIND, payload, job_secrets, thread_id=thread_id)
+
+
+def render_jobs_strip(project_scope: str) -> None:
+    """Background jobs for this scope: progress, Cancel, and the answer box when one is waiting on the operator.
+
+    Polls every two seconds while something is queued, running, or waiting; a full rerun follows
+    each step so the chat underneath shows the new messages.
+    """
+    if not list_jobs(project_scope, ACTIVE_STATUSES, limit=1):
+        st.session_state.pop("jobs_seen", None)
+        return
+
+    def body() -> None:
+        jobs = [job_view(row) for row in list_jobs(project_scope, ACTIVE_STATUSES, limit=6)]
+        snapshot = [(job["id"], job["status"], job["progress"].get("step")) for job in jobs]
+        seen = st.session_state.get("jobs_seen")
+        st.session_state.jobs_seen = snapshot
+        if seen is not None and snapshot != seen:
+            st.rerun(scope="app")
+        for job in jobs:
+            progress = job["progress"]
+            total = int(progress.get("total") or 0)
+            step = int(progress.get("step") or 0)
+            with st.container(border=True):
+                head, tail = st.columns([0.8, 0.2], gap="small")
+                head.markdown(f"**{JOB_LABELS.get(job['kind'], job['kind'].title())} #{job['id']}** · {job['status'].replace('_', ' ')}")
+                if tail.button("Cancel", key=f"cancel_job_{job['id']}", use_container_width=True, disabled=job["cancel_requested"]):
+                    request_cancel(job["id"])
+                st.progress(min(1.0, step / total) if total else 0.0, text=str(progress.get("text") or job["status"]))
+                if job["status"] == "waiting_input":
+                    st.info(job["question"])
+                    answer = st.text_input("Your answer", key=f"job_answer_{job['id']}")
+                    if st.button("Send answer", key=f"job_answer_btn_{job['id']}") and answer.strip():
+                        answer_job(job["id"], answer.strip())
+
+    fragment = getattr(st, "fragment", None)
+    if fragment is not None:
+        fragment(run_every=2)(body)()
+    else:
+        body()
+
+
+def render_launch_summary(job: Dict[str, Any], thread_id: int, dismissed: set) -> None:
+    """What a finished mission produced, read from its job row."""
+    result = job["result"]
+    if job["status"] == "cancelled":
+        st.warning("Mission cancelled; the workstreams that finished are above and in this chat's memory.")
+    elif job["status"] == "failed" or "succeeded" not in result:
+        st.error(f"Mission failed: {result.get('error', 'unknown error')}")
+    elif result["failed"] == 0:
+        st.success(
+            f"All {result['succeeded']} workstream(s) finished; the results are above and in this chat's memory. "
+            "Continue the mission in the chat bar."
         )
-        target = parse_length_target(goal)
-        summary.update({
-            "deliverable_artifact": int(artifact_id), "deliverable_version": int(version), "sections": len(sections),
-            "measure": text_measure(deliverable), "target_words": target["words"] if target else None,
-            "target_label": f"{target['amount']} {target['unit']}(s)" if target else "",
-        })
-    return summary
+    elif result["succeeded"] == 0:
+        st.error(f"All {result['failed']} workstream(s) failed. Each error is below; fix keys or adjust the mission and send it again.")
+    else:
+        st.warning(f"{result['succeeded']} workstream(s) succeeded, {result['failed']} failed. The failed steps are below.")
+    if result.get("deliverable_artifact"):
+        measure = result.get("measure", {})
+        target_note = f" against a target of {result['target_label']} (≈{result['target_words']} words)" if result.get("target_words") else ""
+        st.info(
+            f"Deliverable assembled from {result['sections']} section(s): {measure.get('lines', 0)} lines, "
+            f"{measure.get('words', 0)} words{target_note}. Locked as artifact v{result['deliverable_version']}; "
+            "it is also under Locked artifacts in the sidebar."
+        )
+        filename, body = export_artifact(int(result["deliverable_artifact"]))
+        st.download_button("⬇ Download deliverable (.md)", data=body, file_name=filename, mime="text/markdown",
+                           key=f"deliverable_{thread_id}_{result['deliverable_artifact']}")
+    if result.get("truncated"):
+        st.caption(f"{result['truncated']} workstream(s) stopped at the output budget; raise it in the sidebar for fuller results.")
+    for title, error in result.get("failures", []):
+        with st.expander(f"{title} · failed", expanded=False):
+            st.code(error)
+    if st.button("Dismiss", key=f"dismiss_launch_{job['id']}"):
+        dismissed.add(job["id"])
+        st.rerun()
 
 
 def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, pending: Dict[int, str]) -> None:
@@ -1608,8 +1590,7 @@ def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int
             disabled=not configured_provider_names(),
             help="Runs the workstreams strictly in order, each one seeing the results before it; results are saved to this chat.",
         ):
-            summary = execute_mission(project_scope, ledger, thread_id, goal, plan)
-            st.session_state.setdefault("task_launches", {})[int(summary["thread_id"])] = summary
+            launch_mission(project_scope, ledger, thread_id, goal, plan)
             pending.pop(thread_id, None)
             st.rerun()
         if discard_col.button("Discard", key=f"discard_{thread_id}", use_container_width=True):
@@ -1631,50 +1612,29 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
     if mission:
         st.caption(f"Mission · {mission[:240]}")
     pending: Dict[int, str] = st.session_state.setdefault("pending_missions", {})
+    job_rows = list_jobs(project_scope, None, limit=1, thread_id=thread_id, kind=mission_runner.KIND)
+    job = job_view(job_rows[0]) if job_rows else None
+    running = bool(job and job["status"] in ACTIVE_STATUSES)
     continuing: Optional[ChatSubmission] = None
     if submission and submission.text.strip():
-        if has_mission:
+        if running:
+            st.warning("A mission is running in this chat; wait for it to finish or cancel it above, then send again.")
+        elif has_mission:
             continuing = submission
         else:
             pending[thread_id] = submission.text.strip()
     render_history(project_scope, "Mission conversation", workspace="task_finder")
     if continuing:
         dispatch_chat(project_scope, "task_finder", continuing, ledger)
-    launches: Dict[int, Dict[str, Any]] = st.session_state.setdefault("task_launches", {})
-    launch = launches.get(thread_id)
-    if launch:
-        if launch["failed"] == 0:
-            st.success(
-                f"All {launch['succeeded']} workstream(s) finished; the results are above and in this chat's memory. "
-                "Continue the mission in the chat bar."
-            )
-        elif launch["succeeded"] == 0:
-            st.error(f"All {launch['failed']} workstream(s) failed. Each error is below; fix keys or adjust the mission and send it again.")
-        else:
-            st.warning(f"{launch['succeeded']} workstream(s) succeeded, {launch['failed']} failed. The failed steps are below.")
-        if launch.get("deliverable_artifact"):
-            measure = launch.get("measure", {})
-            target_note = f" against a target of {launch['target_label']} (≈{launch['target_words']} words)" if launch.get("target_words") else ""
-            st.info(
-                f"Deliverable assembled from {launch['sections']} section(s): {measure.get('lines', 0)} lines, "
-                f"{measure.get('words', 0)} words{target_note}. Locked as artifact v{launch['deliverable_version']}; "
-                "it is also under Locked artifacts in the sidebar."
-            )
-            filename, body = export_artifact(int(launch["deliverable_artifact"]))
-            st.download_button("⬇ Download deliverable (.md)", data=body, file_name=filename, mime="text/markdown",
-                               key=f"deliverable_{thread_id}_{launch['deliverable_artifact']}")
-        if launch.get("truncated"):
-            st.caption(f"{launch['truncated']} workstream(s) stopped at the output budget; raise it in the sidebar for fuller results.")
-        for title, error in launch["failures"]:
-            with st.expander(f"{title} · failed", expanded=False):
-                st.code(error)
-        if st.button("Dismiss", key=f"dismiss_launch_{thread_id}"):
-            launches.pop(thread_id, None)
-            st.rerun()
+    dismissed: set = st.session_state.setdefault("dismissed_jobs", set())
+    if running:
+        st.caption("Mission running in the background: each workstream lands in this chat as it finishes, and the other workspaces stay usable.")
+    elif job and job["id"] not in dismissed:
+        render_launch_summary(job, thread_id, dismissed)
     goal = pending.get(thread_id, "")
-    if goal:
+    if goal and not running:
         render_mission_panel(project_scope, ledger, thread_id, goal, pending)
-    elif not has_mission:
+    elif not has_mission and not running:
         st.caption("No mission in this chat yet. Type one in the chat bar to see its proposed workstreams before anything runs.")
     else:
         st.caption("Mission in progress: the chat bar continues it with every result in context. Start another mission with New chat.")
@@ -1735,7 +1695,8 @@ st.markdown(
 )
 
 if "project_scope" not in st.session_state:
-    st.session_state.project_scope = "chat-johnson"
+    st.session_state.project_scope = resolve_visitor_scope()
+remember_scope(st.session_state.project_scope)
 if "byok_keys" not in st.session_state:
     st.session_state.byok_keys = {}
 # Keys pasted in this browser session are bound to this script run only.
@@ -1824,8 +1785,18 @@ with st.sidebar:
                 marker = "✅" if row["ok"] else ("⚪" if row["detail"] == "no key configured" else "❌")
                 status = f" · HTTP {row['status']}" if row["status"] else ""
                 st.caption(f"{marker} **{row['endpoint']}** · {row['model']} · key {row['key']}{status} · {row['detail']}")
-    project_input = st.text_input("Active project scope", value=st.session_state.project_scope, key="project_scope_input")
-    st.session_state.project_scope = project_input.strip() or "chat-johnson"
+    st.caption(
+        f"Private scope `{st.session_state.project_scope}` · chats, artifacts, and jobs are visible only on this browser. "
+        "Bookmark the URL to come back to them."
+    )
+    with st.expander("Open another scope", expanded=False):
+        other_scope = st.text_input("Scope id", key="scope_switch_input", placeholder="visitor-…")
+        if st.button("Open scope", key="scope_switch_button", use_container_width=True):
+            if SCOPE_RE.match(other_scope.strip()):
+                st.session_state.project_scope = other_scope.strip()
+                remember_scope(st.session_state.project_scope)
+                st.rerun()
+            st.warning("Scope ids use letters, digits, dots, dashes, or underscores (up to 64 characters).")
 
     st.subheader("Thread health agent")
     st.checkbox(
@@ -1950,6 +1921,7 @@ st.caption(
 
 scope = st.session_state.project_scope
 workspace = render_workspace_switch()
+render_jobs_strip(scope)
 # Created at the top level on purpose: inside a column or tab the chat bar would render inline instead of pinned.
 submission = render_chat_bar(workspace)
 

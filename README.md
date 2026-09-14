@@ -56,9 +56,14 @@ reading. Each workspace owns its own chats (selector, New chat, Clear chat, Dele
 menu with Rename, context load, and Migrate now); keys are never touched by any of these.
 
 - **Task Finder**: a mission is classified (research, code, analysis, plan, general) with no provider
-  call and expanded into typed workstreams you can edit before launch. Steps run one at a time through
-  the router to respect free-tier limits; every result lands in the workspace's chat, and a
-  chat bar keeps the conversation going with the results in context.
+  call and expanded into typed workstreams you can edit before launch. Launch queues the mission as a
+  **background job**: steps run one at a time through the router on a worker thread, every result
+  lands in the workspace's chat as it finishes, and the chat bar and the other workspaces stay usable.
+  A jobs strip above the workspace shows progress, a Cancel button, and an answer box when a job
+  asks the operator a question.
+- **Private scope per visitor**: chats, artifacts, jobs, and the routing log are keyed by a scope id
+  minted for each browser session and kept on the URL (`?scope=`); bookmark it to come back. Nothing
+  is shared between visitors of the same deployment.
 - **Repository Work**: least-privilege GitHub OAuth skeleton, the local sandboxed patch pipeline, and a
   discussion thread for the change.
 - **Chat Bot**: long-form developer chat with file uploads injected as context.
@@ -171,6 +176,11 @@ HTTP status, key fingerprint, and any auto-switch. Probes count toward the vendo
 - **Free-tier pacing in Task Finder**: before each workstream the ledger is consulted; if every keyed
   vendor is inside its RPM/TPM window the step waits (up to 65 s) instead of failing. Missions are
   pinned to the chat, so they survive window eviction and thread migration.
+- **Job runner**: `orchestrator/jobs.py` claims rows from the vault's `jobs` table on daemon worker
+  threads (`CHAT_JOHNSON_JOB_WORKERS`, default 2; 0 disables) and runs registered handlers
+  (`orchestrator/mission_runner.py` today). Session keys are handed to the job in memory only and
+  bound in a fresh context per job; the table never holds them. A restart fails every unfinished job
+  with a note, because its keys are gone. The runner also sweeps stale repository sandboxes on start.
 - **Quota ledger**: one bucket per vendor credential; every HTTP attempt (retries, rediscovery,
   probes) counts toward RPM; tokens are charged on success. A visitor's ledger is keyed by a
   non-reversible fingerprint of their applied keys, so visitors never throttle each other.

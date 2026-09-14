@@ -25,11 +25,18 @@
   (More → ⬇ Chat) before rebooting. Self-hosted deployments should point `CHAT_JOHNSON_DB_PATH`
   at persistent storage.
 - Keys are never stored; every visitor pastes their own for the session.
+- Every browser session gets a private scope (`?scope=visitor-…` on the URL). A visitor who loses the
+  URL loses the way back to those chats; the data itself stays in the vault until the next redeploy.
+- Background jobs (Task Finder missions) live in the vault's `jobs` table and run on worker threads
+  inside the app process (`CHAT_JOHNSON_JOB_WORKERS`, default 2). A reboot fails every unfinished
+  job with a "restarted" note, since its session keys died with the process; launch it again.
 
 ## Repository sandboxes
 - Fetched GitHub trees and pipeline sandboxes live under the temp directory (`chatjohnson-repos`,
-  `chat_johnson_worktrees`) and are ephemeral. Running a fetched repository's tests executes its
-  code in the app's container; the box is off by default for GitHub sources.
+  `chat_johnson_worktrees`). Trees older than six hours and sandboxes older than two are removed
+  when a pipeline run or the job runner starts; a finished run keeps its sandbox until then so the
+  push flow can read the changed files. Running a fetched repository's tests executes its code in
+  the app's container; the box is off by default for GitHub sources.
 
 ## Key rotation
 1. Create the new key at the vendor.

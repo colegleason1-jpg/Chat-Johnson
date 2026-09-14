@@ -66,6 +66,7 @@ class Orchestrator:
         # 3) sandbox
         sandbox_path, branch = ("", "(no-repo)")
         if repo_path:
+            sandbox.prune_staging(s.staging_root)  # earlier runs' sandboxes; this one stays until the next sweep
             sandbox_path, branch = sandbox.create_worktree(repo_path, s.staging_root)
         self._log_event("sandbox", path=sandbox_path, branch=branch)
 

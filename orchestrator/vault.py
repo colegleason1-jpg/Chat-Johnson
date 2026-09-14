@@ -134,6 +134,26 @@ CREATE INDEX IF NOT EXISTS idx_route_log_scope_time
 -- Older databases carried a destructive trigger; the application now
 -- texturizes (summarize + archive) before evicting from the active window.
 DROP TRIGGER IF EXISTS message_history_rolling_cap;
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_scope TEXT NOT NULL,
+    thread_id INTEGER,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'running', 'waiting_input', 'done', 'failed', 'cancelled')),
+    payload TEXT NOT NULL DEFAULT '{}',
+    progress TEXT NOT NULL DEFAULT '{}',
+    result TEXT NOT NULL DEFAULT '{}',
+    question TEXT NOT NULL DEFAULT '',
+    answer TEXT,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    worker TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    claimed_at REAL,
+    finished_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_scope_status ON jobs(project_scope, status, id DESC);
 """
 
 
@@ -144,6 +164,8 @@ def _open_database() -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 30000")
+    # Readers (the UI polling a running job) never block the worker's writes.
+    connection.execute("PRAGMA journal_mode = WAL")
     return connection
 
 
@@ -894,6 +916,181 @@ def routes_csv(project_scope: str, limit: int = 5000) -> str:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(row["timestamp"])))
         lines.append(f"{row['id']},{stamp},{row['workspace']},{row['task_type']},{row['route']},{row['mode']},{row['ms']},{row['finish']},\"{reason}\"")
     return "\n".join(lines) + "\n"
+
+
+# =============================================================================
+# Jobs (background work claimed by the in-process runner or an external worker)
+# =============================================================================
+
+JOB_ACTIVE = ("queued", "running", "waiting_input")
+
+
+def _job_json(text: Optional[str]) -> Dict[str, Any]:
+    try:
+        value = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def enqueue_job(project_scope: str, kind: str, payload: Mapping[str, Any], thread_id: Optional[int] = None) -> int:
+    """Queue one job. The payload is redacted like a message; secrets belong to the runner, never here."""
+    scope = project_scope.strip() or "default"
+    now = time.time()
+    body = redact_secrets(json.dumps(dict(payload), default=str))
+    with _open_database() as connection:
+        cursor = connection.execute(
+            "INSERT INTO jobs (project_scope, thread_id, kind, status, payload, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'queued', ?, ?, ?)",
+            (scope, int(thread_id) if thread_id is not None else None, kind, body, now, now),
+        )
+        return int(cursor.lastrowid)
+
+
+def claim_job(worker: str, kinds: Sequence[str]) -> Optional[sqlite3.Row]:
+    """Atomically take the oldest queued job of the given kinds; None when the queue is empty."""
+    if not kinds:
+        return None
+    marks = ",".join("?" for _ in kinds)
+    with _open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            f"SELECT id FROM jobs WHERE status = 'queued' AND kind IN ({marks}) ORDER BY id ASC LIMIT 1", tuple(kinds)
+        ).fetchone()
+        if row is None:
+            connection.commit()
+            return None
+        now = time.time()
+        connection.execute(
+            "UPDATE jobs SET status = 'running', worker = ?, claimed_at = ?, updated_at = ? WHERE id = ?",
+            (worker, now, now, int(row["id"])),
+        )
+        connection.commit()
+        return connection.execute("SELECT * FROM jobs WHERE id = ?", (int(row["id"]),)).fetchone()
+
+
+def update_job_progress(job_id: int, fields: Mapping[str, Any]) -> None:
+    """Merge ``fields`` into the job's progress JSON."""
+    with _open_database() as connection:
+        row = connection.execute("SELECT progress FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+        if row is None:
+            return
+        progress = _job_json(row["progress"])
+        progress.update(dict(fields))
+        connection.execute(
+            "UPDATE jobs SET progress = ?, updated_at = ? WHERE id = ?", (json.dumps(progress, default=str), time.time(), int(job_id))
+        )
+
+
+def ask_job_question(job_id: int, question: str) -> None:
+    with _open_database() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'waiting_input', question = ?, answer = NULL, updated_at = ? WHERE id = ? AND status = 'running'",
+            (str(question)[:2000], time.time(), int(job_id)),
+        )
+
+
+def answer_job(job_id: int, answer: str) -> bool:
+    """Operator's reply; True when the job was actually waiting."""
+    with _open_database() as connection:
+        cursor = connection.execute(
+            "UPDATE jobs SET status = 'running', answer = ?, updated_at = ? WHERE id = ? AND status = 'waiting_input'",
+            (redact_secrets(str(answer)), time.time(), int(job_id)),
+        )
+        return cursor.rowcount == 1
+
+
+def job_answer(job_id: int) -> Optional[str]:
+    with _open_database() as connection:
+        row = connection.execute("SELECT status, answer FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+    if row is None or row["status"] != "running" or row["answer"] is None:
+        return None
+    return str(row["answer"])
+
+
+def request_cancel(job_id: int) -> None:
+    """Cooperative cancel: a queued job ends now, a running one at its next check."""
+    now = time.time()
+    with _open_database() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'cancelled', cancel_requested = 1, finished_at = ?, updated_at = ? WHERE id = ? AND status = 'queued'",
+            (now, now, int(job_id)),
+        )
+        connection.execute(
+            "UPDATE jobs SET cancel_requested = 1, updated_at = ? WHERE id = ? AND status IN ('running', 'waiting_input')",
+            (now, int(job_id)),
+        )
+
+
+def cancel_requested(job_id: int) -> bool:
+    with _open_database() as connection:
+        row = connection.execute("SELECT cancel_requested FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+    return bool(row and row["cancel_requested"])
+
+
+def finish_job(job_id: int, status: str, result: Mapping[str, Any]) -> None:
+    final = status if status in ("done", "failed", "cancelled") else "failed"
+    now = time.time()
+    with _open_database() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = ?, result = ?, finished_at = ?, updated_at = ? WHERE id = ?",
+            (final, redact_secrets(json.dumps(dict(result), default=str)), now, now, int(job_id)),
+        )
+
+
+def job_by_id(job_id: int) -> Optional[sqlite3.Row]:
+    with _open_database() as connection:
+        return connection.execute("SELECT * FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+
+
+def list_jobs(
+    project_scope: str, statuses: Optional[Sequence[str]] = None, limit: int = 50,
+    thread_id: Optional[int] = None, kind: Optional[str] = None,
+) -> List[sqlite3.Row]:
+    """Newest first for one scope, optionally narrowed by status, thread, or kind."""
+    scope = project_scope.strip() or "default"
+    clauses = ["project_scope = ?"]
+    params: List[Any] = [scope]
+    if statuses:
+        clauses.append("status IN (" + ",".join("?" for _ in statuses) + ")")
+        params.extend(statuses)
+    if thread_id is not None:
+        clauses.append("thread_id = ?")
+        params.append(int(thread_id))
+    if kind:
+        clauses.append("kind = ?")
+        params.append(kind)
+    params.append(int(limit))
+    with _open_database() as connection:
+        return connection.execute(
+            f"SELECT * FROM jobs WHERE {' AND '.join(clauses)} ORDER BY id DESC LIMIT ?", tuple(params)
+        ).fetchall()
+
+
+def reap_stale_jobs(note: str, queued_before: Optional[float] = None) -> int:
+    """Fail every running or waiting job, plus queued ones created before ``queued_before``; returns the count.
+
+    After a process restart their secrets are gone, so none of them can continue. Queued rows
+    created after the restart (by this process) are left alone.
+    """
+    now = time.time()
+    with _open_database() as connection:
+        cursor = connection.execute(
+            "UPDATE jobs SET status = 'failed', result = ?, finished_at = ?, updated_at = ? "
+            "WHERE status IN ('running', 'waiting_input') OR (status = 'queued' AND created_at < ?)",
+            (json.dumps({"error": note}), now, now, float(queued_before) if queued_before is not None else 0.0),
+        )
+        return int(cursor.rowcount)
+
+
+def job_view(row: sqlite3.Row) -> Dict[str, Any]:
+    """A job row with its JSON columns parsed, for display."""
+    return {
+        "id": int(row["id"]), "kind": str(row["kind"]), "status": str(row["status"]), "thread_id": row["thread_id"],
+        "payload": _job_json(row["payload"]), "progress": _job_json(row["progress"]), "result": _job_json(row["result"]),
+        "question": str(row["question"] or ""), "answer": row["answer"], "cancel_requested": bool(row["cancel_requested"]),
+        "created_at": float(row["created_at"]), "updated_at": float(row["updated_at"]), "finished_at": row["finished_at"],
+    }
 
 
 def health_check() -> Dict[str, Any]:
