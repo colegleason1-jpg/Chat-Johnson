@@ -263,3 +263,17 @@ def test_academy_workspace_starts_and_stops_the_society_tick(app, monkeypatch):
     next(b for b in app.button if b.label == "Stop the tick").click().run()
     assert not app.exception
     assert vault.job_by_id(rows[0]["id"])["status"] == "cancelled"
+
+
+def test_sidebar_shows_a_local_model_registered_from_the_environment(app, monkeypatch):
+    from orchestrator import router
+    monkeypatch.setenv("CHAT_JOHNSON_LOCAL_ENDPOINT", "http://ollama:11434/v1")
+    monkeypatch.setenv("CHAT_JOHNSON_LOCAL_MODEL", "llama3.1:8b")
+    try:
+        app.run()
+        assert not app.exception
+        assert any("Local model (self-hosted)" in m.value for m in app.sidebar.markdown)
+        assert any("the academy's cheap labour goes here first" in c.value for c in app.sidebar.caption)
+    finally:
+        router.unregister_local_endpoint()
+        monkeypatch.delenv("CHAT_JOHNSON_LOCAL_KEY", raising=False)

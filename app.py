@@ -91,6 +91,9 @@ from orchestrator.router import (
     cortex_wait_seconds,
     endpoint_model,
     generate_mode,
+    local_endpoint,
+    register_local_endpoint,
+    register_local_endpoint_from_env,
     probe_all_endpoints,
     repository_context_chars,
     strip_reasoning_tags,
@@ -151,6 +154,7 @@ from orchestrator.vault import (
 )
 
 initialize_database()
+register_local_endpoint_from_env()  # a self-hosted box declares its local model in the environment
 # Background workers start once per process (CHAT_JOHNSON_JOB_WORKERS=0 keeps them idle, as the tests do).
 get_runner()
 
@@ -247,6 +251,9 @@ def provider_status_rows() -> List[Tuple[str, str, str, bool]]:
         if name == "google_ai_studio":
             configured = bool(status.get("gemini", {}).get("configured", configured))
         rows.append((name, label, f"{model} · {env_name}", configured))
+    local = local_endpoint()
+    if local is not None:
+        rows.append(("local", "Local model (self-hosted)", f"{endpoint_model(local)} · {local.base_url} · serves Producer tasks and leisure notes first, then anything the solver routes to it", True))
     for name, cfg in PROVIDERS.items():
         if name in {"gemini", "groq"}:
             continue
@@ -809,12 +816,16 @@ def render_deploy_kit(project_scope: str) -> None:
             c10, c11 = st.columns(2)
             lint_command = c10.text_input("Lint command", value=defaults.lint_command)
             test_command = c11.text_input("Test command", value=defaults.test_command)
+            c12, c13 = st.columns(2)
+            domain = c12.text_input("Domain (VM target: TLS host, blank = plain HTTP)", value="")
+            local_model = c13.text_input("Local model (VM target: Ollama tag)", value=defaults.local_model)
             generate = st.form_submit_button("Generate kit", type="primary")
         if generate:
             spec = KitSpec(
                 app_name=app_name, target=target, language=language, runtime_version=runtime_version.strip() or defaults.runtime_version,
                 port=int(port), registry=registry, cloud=cloud, health_path=health_path, lint_command=lint_command.strip() or defaults.lint_command,
                 test_command=test_command.strip() or defaults.test_command, entrypoint=entrypoint.strip() or defaults.entrypoint, deploy_url=deploy_url,
+                domain=domain, local_model=local_model.strip() or defaults.local_model,
             ).normalized()
             files = generate_kit(spec)
             kit = {"spec": spec, "files": files, "findings": validate_kit(files)}
@@ -2230,6 +2241,20 @@ with st.sidebar:
             st.caption(usage_sentence(ledger, vendor_for(name)))
     if not configured_provider_names():
         st.warning("No provider keys detected. Paste them in the API keys panel above or set environment variables; this app never stores them in SQLite.")
+    with st.expander("Local model endpoint", expanded=False):
+        local = local_endpoint()
+        if local is not None:
+            st.caption(f"Registered: `{local.base_url}` · model `{endpoint_model(local)}` · the academy's cheap labour goes here first.")
+        if os.environ.get("CHAT_JOHNSON_SELF_HOSTED", "").strip() == "1":
+            with st.form("local_endpoint_form"):
+                base_url = st.text_input("OpenAI-compatible base URL", value=local.base_url if local else "http://ollama:11434/v1")
+                model = st.text_input("Model", value=local.model if local else "llama3.1:8b")
+                if st.form_submit_button("Register for this process"):
+                    register_local_endpoint(base_url.strip(), model.strip())
+                    st.success("Local endpoint registered; it shows under BYOK channels.")
+                    st.rerun()
+        elif local is None:
+            st.caption("A self-hosted deployment (the VM kit) sets CHAT_JOHNSON_LOCAL_ENDPOINT so Ollama, LM Studio, or vLLM serve the academy's cheap labour; on a shared host this stays off.")
     st.divider()
     st.subheader("Locked artifacts")
     artifact_query = st.text_input("Search artifacts", key="artifact_query", placeholder="keywords, any order: name, path, or summary")

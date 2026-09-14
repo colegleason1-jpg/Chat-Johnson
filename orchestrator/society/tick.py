@@ -85,6 +85,40 @@ def tick_state(scope: str) -> Dict[str, Any]:
     return {"running": bool(rows), "jobs": rows, "next_run_after": max((r["run_after"] for r in rows), default=0.0)}
 
 
+def bootstrap_ticks(scopes: Optional[List[str]] = None) -> int:
+    """After a restart, re-queue the society tick for every scope whose tick died with the process.
+
+    Only meaningful where keys outlive the session (the VM worker's environment): without a keyed
+    endpoint the restored ticks would fail every call. Returns how many ticks were started.
+    """
+    from ..router import cortex_available
+    from ..config import PROVIDERS, provider_api_key
+
+    if not cortex_available() and not any(provider_api_key(cfg) for cfg in PROVIDERS.values()):
+        return 0
+    with vault._open_database() as connection:
+        rows = connection.execute(
+            "SELECT project_scope, payload, MAX(id) AS last_id FROM jobs WHERE kind = ? AND status = 'failed' GROUP BY project_scope", (KIND_TICK,)
+        ).fetchall()
+    started = 0
+    for row in rows:
+        scope = str(row["project_scope"])
+        if scopes is not None and scope not in scopes:
+            continue
+        if tick_state(scope)["running"]:
+            continue
+        # A scope whose latest tick ended by cancel or by a later success is left alone: only a dead chain is restored.
+        latest = vault.list_jobs(scope, None, limit=1, kind=KIND_TICK)
+        if not latest or latest[0]["status"] != "failed":
+            continue
+        payload = vault.job_view(latest[0])["payload"]
+        if "chained_from" in payload:
+            payload = {k: v for k, v in payload.items() if k != "chained_from"}
+        enqueue(scope, KIND_TICK, payload, {})
+        started += 1
+    return started
+
+
 def stop_tick(scope: str) -> int:
     stopped = 0
     for row in vault.list_jobs(scope, ACTIVE_STATUSES, limit=50, kind=KIND_TICK):

@@ -32,6 +32,9 @@ DEFAULT_WORKERS = 2
 ANSWER_TIMEOUT_SECONDS = 900.0
 _PROCESS_STARTED = time.time()
 RESTART_NOTE = "the app restarted before this job finished (its session keys are gone); launch it again"
+STALE_NOTE = "the worker running this job stopped responding; launch it again"
+HEARTBEAT_SECONDS = 15.0
+STALE_AFTER_SECONDS = 180.0
 
 
 class JobCancelled(Exception):
@@ -172,14 +175,32 @@ class JobRunner:
         self._stop = threading.Event()
         self._threads: list = []
 
-    def start(self) -> "JobRunner":
-        vault.reap_stale_jobs(RESTART_NOTE, queued_before=_PROCESS_STARTED)
+    def start(self, reap: Optional[bool] = None) -> "JobRunner":
+        """Start the workers. With no workers (the app beside a worker container) nothing is reaped: the worker owns the rows."""
+        if reap if reap is not None else self.max_workers > 0:
+            vault.reap_stale_jobs(RESTART_NOTE, queued_before=_PROCESS_STARTED)
         _sweep_staging()
         for index in range(self.max_workers):
             thread = threading.Thread(target=self._loop, name=f"job-worker-{index}", daemon=True)
             thread.start()
             self._threads.append(thread)
+        if self.max_workers > 0:
+            keeper = threading.Thread(target=self._housekeeping, name="job-housekeeping", daemon=True)
+            keeper.start()
+            self._threads.append(keeper)
         return self
+
+    def _housekeeping(self) -> None:
+        """Stamp this worker's rows and fail rows whose worker went silent (another container, a crashed thread)."""
+        last_reap = time.monotonic()
+        while not self._stop.wait(HEARTBEAT_SECONDS):
+            try:
+                vault.touch_heartbeat(self.worker_name)
+                if time.monotonic() - last_reap >= 60.0:
+                    vault.reap_stale_heartbeats(STALE_NOTE, STALE_AFTER_SECONDS)
+                    last_reap = time.monotonic()
+            except Exception:  # housekeeping must never take a worker down
+                pass
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -232,3 +253,60 @@ def get_runner() -> JobRunner:
 def job_summary_rows(project_scope: str, statuses: Optional[Sequence[str]] = None, limit: int = 20) -> list:
     """Parsed job rows for display."""
     return [vault.job_view(row) for row in vault.list_jobs(project_scope, statuses, limit=limit)]
+
+
+# =============================================================================
+# Worker mode: `python -m orchestrator.jobs --worker` runs the pool in the foreground
+# =============================================================================
+
+def build_arg_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m orchestrator.jobs", description="Chat Johnson background worker")
+    parser.add_argument("--worker", action="store_true", help="run the job workers in the foreground until SIGTERM")
+    parser.add_argument("--workers", type=int, default=None, help="worker threads (default CHAT_JOHNSON_JOB_WORKERS or 2)")
+    parser.add_argument("--poll", type=float, default=1.0, help="seconds between queue polls")
+    parser.add_argument("--no-bootstrap", action="store_true", help="do not re-queue society ticks that were running before a restart")
+    return parser
+
+
+def run_worker(argv: Optional[Sequence[str]] = None) -> int:
+    """Foreground worker for a container: registers every handler, restores ticks, serves the queue until stopped."""
+    import logging
+    import signal
+
+    args = build_arg_parser().parse_args(list(argv) if argv is not None else None)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("chat_johnson.worker")
+    if not args.worker:
+        build_arg_parser().print_help()
+        return 2
+    from . import mission_runner, society  # noqa: F401  (register the mission, company, academy, and tick handlers)
+    from .router import register_local_endpoint_from_env
+
+    vault.initialize_database()
+    local = register_local_endpoint_from_env()
+    if local is not None:
+        log.info("local model endpoint: %s (%s)", local.base_url, local.model)
+    runner = JobRunner(max_workers=args.workers, poll_seconds=args.poll).start(reap=False)
+    vault.reap_stale_heartbeats(STALE_NOTE, STALE_AFTER_SECONDS)
+    if not args.no_bootstrap:
+        restored = society.bootstrap_ticks()
+        log.info("society ticks restored: %d", restored)
+    log.info("worker %s serving kinds %s with %d thread(s)", runner.worker_name, ", ".join(handler_kinds()), runner.max_workers)
+    stop = threading.Event()
+
+    def _signal(signum, frame):  # noqa: ARG001
+        log.info("signal %s: stopping", signum)
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _signal)
+    while not stop.wait(1.0):
+        pass
+    runner.stop()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by the container
+    raise SystemExit(run_worker())

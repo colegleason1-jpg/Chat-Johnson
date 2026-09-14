@@ -77,7 +77,7 @@ def run_leisure(ctx: JobContext, budget: CycleBudget, cycle_id: int, call_free, 
         ctx.check_cancel()
         entry: Dict[str, Any] = {"agent": agent["name"]}
         try:
-            choice, _ = call_free(ctx, budget, cycle_id, agent, CHOOSE_PROMPT.format(sources=", ".join(sources), interest=agent.get("interest") or "none yet", recent=_recent_work(scope, agent)), "quick_text", min(call_tokens, 150), mode=mode, role_note="Leisure: explore, do not work.")
+            choice, _ = call_free(ctx, budget, cycle_id, agent, CHOOSE_PROMPT.format(sources=", ".join(sources), interest=agent.get("interest") or "none yet", recent=_recent_work(scope, agent)), "quick_text", min(call_tokens, 150), mode=mode, role_note="Leisure: explore, do not work.", prefer_local=True)
         except CycleBudgetExceeded:
             entry["stopped"] = "budget"
             done.append(entry)
@@ -106,7 +106,7 @@ def run_leisure(ctx: JobContext, budget: CycleBudget, cycle_id: int, call_free, 
         if text:
             before = budget.tokens
             try:
-                findings, _ = call_free(ctx, budget, cycle_id, agent, SUMMARISE_PROMPT.format(source=source, text=text[:4000]), "quick_text", call_tokens, mode=mode, role_note="Leisure notes for your dream bank.")
+                findings, _ = call_free(ctx, budget, cycle_id, agent, SUMMARISE_PROMPT.format(source=source, text=text[:4000]), "quick_text", call_tokens, mode=mode, role_note="Leisure notes for your dream bank.", prefer_local=True)
             except CycleBudgetExceeded:
                 status = "budget"
             tokens = budget.tokens - before

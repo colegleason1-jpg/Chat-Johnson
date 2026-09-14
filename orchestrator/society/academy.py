@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .. import vault
 from ..jobs import JobCancelled, JobContext, enqueue, register_handler
-from ..router import _estimate_tokens, cortex_wait_seconds, generate_mode, strip_reasoning_tags
+from ..router import _estimate_tokens, cortex_wait_seconds, generate_mode, local_endpoint, local_first_generate, strip_reasoning_tags
 from . import economy, evaluate, store
 from .cycles import CycleBudget, CycleBudgetExceeded, MAX_WAIT_SECONDS, WORKSPACE
 from .personas import build_academy_messages
@@ -66,8 +66,11 @@ def ensure_agent_thread(scope: str, agent: Dict[str, Any]) -> int:
     return thread_id
 
 
-def call_free(ctx: JobContext, budget: CycleBudget, cycle_id: int, agent: Dict[str, Any], prompt: str, task_type: str, max_tokens: int, mode: str = "normal", role_note: str = "") -> Tuple[str, Any]:
-    """One metered call by an academy agent in its own thread (the seat-less twin of cycles.call)."""
+def call_free(ctx: JobContext, budget: CycleBudget, cycle_id: int, agent: Dict[str, Any], prompt: str, task_type: str, max_tokens: int, mode: str = "normal", role_note: str = "", prefer_local: bool = False) -> Tuple[str, Any]:
+    """One metered call by an academy agent in its own thread (the seat-less twin of cycles.call).
+
+    ``prefer_local`` sends cheap labour (Producer tasks, leisure notes) to a registered local model first.
+    """
     scope = ctx.project_scope
     thread_id = ensure_agent_thread(scope, agent)
     from .leisure import dream_excerpt_for  # local: leisure imports this module
@@ -83,7 +86,10 @@ def call_free(ctx: JobContext, budget: CycleBudget, cycle_id: int, agent: Dict[s
         ctx.sleep(wait + 0.5)
     started = time.perf_counter()
     with ctx.request_lock:
-        answer, decision = generate_mode(mode, task_type, messages, ctx.ledger, max_tokens=max_tokens, temperature=0.3)
+        if prefer_local and local_endpoint() is not None:
+            answer, decision = local_first_generate(mode, task_type, messages, ctx.ledger, max_tokens=max_tokens, temperature=0.3)
+        else:
+            answer, decision = generate_mode(mode, task_type, messages, ctx.ledger, max_tokens=max_tokens, temperature=0.3)
     answer = strip_reasoning_tags(answer)
     vault.append_message(scope, "user", prompt, mode=mode, thread_id=thread_id, workspace=WORKSPACE, task_type=task_type)
     vault.append_message(scope, "assistant", answer, provider=f"{decision.provider}/{decision.model}", mode=mode, thread_id=thread_id, workspace=WORKSPACE, task_type=task_type)
@@ -142,7 +148,7 @@ def academy_cycle(ctx: JobContext) -> Dict[str, Any]:
         pending: List[Tuple[Dict[str, Any], Tuple[str, str], str]] = []
         for agent in producers[: int(payload.get("producers_per_cycle") or PRODUCERS_PER_CYCLE)]:
             title, brief = PRODUCER_TASKS[(int(agent["id"]) + cycle_id) % len(PRODUCER_TASKS)]
-            text, _ = call_free(ctx, budget, cycle_id, agent, f"TASK: {title}\n{brief}", "quick_text", call_tokens, mode=mode)
+            text, _ = call_free(ctx, budget, cycle_id, agent, f"TASK: {title}\n{brief}", "quick_text", call_tokens, mode=mode, prefer_local=True)
             pending.append((agent, (title, brief), text))
         log.append({"step": "producers", "tasks": len(pending)})
         ctx.progress(step=2, total=6, text=f"{len(pending)} producer task(s) done")

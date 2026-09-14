@@ -77,7 +77,7 @@ def test_inquiry_sources_parse_their_apis(monkeypatch):
 
 
 def fake_call_free(calls):
-    def call_free(ctx, budget, cycle_id, agent, prompt, task_type, max_tokens, mode="normal", role_note=""):
+    def call_free(ctx, budget, cycle_id, agent, prompt, task_type, max_tokens, mode="normal", role_note="", **kwargs):
         calls.append(prompt[:30])
         if "off the clock" in prompt:
             text = "SOURCE: wikipedia\nQUERY: tidal rhythms in fiction\nWAKE_HOURS: 2"

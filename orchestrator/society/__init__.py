@@ -7,10 +7,10 @@ from .cycles import KIND_COMPANY, run_now
 from .release import publish_work, record_board_feedback, request_final_edit
 from .store import SOCIETY_SCHEMA_SQL
 from .templates import DEFAULT_PRODUCTS, add_product, seed_academy, seed_company
-from .tick import KIND_TICK, start_tick, stop_tick, tick_state
+from .tick import KIND_TICK, bootstrap_ticks, start_tick, stop_tick, tick_state
 
 __all__ = [
-    "KIND_ACADEMY", "KIND_COMPANY", "KIND_TICK", "run_academy_now", "run_now", "start_tick", "stop_tick", "tick_state",
+    "KIND_ACADEMY", "KIND_COMPANY", "KIND_TICK", "bootstrap_ticks", "run_academy_now", "run_now", "start_tick", "stop_tick", "tick_state",
     "publish_work", "record_board_feedback", "request_final_edit", "SOCIETY_SCHEMA_SQL", "DEFAULT_PRODUCTS", "add_product",
     "seed_academy", "seed_company",
 ]

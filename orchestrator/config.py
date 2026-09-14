@@ -178,6 +178,7 @@ DAILY_CAPS: Dict[str, int] = {
     "openrouter": 200_000,
     "cerebras": 1_000_000,
     "mistral": 500_000,
+    "local": 5_000_000,  # a self-hosted model: bounded by the box, not a vendor
 }
 
 

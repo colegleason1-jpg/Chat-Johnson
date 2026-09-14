@@ -190,6 +190,7 @@ def initialize_database() -> None:
             "CREATE INDEX IF NOT EXISTS idx_message_thread ON message_history(thread_id, timestamp ASC, id ASC)"
         )
         _ensure_column(connection, "jobs", "run_after", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(connection, "jobs", "heartbeat_at", "REAL")
         from .society.store import SOCIETY_SCHEMA_SQL  # local import: the society package imports this module
 
         connection.executescript(SOCIETY_SCHEMA_SQL)
@@ -1094,6 +1095,27 @@ def reap_stale_jobs(note: str, queued_before: Optional[float] = None) -> int:
             "UPDATE jobs SET status = 'failed', result = ?, finished_at = ?, updated_at = ? "
             "WHERE status IN ('running', 'waiting_input') OR (status = 'queued' AND created_at < ?)",
             (json.dumps({"error": note}), now, now, float(queued_before) if queued_before is not None else 0.0),
+        )
+        return int(cursor.rowcount)
+
+
+def touch_heartbeat(worker: str) -> int:
+    """A live worker stamps its running and waiting rows; stale stamps let another process reap them."""
+    with _open_database() as connection:
+        cursor = connection.execute(
+            "UPDATE jobs SET heartbeat_at = ? WHERE worker = ? AND status IN ('running', 'waiting_input')", (time.time(), worker)
+        )
+        return int(cursor.rowcount)
+
+
+def reap_stale_heartbeats(note: str, older_than_seconds: float = 180.0) -> int:
+    """Fail running or waiting rows whose worker stopped stamping them (crashed thread or dead container)."""
+    now = time.time()
+    with _open_database() as connection:
+        cursor = connection.execute(
+            "UPDATE jobs SET status = 'failed', result = ?, finished_at = ?, updated_at = ? "
+            "WHERE status IN ('running', 'waiting_input') AND COALESCE(heartbeat_at, claimed_at, created_at) < ?",
+            (json.dumps({"error": note}), now, now, now - float(older_than_seconds)),
         )
         return int(cursor.rowcount)
 

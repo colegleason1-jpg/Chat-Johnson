@@ -22,6 +22,7 @@ TARGETS: Dict[str, str] = {
     "streamlit-cloud": "Streamlit Community Cloud (deploys main; CI + post-deploy smoke + runbook)",
     "docker-kubernetes": "Docker image + Kubernetes via Helm (CI/CD, chart, Terraform, observability, rollback)",
     "serverless": "Serverless container (AWS SAM, Google Cloud Run, or Azure Container Apps)",
+    "oracle-vm": "Self-hosted VM (Oracle Cloud Always Free or any Docker host: app, 24/7 worker, local model, TLS)",
 }
 CLOUDS = ("aws", "gcp", "azure", "none")
 LANGUAGES = ("python", "node")
@@ -41,6 +42,9 @@ class KitSpec:
     test_command: str = "python -m pytest -q"
     entrypoint: str = "python -m streamlit run app.py --server.port 8501 --server.address 0.0.0.0"
     deploy_url: str = "https://example.streamlit.app"
+    domain: str = ""                      # VM target: TLS host for Caddy (blank = plain HTTP on port 80)
+    local_model: str = "llama3.1:8b"      # VM target: the Ollama model the worker uses for cheap labour
+    worker_threads: int = 2               # VM target: job threads in the worker container
 
     def normalized(self) -> "KitSpec":
         spec = KitSpec(**asdict(self))
@@ -52,6 +56,9 @@ class KitSpec:
         spec.registry = (self.registry or "ghcr.io/OWNER/REPO").strip().rstrip("/")
         spec.health_path = self.health_path.strip() or "/"
         spec.deploy_url = (self.deploy_url or "").strip().rstrip("/")
+        spec.domain = (self.domain or "").strip().lower()
+        spec.local_model = (self.local_model or "llama3.1:8b").strip()
+        spec.worker_threads = int(self.worker_threads) if 1 <= int(self.worker_threads) <= 16 else 2
         return spec
 
 
@@ -100,6 +107,155 @@ EXPOSE [[port]]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \\
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:[[port]][[health_url_path]]', timeout=4).status < 400 else 1)"
 CMD [[entrypoint_json]]
+"""
+
+_DOCKERFILE_VM = """# syntax=docker/dockerfile:1
+# One image for the app and the worker; WITH_BROWSER=1 adds Chromium for browser checks in the worker.
+FROM python:[[runtime_version]]-slim AS base
+ARG WITH_BROWSER=0
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+WORKDIR /app
+RUN groupadd --system app && useradd --system --gid app --create-home app
+COPY requirements.txt ./
+RUN pip install --upgrade pip && pip install -r requirements.txt \\
+ && if [ "$WITH_BROWSER" = "1" ]; then pip install playwright && playwright install --with-deps chromium; fi
+COPY . .
+RUN mkdir -p /data /opt/pw-browsers && chown -R app:app /app /data /opt/pw-browsers
+USER app
+EXPOSE [[port]]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \\
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:[[port]][[health_url_path]]', timeout=4).status < 400 else 1)"
+CMD [[entrypoint_json]]
+"""
+
+_COMPOSE_VM = """# docker compose up -d --build   (see docs/RUNBOOK.md)
+services:
+  app:
+    build:
+      context: .
+      args:
+        WITH_BROWSER: "0"
+    env_file: .env
+    environment:
+      CHAT_JOHNSON_JOB_WORKERS: "0"            # the worker container owns every background job
+      CHAT_JOHNSON_DB_PATH: /data/vault.db
+      CHAT_JOHNSON_SELF_HOSTED: "1"
+      CHAT_JOHNSON_LOCAL_ENDPOINT: http://ollama:11434/v1
+      CHAT_JOHNSON_LOCAL_MODEL: [[local_model]]
+    volumes:
+      - data:/data
+    expose:
+      - "[[port]]"
+    depends_on:
+      - ollama
+    restart: unless-stopped
+  worker:
+    build:
+      context: .
+      args:
+        WITH_BROWSER: "1"
+    command: ["python", "-m", "orchestrator.jobs", "--worker", "--workers", "[[worker_threads]]"]
+    env_file: .env
+    environment:
+      CHAT_JOHNSON_DB_PATH: /data/vault.db
+      CHAT_JOHNSON_LOCAL_ENDPOINT: http://ollama:11434/v1
+      CHAT_JOHNSON_LOCAL_MODEL: [[local_model]]
+    volumes:
+      - data:/data
+    healthcheck:
+      disable: true
+    depends_on:
+      - ollama
+    restart: unless-stopped
+  ollama:
+    image: ollama/ollama:latest   # pin a tag once the model you use is settled
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+volumes:
+  data: {}
+  ollama: {}
+  caddy_data: {}
+  caddy_config: {}
+"""
+
+_CADDYFILE = """[[site]] {
+    encode gzip
+    reverse_proxy app:[[port]]
+}
+"""
+
+_ENV_VM = """# Copy to .env on the VM. Keys here outlive browser sessions on purpose: the worker uses them 24/7.
+# Free-tier vendor keys (any subset):
+GEMINI_API_KEY=
+GROQ_API_KEY=
+HF_TOKEN=
+NVIDIA_API_KEY=
+OPENROUTER_API_KEY=
+CEREBRAS_API_KEY=
+MISTRAL_API_KEY=
+# Daily token caps per vendor (0 = uncapped), e.g. CHAT_JOHNSON_DAILY_GEMINI=2000000
+# Timeouts for slow local models: CHAT_JOHNSON_TIMEOUT=300
+"""
+
+_VM_BOOTSTRAP_SH = """#!/usr/bin/env bash
+# First-time setup on a fresh Ubuntu or Oracle Linux VM (ARM64 or x86_64). Run as a sudo-capable user.
+set -euo pipefail
+REPO_URL="${1:?usage: vm-bootstrap.sh <git repo url> [branch]}"
+BRANCH="${2:-main}"
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com | sh
+  sudo usermod -aG docker "$USER"
+fi
+# Oracle images ship iptables rules that drop 80/443; open them (the VCN security list must allow them too).
+if command -v iptables >/dev/null 2>&1; then
+  sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT || true
+  sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT || true
+  sudo netfilter-persistent save 2>/dev/null || sudo sh -c 'iptables-save > /etc/iptables/rules.v4' 2>/dev/null || true
+fi
+if command -v firewall-cmd >/dev/null 2>&1; then
+  sudo firewall-cmd --permanent --add-service=http --add-service=https && sudo firewall-cmd --reload || true
+fi
+if [ ! -d "[[app_name]]" ]; then
+  git clone --branch "$BRANCH" "$REPO_URL" "[[app_name]]"
+fi
+cd "[[app_name]]"
+[ -f .env ] || cp .env.example .env
+echo "Edit .env with your keys, then run: bash scripts/vm-update.sh"
+"""
+
+_VM_UPDATE_SH = """#!/usr/bin/env bash
+# Deploy the current branch: pull, rebuild, restart, and make sure the local model is present.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+git pull --ff-only
+docker compose up -d --build
+docker compose exec -T ollama ollama pull "[[local_model]]" || echo "ollama pull failed; the router falls back to cloud endpoints"
+docker compose ps
+echo "Health: $(curl -fsS http://127.0.0.1/?health=1 2>/dev/null | head -c 200 || echo 'not answering yet')"
+"""
+
+_VM_BACKUP_SH = """#!/usr/bin/env bash
+# Copy the vault out of the data volume; keep the last 14 copies.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mkdir -p backups
+docker compose exec -T app python -c "import sqlite3; src=sqlite3.connect('/data/vault.db'); dst=sqlite3.connect('/data/vault-backup.db'); src.backup(dst); dst.close()"
+docker compose cp app:/data/vault-backup.db "backups/vault-$(date +%F-%H%M).db"
+ls -1t backups/vault-*.db | tail -n +15 | xargs -r rm --
+echo "backups:"; ls -1 backups
 """
 
 _DOCKERFILE_NODE = """# syntax=docker/dockerfile:1
@@ -955,6 +1111,14 @@ def _runbook(spec: KitSpec, secrets: Sequence[Sequence[str]]) -> str:
                   "2. `kubectl -n [[app_name]] rollout status deployment/[[app_name]]` if watching by hand.")
         rollback = ("1. `bash scripts/rollback.sh` (Helm rollback to the previous revision, waits for the rollout).\n"
                     "2. Or pin an image: `helm -n [[app_name]] upgrade [[app_name]] ./helm/[[app_name]] --set image.tag=<previous>`.")
+    elif spec.target == "oracle-vm":
+        deploy = ("1. First time: create an Always Free ARM instance (Ubuntu or Oracle Linux), allow ports 80 and 443 in the VCN security "
+                  "list, then `bash scripts/vm-bootstrap.sh <repo url> <branch>` on the VM and fill `.env` with the keys the worker will use.\n"
+                  "2. Every deploy: `ssh` in and run `bash scripts/vm-update.sh` (pull, rebuild, restart, pull the local model `[[local_model]]`).\n"
+                  "3. The app runs with no job workers; the `worker` container serves every job 24/7 and restores the society tick after a restart; "
+                  "`ollama` serves cheap labour (Producer tasks, leisure notes); Caddy terminates TLS for `[[domain]]` (blank = plain HTTP).")
+        rollback = ("1. `git checkout <previous commit>` on the VM and `docker compose up -d --build`; the vault volume is untouched.\n"
+                    "2. `bash scripts/vm-backup.sh` before risky changes; restore by copying a backup over `/data/vault.db` with the stack stopped.")
     else:
         deploy = ("1. Merge into `main`; `ci-cd.yml` builds, scans, pushes the image, then deploys it to the serverless platform "
                   "in the `production` environment.\n"
@@ -977,6 +1141,21 @@ def generate_kit(raw_spec: KitSpec) -> List[KitFile]:
         files.append(KitFile(".github/workflows/post-deploy-smoke.yml", _render(_SMOKE_WORKFLOW, spec, {}), "yaml", "health + build check against the live app"))
         files.append(KitFile("scripts/smoke_test.sh", _render(_SMOKE_SH, spec, {}), "bash", "post-deploy smoke test"))
         files.append(KitFile("docs/RUNBOOK.md", _runbook(spec, secrets), "markdown", "deploy, verify, roll back, rotate keys"))
+        return files
+
+    if spec.target == "oracle-vm":
+        files.append(KitFile("Dockerfile", _render(_DOCKERFILE_VM, spec, {}), "dockerfile", "one image for app and worker (WITH_BROWSER=1 adds Chromium)"))
+        files.append(KitFile(".dockerignore", _DOCKERIGNORE, "text", "keeps secrets, caches, and git out of the image"))
+        files.append(KitFile("docker-compose.yml", _render(_COMPOSE_VM, spec, {}), "yaml", "app, 24/7 worker, Ollama, Caddy TLS, persistent vault volume"))
+        files.append(KitFile("Caddyfile", _render(_CADDYFILE, spec, {"site": spec.domain or ":80"}), "text", "reverse proxy with automatic TLS when a domain is set"))
+        files.append(KitFile(".env.example", _ENV_VM, "text", "keys the worker uses around the clock (copy to .env on the VM)"))
+        files.append(KitFile("scripts/vm-bootstrap.sh", _render(_VM_BOOTSTRAP_SH, spec, {}), "bash", "install Docker, open ports, clone"))
+        files.append(KitFile("scripts/vm-update.sh", _render(_VM_UPDATE_SH, spec, {}), "bash", "pull, rebuild, restart, pull the local model"))
+        files.append(KitFile("scripts/vm-backup.sh", _VM_BACKUP_SH, "bash", "copy the vault out of the volume"))
+        files.append(KitFile(".github/workflows/ci.yml", _render(_CI_STREAMLIT, spec, {"setup_steps": setup}), "yaml", "lint and test on every push"))
+        files.append(KitFile(".github/workflows/post-deploy-smoke.yml", _render(_SMOKE_WORKFLOW, spec, {}), "yaml", "health + build check against the live app"))
+        files.append(KitFile("scripts/smoke_test.sh", _render(_SMOKE_SH, spec, {}), "bash", "post-deploy smoke test"))
+        files.append(KitFile("docs/RUNBOOK.md", _runbook(spec, secrets), "markdown", "VM setup, deploy, verify, roll back, back up, rotate keys"))
         return files
 
     files.append(KitFile("Dockerfile", _render(_DOCKERFILE_PY if spec.language == "python" else _DOCKERFILE_NODE, spec, {}), "dockerfile", "non-root image with a health check"))

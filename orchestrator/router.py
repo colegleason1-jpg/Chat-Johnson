@@ -549,6 +549,63 @@ def _ensure_cortex_ledger(ledger: Optional[QuotaLedger]) -> None:
         )
 
 
+LOCAL_ENDPOINT_NAME = "local"
+LOCAL_ENV_URL = "CHAT_JOHNSON_LOCAL_ENDPOINT"
+LOCAL_ENV_MODEL = "CHAT_JOHNSON_LOCAL_MODEL"
+LOCAL_ENV_KEY = "CHAT_JOHNSON_LOCAL_KEY"
+LOCAL_DEFAULT_MODEL = "llama3.1:8b"
+
+
+def register_local_endpoint(base_url: str, model: str = LOCAL_DEFAULT_MODEL, rpm_limit: int = 60, tpm_limit: Optional[int] = None) -> CortexEndpoint:
+    """Register a self-hosted OpenAI-compatible endpoint (Ollama, LM Studio, vLLM) as the ``local`` Cortex endpoint.
+
+    Process-wide by design: on a self-hosted box the operator owns the process. The endpoint counts
+    as keyed through ``CHAT_JOHNSON_LOCAL_KEY`` (any value; most local servers ignore it).
+    """
+    if not os.environ.get(LOCAL_ENV_KEY, "").strip():
+        os.environ[LOCAL_ENV_KEY] = "local"
+    endpoint = CortexEndpoint(
+        name=LOCAL_ENDPOINT_NAME, label=f"Local model ({model})", env_keys=(LOCAL_ENV_KEY,), base_url=base_url.rstrip("/"),
+        kind="openai", model=model or LOCAL_DEFAULT_MODEL, rpm_limit=int(rpm_limit), tpm_limit=tpm_limit, speed_score=0.35,
+        context_score=0.45, strengths=("quick_text", "chat"), model_env=LOCAL_ENV_MODEL,
+    )
+    CORTEX_ENDPOINTS[LOCAL_ENDPOINT_NAME] = endpoint
+    return endpoint
+
+
+def unregister_local_endpoint() -> None:
+    CORTEX_ENDPOINTS.pop(LOCAL_ENDPOINT_NAME, None)
+
+
+def local_endpoint() -> Optional[CortexEndpoint]:
+    return CORTEX_ENDPOINTS.get(LOCAL_ENDPOINT_NAME)
+
+
+def register_local_endpoint_from_env() -> Optional[CortexEndpoint]:
+    """``CHAT_JOHNSON_LOCAL_ENDPOINT`` (and optional ``CHAT_JOHNSON_LOCAL_MODEL``) register the local endpoint at start-up."""
+    url = os.environ.get(LOCAL_ENV_URL, "").strip()
+    if not url:
+        return None
+    return register_local_endpoint(url, os.environ.get(LOCAL_ENV_MODEL, "").strip() or LOCAL_DEFAULT_MODEL)
+
+
+def local_first_generate(
+    mode: str, task_type: str, messages: List[dict], ledger: QuotaLedger, max_tokens: int = 1024, temperature: float = 0.3,
+) -> Tuple[str, "RouteDecision"]:
+    """Cheap labour goes to the local model when one is registered; otherwise (or on failure) the normal router."""
+    endpoint = local_endpoint()
+    if endpoint is not None and _endpoint_key(endpoint):
+        status: Dict[str, Any] = {}
+        try:
+            text = "".join(cortex_stream(endpoint, messages, max_tokens=max_tokens, temperature=temperature, ledger=ledger, status=status))
+            if ledger is not None:
+                ledger.record(_vendor(endpoint), _estimate_tokens(messages, text), count_request=False)
+            return text, RouteDecision(endpoint.name, endpoint_model(endpoint), task_type, "tier routing: local model first", finish=str(status.get("finish", "")))
+        except ProviderError:
+            pass  # the local box is down or overloaded: cloud free tiers take the call
+    return generate_mode(mode, task_type, messages, ledger, max_tokens=max_tokens, temperature=temperature)
+
+
 def _endpoint_key(endpoint: CortexEndpoint) -> str:
     for env_name in endpoint.env_keys:
         value = resolve_secret(env_name)

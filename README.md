@@ -96,6 +96,13 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   positioning, landing copy (rendered in the preview), a launch plan, outreach drafts, and pricing
   notes; feedback themes are extracted for marketing. **Skip-level escalations** in a seat's output
   are routed one level above the superior or below a subordinate and answered in the next cycle.
+- **Self-hosted VM (batch F)**: the Deploy Kit's `oracle-vm` target (also committed at the repo root:
+  `Dockerfile`, `docker-compose.yml`, `Caddyfile`, `scripts/vm-*.sh`) runs the app, a 24/7 worker
+  container (`python -m orchestrator.jobs --worker`) that serves every background job and restores the
+  society tick after a restart, an Ollama local model registered as the `local` Cortex endpoint
+  (`CHAT_JOHNSON_LOCAL_ENDPOINT`) that takes the academy's cheap labour first, and Caddy TLS. Job
+  rows carry heartbeats so a dead worker's jobs are reaped by a live one. Keys live in the VM's
+  `.env` by decision; the vault sits on a persistent volume.
 - **Private scope per visitor**: chats, artifacts, jobs, and the routing log are keyed by a scope id
   minted for each browser session and kept on the URL (`?scope=`); bookmark it to come back. Nothing
   is shared between visitors of the same deployment.

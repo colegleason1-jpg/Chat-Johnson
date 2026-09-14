@@ -19,6 +19,21 @@
 1. `git revert <bad merge commit>` on `main` and push; the platform redeploys the previous state.
 2. Reboot from *Manage app* if the old build lingers. Verify as above.
 
+## Self-hosted VM (Oracle Cloud Always Free or any Docker host)
+- `docker-compose.yml` runs four services: `app` (Streamlit, no job workers), `worker`
+  (`python -m orchestrator.jobs --worker`, Chromium included, serves every job 24/7 and restores the
+  society tick after a restart), `ollama` (the local model for Producer tasks and leisure notes),
+  and `caddy` (TLS for the domain in `Caddyfile`, plain HTTP on port 80 when none is set). The vault
+  lives on the `data` volume at `/data/vault.db` and survives deploys.
+- First time: create the instance (Ubuntu or Oracle Linux, ARM64 is fine), allow 80/443 in the VCN
+  security list, then `bash scripts/vm-bootstrap.sh <repo url> <branch>`; copy `.env.example` to
+  `.env` and fill the keys (decision: keys on the VM worker only, never in the vault).
+- Every deploy: `bash scripts/vm-update.sh` (pull, rebuild, restart, pull the local model). Roll
+  back with `git checkout <previous>` and `docker compose up -d --build`. Back up with
+  `bash scripts/vm-backup.sh` (keeps 14 copies under `backups/`).
+- Heartbeats: the worker stamps its rows every 15 s and fails rows silent for 3 minutes; the app
+  never reaps rows because the worker owns them.
+
 ## Data
 - The SQLite vault lives on the container's disk. On Streamlit Community Cloud that disk is
   **ephemeral**: a reboot or redeploy starts with an empty vault. Download chats you care about

@@ -1,0 +1,61 @@
+# docker compose up -d --build   (see docs/RUNBOOK.md)
+services:
+  app:
+    build:
+      context: .
+      args:
+        WITH_BROWSER: "0"
+    env_file: .env
+    environment:
+      CHAT_JOHNSON_JOB_WORKERS: "0"            # the worker container owns every background job
+      CHAT_JOHNSON_DB_PATH: /data/vault.db
+      CHAT_JOHNSON_SELF_HOSTED: "1"
+      CHAT_JOHNSON_LOCAL_ENDPOINT: http://ollama:11434/v1
+      CHAT_JOHNSON_LOCAL_MODEL: llama3.1:8b
+    volumes:
+      - data:/data
+    expose:
+      - "8501"
+    depends_on:
+      - ollama
+    restart: unless-stopped
+  worker:
+    build:
+      context: .
+      args:
+        WITH_BROWSER: "1"
+    command: ["python", "-m", "orchestrator.jobs", "--worker", "--workers", "2"]
+    env_file: .env
+    environment:
+      CHAT_JOHNSON_DB_PATH: /data/vault.db
+      CHAT_JOHNSON_LOCAL_ENDPOINT: http://ollama:11434/v1
+      CHAT_JOHNSON_LOCAL_MODEL: llama3.1:8b
+    volumes:
+      - data:/data
+    healthcheck:
+      disable: true
+    depends_on:
+      - ollama
+    restart: unless-stopped
+  ollama:
+    image: ollama/ollama:latest   # pin a tag once the model you use is settled
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+volumes:
+  data: {}
+  ollama: {}
+  caddy_data: {}
+  caddy_config: {}
