@@ -277,3 +277,21 @@ def test_sidebar_shows_a_local_model_registered_from_the_environment(app, monkey
     finally:
         router.unregister_local_endpoint()
         monkeypatch.delenv("CHAT_JOHNSON_LOCAL_KEY", raising=False)
+
+
+def test_navigator_focus_shows_the_window_around_a_message(app):
+    from orchestrator import vault
+    app.query_params["scope"] = "visitor-nav"
+    app.run()
+    thread = int(vault.active_thread("visitor-nav", "normal_chat")["id"])
+    ids = [vault.append_message("visitor-nav", "user" if i % 2 == 0 else "assistant", f"turn {i}", thread_id=thread, workspace="normal_chat") for i in range(40)]
+    app.session_state["focus_normal_chat"] = {"thread_id": thread, "message_id": ids[10]}
+    app.run()
+    assert not app.exception
+    assert any(f"around message #{ids[10]}" in c.value for c in app.caption)
+    shown = [m.value for m in app.markdown if m.value.startswith("turn ")]
+    assert "turn 10" in shown and "turn 39" not in shown
+    next(b for b in app.button if b.label == "Back to latest").click().run()
+    assert not app.exception
+    shown = [m.value for m in app.markdown if m.value.startswith("turn ")]
+    assert "turn 39" in shown and "focus_normal_chat" not in app.session_state

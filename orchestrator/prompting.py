@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 from .capabilities import capability_card
 from .router import prompt_context_chars
+from .skills import skills_block
 from .vault import alternating_turns, context_parts
 
 SYSTEM_PERSONA = (
@@ -44,6 +45,9 @@ def build_prompt_messages(
     if extra_system.strip():
         # A seat persona or another role block: after the card (stable prefix), before the memory (volatile).
         system += "\n\n" + extra_system.strip()
+    skills_text, _ = skills_block(user_prompt)
+    if skills_text:
+        system += "\n\n" + skills_text
     if memory:
         system += "\n\nPROJECT MEMORY (compressed earlier history, for reference only; never imitate its format):\n" + memory
     return [{"role": "system", "content": system}, *turns]

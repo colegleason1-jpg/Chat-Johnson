@@ -108,7 +108,9 @@ from orchestrator.connectors import ROADMAP_FEATURES, connector_status
 from orchestrator.deploykit import CLOUDS, LANGUAGES, TARGETS, KitSpec, generate_kit, kit_zip, summarize, validate_kit
 from orchestrator.github_push import GitHubPushError, GitHubWriter, PushRecord, branch_name_for
 from orchestrator.github_repo import GitHubRepoError, collect_changed_files, fetch_tree, list_repositories, looks_like_owner_repo, qualify_repository, whoami
+from orchestrator.render_text import hold_fences, prepare_markdown
 from orchestrator.repo_ingest import repo_prompt_context
+from orchestrator.skills import select_skills
 from orchestrator.missions import (
     MAX_SECTIONS,
     MISSION_TEMPLATES,
@@ -122,6 +124,9 @@ from orchestrator.missions import (
 from orchestrator.preview import extract_preview_source, safe_preview_document
 from orchestrator.vault import (
     answer_job,
+    messages_around,
+    search_messages,
+    thread_outline,
     job_view,
     list_jobs,
     request_cancel,
@@ -366,7 +371,7 @@ def render_output_with_artifacts(
         found = True
         before = text[cursor:match.start()]
         if before.strip():
-            st.markdown(before)
+            st.markdown(prepare_markdown(before))
         language = match.group("language").strip() or "text"
         body = match.group("body")
         left, right = st.columns([0.88, 0.12], gap="small")
@@ -390,9 +395,9 @@ def render_output_with_artifacts(
         cursor = match.end()
     remainder = text[cursor:]
     if remainder.strip():
-        st.markdown(remainder)
+        st.markdown(prepare_markdown(remainder))
     if not found:
-        st.markdown(text)
+        st.markdown(prepare_markdown(text))
 
 
 def render_preview_panel() -> None:
@@ -1095,7 +1100,7 @@ def run_generation(
                 with live_box.container():
                     with st.chat_message("assistant"):
                         st.caption(f"{stream.decision.provider}/{stream.decision.model} · {task_type} · streaming")
-                        st.write_stream(stream)
+                        st.write_stream(hold_fences(stream))  # prose live, each code block whole
                 answer, decision = stream.text, stream.decision
             except ProviderError:
                 # Strict endpoint failed mid-flight; use the blocking path with fallback.
@@ -1141,7 +1146,8 @@ def run_generation(
     )
     log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish)
     with st.chat_message("assistant"):
-        st.caption(f"{decision.provider}/{decision.model} · {task_type} · {mode}")
+        applied = [skill.name for skill in select_skills(clean_prompt)]
+        st.caption(f"{decision.provider}/{decision.model} · {task_type} · {mode}" + (f" · skills: {', '.join(applied)}" if applied else ""))
         render_output_with_artifacts(answer, project_scope, assistant_id, f"message-{assistant_id}")
     if decision.finish == "length":
         st.warning(
@@ -1185,7 +1191,21 @@ def dispatch_chat(
 
 def render_history(project_scope: str, heading: str, workspace: Optional[str] = None, limit: int = 24) -> None:
     st.markdown(f"#### {heading}")
-    rows = recent_messages(project_scope, MESSAGE_WINDOW, workspace=workspace)
+    focus = st.session_state.get(f"focus_{workspace}")
+    if focus:
+        # The navigator jumped here: show the window around that message instead of the tail.
+        rows = messages_around(int(focus["thread_id"]), int(focus["message_id"]), before=limit // 2, after=limit // 2)
+        left, right = st.columns([0.7, 0.3])
+        left.caption(f"Showing {len(rows)} messages around message #{focus['message_id']} (from the navigator).")
+        if right.button("Back to latest", key=f"unfocus_{workspace}", use_container_width=True):
+            st.session_state.pop(f"focus_{workspace}", None)
+            st.rerun()
+        if not rows:
+            st.caption("That message is no longer in this chat.")
+            return
+        limit = len(rows)
+    else:
+        rows = recent_messages(project_scope, MESSAGE_WINDOW, workspace=workspace)
     if not rows:
         st.caption("No messages yet in this chat.")
         return
@@ -1284,6 +1304,28 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
                            key=f"download_md_{workspace}_{current['id']}", use_container_width=True)
         st.download_button("⬇ Chat (.json)", data=js_body, file_name=js_name, mime="application/json",
                            key=f"download_json_{workspace}_{current['id']}", use_container_width=True)
+
+    with st.expander("Navigator · search this chat and jump to a turn", expanded=False):
+        st.markdown("**Navigator**")
+        nav_query = st.text_input("Search this chat", key=f"nav_query_{workspace}", placeholder="keywords, any order")
+        if nav_query.strip():
+            hits = search_messages(project_scope, int(current["id"]), nav_query, limit=8)
+            if not hits:
+                st.caption("No message matches.")
+            for hit in hits:
+                snippet = " ".join(str(hit["content"]).split())[:110]
+                if st.button(f"#{hit['id']} {hit['role']}: {snippet}", key=f"nav_hit_{workspace}_{hit['id']}", use_container_width=True):
+                    st.session_state[f"focus_{workspace}"] = {"thread_id": int(current["id"]), "message_id": int(hit["id"])}
+                    st.rerun()
+        outline = thread_outline(int(current["id"]))
+        if outline:
+            # Distinct names on purpose: the chat select box's formatter closes over ``labels`` above.
+            turn_labels = [f"#{entry['id']} {entry['role']}: {entry['text']}" for entry in outline]
+            ids_by_turn = {label: entry["id"] for label, entry in zip(turn_labels, outline)}
+            picked = st.selectbox("Jump to a turn", turn_labels, index=len(turn_labels) - 1, key=f"nav_pick_{workspace}_{current['id']}")
+            if st.button("Show around this turn", key=f"nav_jump_{workspace}", use_container_width=True):
+                st.session_state[f"focus_{workspace}"] = {"thread_id": int(current["id"]), "message_id": int(ids_by_turn[picked])}
+                st.rerun()
 
     pending_delete = st.session_state.get(f"confirm_delete_{workspace}")
     if pending_delete == int(current["id"]):

@@ -103,6 +103,12 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   (`CHAT_JOHNSON_LOCAL_ENDPOINT`) that takes the academy's cheap labour first, and Caddy TLS. Job
   rows carry heartbeats so a dead worker's jobs are reaped by a live one. Keys live in the VM's
   `.env` by decision; the vault sits on a persistent volume.
+- **Chat surface (batch C)**: code blocks are held whole while an answer streams (prose stays live, no
+  half-open fences flicker), currency dollars are escaped so KaTeX math (`$…$`, `$$…$$`) renders only
+  where meant, the More menu has a **navigator** (search this chat, jump to any turn, show the window
+  around it, back to latest), and **skills** in `skills/*.md` (front matter with keywords) are loaded
+  into the prompt only when their keywords appear in the message; the answer caption names the skills
+  applied. Shipped: deploy-kit, repository-patching, mission-writing, company-reporting.
 - **Private scope per visitor**: chats, artifacts, jobs, and the routing log are keyed by a scope id
   minted for each browser session and kept on the URL (`?scope=`); bookmark it to come back. Nothing
   is shared between visitors of the same deployment.

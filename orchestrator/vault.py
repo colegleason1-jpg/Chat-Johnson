@@ -833,6 +833,45 @@ def search_artifacts(project_scope: str, query: str, limit: int = 20) -> List[sq
         )
 
 
+def search_messages(project_scope: str, thread_id: int, query: str, limit: int = 20) -> List[sqlite3.Row]:
+    """Keyword search inside one thread (every word must appear, any order); newest first."""
+    from .keyword_search import like_clauses
+
+    clause, params = like_clauses(query, ("content",))
+    scope = project_scope.strip() or "default"
+    with _open_database() as connection:
+        return list(connection.execute(
+            f"SELECT id, role, content, timestamp, provider FROM message_history WHERE project_scope = ? AND thread_id = ? AND {clause} "
+            "ORDER BY timestamp DESC, id DESC LIMIT ?",
+            (scope, int(thread_id), *params, max(1, min(int(limit), 100))),
+        ).fetchall())
+
+
+def messages_around(thread_id: int, message_id: int, before: int = 10, after: int = 10) -> List[sqlite3.Row]:
+    """The messages surrounding one message in its thread, oldest first (the navigator's jump target)."""
+    with _open_database() as connection:
+        earlier = connection.execute(
+            "SELECT * FROM message_history WHERE thread_id = ? AND id <= ? ORDER BY id DESC LIMIT ?", (int(thread_id), int(message_id), int(before) + 1)
+        ).fetchall()
+        later = connection.execute(
+            "SELECT * FROM message_history WHERE thread_id = ? AND id > ? ORDER BY id ASC LIMIT ?", (int(thread_id), int(message_id), int(after))
+        ).fetchall()
+    return list(reversed(earlier)) + list(later)
+
+
+def thread_outline(thread_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+    """One line per turn for the navigator: id, role, first words."""
+    with _open_database() as connection:
+        rows = connection.execute(
+            "SELECT id, role, content, timestamp FROM message_history WHERE thread_id = ? ORDER BY id ASC LIMIT ?", (int(thread_id), int(limit))
+        ).fetchall()
+    outline = []
+    for row in rows:
+        first = " ".join(str(row["content"]).strip().split())[:90]
+        outline.append({"id": int(row["id"]), "role": row["role"], "text": first, "timestamp": float(row["timestamp"])})
+    return outline
+
+
 def export_artifact(artifact_id: int) -> Tuple[str, str]:
     """Return (suggested_filename, body) for a download or copy-out."""
     row = artifact_by_id(artifact_id)
