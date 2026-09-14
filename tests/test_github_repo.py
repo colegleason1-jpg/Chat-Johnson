@@ -99,3 +99,19 @@ def test_changed_paths_from_git_and_copy_mode_diffs(tmp_path):
     pairs, missing = gr.collect_changed_files(str(box), diff)
     assert dict(pairs)["pkg/a.py"] == "print(2)\n" and dict(pairs)["pkg/b.py"] == "new = True\n"
     assert all(rel not in dict(pairs) for rel in missing)
+
+
+def test_list_repositories_and_owner_repo_shape(monkeypatch):
+    assert gr.looks_like_owner_repo("Chazzzer/Chat-Johnson") and gr.looks_like_owner_repo("https://github.com/me/proj.git")
+    assert not gr.looks_like_owner_repo("Chazzzer") and not gr.looks_like_owner_repo("")
+    seen = {}
+
+    def fake_get(url, headers=None, stream=False, timeout=None, allow_redirects=True):
+        seen["url"] = url
+        return FakeResponse(200, [{"full_name": "me/newest"}, {"full_name": "org/tool"}, {"nope": 1}])
+
+    monkeypatch.setattr(gr.requests, "get", fake_get)
+    assert gr.list_repositories("ghp_x") == ["me/newest", "org/tool"]
+    assert "sort=updated" in seen["url"] and "affiliation=owner,collaborator,organization_member" in seen["url"]
+    with pytest.raises(gr.GitHubRepoError, match="token is required"):
+        gr.list_repositories("")

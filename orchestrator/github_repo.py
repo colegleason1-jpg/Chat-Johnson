@@ -87,6 +87,23 @@ def resolve_sha(owner_repo: str, ref: str = "", token: str = "") -> Tuple[str, s
     return chosen, sha
 
 
+def looks_like_owner_repo(value: str) -> bool:
+    try:
+        parse_owner_repo(value)
+        return True
+    except Exception:
+        return False
+
+
+def list_repositories(token: str, limit: int = 100) -> List[str]:
+    """Repositories the token can see (owner, collaborator, org member), newest activity first, as owner/name."""
+    if not (token or "").strip():
+        raise GitHubRepoError("a token is required to list repositories")
+    data = _get(f"{API_ROOT}/user/repos?per_page={max(1, min(int(limit), 100))}&sort=updated&affiliation=owner,collaborator,organization_member", token).json()
+    names = [str(item.get("full_name") or "") for item in data if isinstance(item, dict)]
+    return [name for name in names if name]
+
+
 def _safe_member(member: tarfile.TarInfo) -> Optional[str]:
     """Relative path with the archive's top-level directory stripped, or None when the member must be skipped."""
     if not (member.isfile() or member.isdir()):

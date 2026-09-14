@@ -87,11 +87,11 @@ def test_repository_work_has_four_tabs_directions_and_a_working_fetch(app, monke
     assert not app.exception
     assert len(app.tabs) >= 4  # Work, Deploy Kit, GitHub, Directions
     markdown = "\n".join(m.value for m in app.markdown)
-    assert "What never happens here" in markdown and "Fetch repository" in [b.label for b in app.button]
+    assert "What never happens here" in markdown and "Connect repository" in [b.label for b in app.button]
     app.text_input(key="repo_fetch_repo").input("me/proj").run()
-    next(b for b in app.button if b.label == "Fetch repository").click().run()
+    next(b for b in app.button if b.label.startswith("Connect me/proj")).click().run()
     assert not app.exception
-    assert any("Fetched me/proj @ main (abc1234)" in s.value for s in app.success), [s.value for s in app.success]
+    assert any("Connected me/proj @ main (abc1234)" in s.value for s in app.success), [s.value for s in app.success]
     captions = "\n".join(c.value for c in app.caption)
     assert "Repository in context: me/proj@abc1234 · 2 files" in captions
 
@@ -101,3 +101,35 @@ def test_repository_chat_says_when_nothing_is_loaded(app):
     app.run()
     assert not app.exception
     assert any("No repository loaded" in i.value for i in app.info)
+
+
+@pytest.mark.skipif(Version(st.__version__) < Version("1.40"), reason="AppTest before 1.40 cannot read a radio that uses format_func")
+def test_user_name_alone_is_flagged_and_the_token_can_list_repositories(app, monkeypatch):
+    from orchestrator import github_repo as gr
+    from tests.test_github_repo import FakeResponse, make_tarball
+
+    def fake_get(url, headers=None, stream=False, timeout=None, allow_redirects=True):
+        if "/user/repos" in url:
+            return FakeResponse(200, [{"full_name": "Chazzzer/Chat-Johnson"}])
+        if url.endswith("/repos/Chazzzer/Chat-Johnson"):
+            return FakeResponse(200, {"default_branch": "main"})
+        if url.endswith("/commits/main"):
+            return FakeResponse(200, {"sha": "feedface0000"})
+        return FakeResponse(200, raw=make_tarball(evil=False))
+
+    monkeypatch.setattr(gr.requests, "get", fake_get)
+    app.query_params["ws"] = "repository"
+    app.run()
+    app.checkbox(key="github_push_enabled").check().run()
+    app.text_input(key="github_push_repo").input("Chazzzer").run()
+    app.text_input(key="github_push_token").input("ghp_secret_token_123").run()
+    warnings = [w.value for w in app.warning]
+    assert any("not owner/name" in w for w in warnings), warnings
+    assert any("No repository loaded" in i.value and "owner/name" in i.value for i in app.info)
+    next(b for b in app.button if b.label == "List repositories this token can see").click().run()
+    assert app.selectbox(key="repo_pick").value == "Chazzzer/Chat-Johnson"
+    next(b for b in app.button if b.label.startswith("Use Chazzzer/Chat-Johnson")).click().run()
+    assert not app.exception
+    assert app.session_state["github_push_repo"] == "Chazzzer/Chat-Johnson"
+    assert any("Connected Chazzzer/Chat-Johnson @ main (feedfac" in s.value for s in app.success), [s.value for s in app.success]
+    assert any("Repository in context: Chazzzer/Chat-Johnson@feedfac" in c.value for c in app.caption)
