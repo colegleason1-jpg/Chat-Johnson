@@ -183,6 +183,7 @@ class Settings:
     """Runtime settings with env overrides."""
 
     max_test_rounds: int = 3          # pytest feedback-loop attempts per code step
+    max_output_tokens: int = 4096     # output budget per pipeline call (the app passes its sidebar slider)
     max_retries_per_call: int = 3     # provider HTTP retries
     repo_ingest_budget: int = 700_000 # ~tokens of repo context fed to big models
     memory_path: str = ".orchestrator/memory.json"

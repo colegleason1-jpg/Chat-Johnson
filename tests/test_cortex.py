@@ -965,3 +965,16 @@ def test_repository_context_chars_follows_the_widest_keyed_window(monkeypatch):
     assert router.repository_context_chars(8192) == router.REPOSITORY_CONTEXT_MIN_CHARS
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     assert router.repository_context_chars(2048) == router.REPOSITORY_CONTEXT_MAX_CHARS
+
+
+def test_pipeline_generate_waits_for_a_window_then_routes_like_the_chat(monkeypatch):
+    slept = []
+    monkeypatch.setattr(router.time, "sleep", lambda seconds: slept.append(seconds))
+    monkeypatch.setattr(router, "cortex_wait_seconds", lambda ledger, messages, max_tokens: 3.0)
+    monkeypatch.setattr(router, "generate_mode", lambda mode, task_type, messages, ledger, max_tokens, temperature: ("ok", RouteDecision("groq", "m", task_type, "r")))
+    text, decision = router.pipeline_generate("code_patch", [{"role": "user", "content": "x"}], QuotaLedger({}), max_tokens=512)
+    assert text == "ok" and slept == [3.5]
+    monkeypatch.setattr(router, "cortex_wait_seconds", lambda ledger, messages, max_tokens: 600.0)  # too long: do not sleep, let routing report
+    slept.clear()
+    router.pipeline_generate("code_patch", [{"role": "user", "content": "x"}], QuotaLedger({}), max_tokens=512)
+    assert slept == []

@@ -1793,3 +1793,29 @@ def generate_mode(
     if mode == "heavy":
         return generate_heavy(task_type, messages, ledger, max_tokens, temperature, settings, paid_slot=paid_slot)
     return generate(task_type, messages, ledger, max_tokens, temperature, settings)
+
+
+PIPELINE_MAX_WAIT_SECONDS = 65.0
+
+
+def pipeline_generate(
+    task_type: str,
+    messages: Sequence[Mapping[str, str]],
+    ledger: Optional[QuotaLedger],
+    max_tokens: int = 4096,
+    temperature: float = 0.2,
+    max_wait: float = PIPELINE_MAX_WAIT_SECONDS,
+) -> Tuple[str, RouteDecision]:
+    """One paced call for the repository pipeline: wait for a free-tier window, then route like the chat does.
+
+    The pipeline used the legacy one-pass route, which skipped every provider the moment a window
+    was full (Gemini: 2 requests per minute) instead of waiting, so multi-step runs failed from
+    step two onward. This waits up to ``max_wait`` seconds, then uses Cortex routing with the
+    legacy providers as fallback.
+    """
+    if ledger is not None:
+        wait = cortex_wait_seconds(ledger, messages, max_tokens)
+        if 0 < wait <= max_wait:
+            time.sleep(wait + 0.5)
+    ledger_value = ledger if ledger is not None else QuotaLedger({})
+    return generate_mode("normal", task_type, messages, ledger_value, max_tokens=max_tokens, temperature=temperature)

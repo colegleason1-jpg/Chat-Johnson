@@ -39,10 +39,11 @@ def _extract_json(text: str) -> Dict:
     return json.loads(text[start : end + 1])
 
 
-def decompose(goal: str, memory_block: str, ledger: QuotaLedger) -> List[Dict]:
+def decompose(goal: str, memory_block: str, ledger: QuotaLedger, generate_fn=None) -> List[Dict]:
     """Ask a reasoning-capable provider for a step plan; fall back to one step."""
+    call = generate_fn or generate
     try:
-        text, _ = generate(
+        text, _ = call(
             "reasoning",
             [
                 {"role": "system", "content": "You output strict JSON task plans."},

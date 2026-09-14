@@ -24,7 +24,7 @@ from .patches import (
 )
 from .quota import QuotaLedger
 from .repo_ingest import serialize_repo
-from .router import generate
+from .router import pipeline_generate
 from .test_loop import repair_loop
 
 
@@ -49,8 +49,18 @@ class Orchestrator:
         if repo_path and os.path.isdir(repo_path):
             repo_context, ingest_stats = serialize_repo(repo_path, s.repo_ingest_budget)
 
-        # 2) decompose
-        plan = decompose(goal, memory.context_block(), self.ledger)
+        # 2) decompose (an empty repository gets a fixed two-step scaffold plan: no call to plan, no call to analyze nothing)
+        if repo_path and ingest_stats.get("file_count", 0) == 0:
+            plan = [
+                {"id": 1, "title": "Create the project structure", "type": "code_patch",
+                 "description": f"Create every folder and file for: {goal}. The repository is empty; emit the complete files.", "targets": []},
+                {"id": 2, "title": "Launch and next steps", "type": "quick_text",
+                 "description": f"Explain how to run what was created for: {goal}, and list the next three improvements.", "targets": []},
+            ]
+        else:
+            plan = decompose(goal, memory.context_block(), self.ledger, generate_fn=pipeline_generate)
+            if ingest_stats.get("file_count", 0) == 0:
+                plan = [step for step in plan if step["type"] != "context_load"] or plan
         self._log_event("plan", steps=plan)
 
         # 3) sandbox
@@ -80,6 +90,7 @@ class Orchestrator:
             "memory": memory.context_block(),
             "ingest": ingest_stats,
             "ledger": {p: self.ledger.usage(p) for p in self.ledger._limits},
+            "failed_steps": sum(1 for s in memory.steps if s.status == "failed"),
             "diff": sandbox.diff_vs_base(sandbox_path, repo_path) if sandbox_path else "",
         }
         return report
@@ -101,9 +112,9 @@ class Orchestrator:
             {"role": "user", "content": self._user_prompt(step, goal, memory, repo_context)},
         ]
         try:
-            text, decision = generate(task_type, messages, self.ledger, max_tokens=8192)
+            text, decision = pipeline_generate(task_type, messages, self.ledger, max_tokens=self.settings.max_output_tokens)
         except Exception as exc:
-            record.status, record.note = "failed", f"provider error: {exc}"
+            record.status, record.note, record.provider = "failed", f"provider error: {exc}", "none"
             memory.add_step(record)
             self._log_event("step_failed", step_id=step["id"], error=str(exc))
             return
@@ -180,7 +191,7 @@ class Orchestrator:
         return "\n".join(parts)
 
     def _cheap_summarizer(self, text: str) -> str:
-        out, _ = generate(
+        out, _ = pipeline_generate(
             "quick_text",
             [{"role": "user", "content": text}],
             self.ledger, max_tokens=256, temperature=0.1,

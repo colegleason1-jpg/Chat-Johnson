@@ -676,12 +676,17 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
             st.error("Refusing to run the pipeline on the studio's own checkout; point it at another repository.")
         else:
             settings = get_settings()
+            settings.max_output_tokens = int(st.session_state.get("max_tokens", 2048))
             if not run_tests:
                 settings.max_test_rounds = 0
-            with st.status("Ingesting, patching, and verifying…", expanded=True) as status:
+            with st.status("Ingesting, planning, patching, and verifying… free-tier windows are waited for, not tripped.", expanded=True) as status:
                 try:
                     report = Orchestrator(settings=settings, ledger=ledger).run(repo_goal, repo_path=repo_path)
-                    status.update(label="Pipeline completed", state="complete")
+                    failed_steps = int(report.get("failed_steps", 0))
+                    if failed_steps:
+                        status.update(label=f"Pipeline finished with {failed_steps} failed step(s); see the step table", state="error")
+                    else:
+                        status.update(label="Pipeline completed", state="complete")
                     st.session_state.repo_last_report = {"report": report, "source": source, "fetched": fetched, "goal": repo_goal.strip()}
                 except Exception as exc:
                     status.update(label="Pipeline stopped", state="error")
@@ -704,7 +709,8 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
     ingest = report.get("ingest", {})
     st.caption(f"Ingested {ingest.get('file_count', 0)} file(s) (~{ingest.get('est_tokens', 0)} tokens) from the sandbox source.")
     diff = str(report.get("diff") or "")
-    if not diff.strip():
+    changed_pairs, changed_missing = collect_changed_files(str(report.get("sandbox") or ""), diff)
+    if not changed_pairs and not changed_missing:
         failed = [s for s in steps if s["status"] == "failed"]
         if failed:
             st.warning(
@@ -720,6 +726,7 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
                 "file content. Create every folder through its files. No prose."
             )
             settings = get_settings()
+            settings.max_output_tokens = int(st.session_state.get("max_tokens", 2048))
             if not st.session_state.get("repo_run_tests", False):
                 settings.max_test_rounds = 0
             source_path = str(last["fetched"]["path"]) if last.get("fetched") else str(st.session_state.get("repo_path", ""))
@@ -733,7 +740,7 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
                     status.update(label="Pipeline stopped", state="error")
                     st.error(f"Repository pipeline failed: {exc}")
     else:
-        pairs, missing = collect_changed_files(str(report.get("sandbox") or ""), diff)
+        pairs, missing = changed_pairs, changed_missing
         st.caption(f"Changed files: {', '.join(path for path, _ in pairs) or 'none readable'}" + (f" · not pushable: {', '.join(missing)}" if missing else ""))
         st.code(diff[:20_000], language="diff")
         st.download_button("⬇ Download patch (.diff)", data=diff, file_name="chat-johnson-change.diff", mime="text/x-diff", key="repo_patch_download")

@@ -14,7 +14,7 @@ from typing import Tuple
 from .memory import TaskMemory
 from .patches import PATCH_INSTRUCTIONS, apply_file_blocks, parse_file_blocks
 from .quota import QuotaLedger
-from .router import generate
+from .router import pipeline_generate as generate
 from .sandbox import validate_python_files
 
 
