@@ -91,6 +91,7 @@ from orchestrator.router import (
     cortex_wait_seconds,
     endpoint_model,
     generate_mode,
+    heavy_stream,
     local_endpoint,
     register_local_endpoint,
     register_local_endpoint_from_env,
@@ -114,18 +115,29 @@ from orchestrator.skills import select_skills
 from orchestrator.spatial_preview import scene_preview_document
 from orchestrator.webqa import browser_available, browser_check, check_markdown, check_url
 from orchestrator.missions import (
+    EXECUTORS,
+    FAILURE_POLICIES,
     MAX_SECTIONS,
     MISSION_TEMPLATES,
+    OUTPUTS,
+    MissionBlockError,
     classify_mission,
     deliverable_slug,
+    mission_block,
     mission_hints,
+    normalise_plan,
     parse_length_target,
+    parse_mission_block,
     task_plan,
     writing_sections,
 )
+from orchestrator.connectors_nodes import CONNECTORS, validate_nodes
+from orchestrator import mcp_client
 from orchestrator.preview import extract_preview_source, safe_preview_document
 from orchestrator.vault import (
     answer_job,
+    mission_nodes_for,
+    save_mission_nodes,
     messages_around,
     search_messages,
     thread_outline,
@@ -400,6 +412,36 @@ def render_output_with_artifacts(
         st.markdown(prepare_markdown(remainder))
     if not found:
         st.markdown(prepare_markdown(text))
+    render_mission_handoff(text, project_scope, artifact_prefix)
+
+
+def render_mission_handoff(text: str, project_scope: str, artifact_prefix: str) -> None:
+    """A ```mission block in an answer gets a Send to Task Finder button; nothing runs until Launch there."""
+    if "```mission" not in text:
+        return
+    try:
+        parsed = parse_mission_block(text)
+    except MissionBlockError as exc:
+        st.caption(f"Mission block found but not usable: {exc}")
+        return
+    if not parsed:
+        return
+    if st.button("Send to Task Finder", key=f"{artifact_prefix}:mission", help="Opens Task Finder with these nodes prefilled; nothing runs until you press Launch."):
+        thread_id = send_plan_to_task_finder(project_scope, parsed)
+        st.session_state.workspace_jump = "task_finder"
+        st.session_state["notice_task_finder"] = f"Mission received from the chat into chat #{thread_id}; review the nodes and launch."
+        st.rerun()
+
+
+def send_plan_to_task_finder(project_scope: str, parsed: Dict[str, Any]) -> int:
+    """Land a parsed mission in a Task Finder chat that has no mission yet (a fresh one when the current chat is taken)."""
+    thread = active_thread(project_scope, "task_finder")
+    thread_id = int(thread["id"])
+    if thread_mission(thread) or thread_id in st.session_state.get("pending_plans", {}):
+        thread_id = create_thread(project_scope, title=parsed["statement"][:60], workspace="task_finder")
+    st.session_state.setdefault("pending_plans", {})[thread_id] = {"statement": parsed["statement"], "plan": normalise_plan(parsed["plan"])}
+    st.session_state.get("pending_missions", {}).pop(thread_id, None)
+    return thread_id
 
 
 def render_preview_panel() -> None:
@@ -1124,6 +1166,27 @@ def run_generation(
                 # Strict endpoint failed mid-flight; use the blocking path with fallback.
                 live_box.empty()
                 answer, decision = generate_mode(mode, task_type, messages, ledger, max_tokens=max_tokens, temperature=0.35)
+        elif mode == "heavy" and cortex_available():
+            # Draft and review block; the synthesis streams like a Normal Chat answer.
+            with live_box.container():
+                st.info("Heavy Mode: draft and review passes running; the synthesis streams here when they finish…")
+            stream: Any = None
+            try:
+                stream, decision = heavy_stream(task_type, messages, ledger, max_tokens=max_tokens, temperature=0.2, paid_slot=session_paid_slot())
+                if isinstance(stream, str):
+                    answer = stream
+                else:
+                    live_box.empty()
+                    with live_box.container():
+                        with st.chat_message("assistant"):
+                            st.caption(f"{stream.decision.provider}/{stream.decision.model} · {task_type} · heavy · synthesis streaming")
+                            st.write_stream(hold_fences(stream))
+                    answer, decision = stream.text, stream.decision
+            except ProviderError:
+                live_box.empty()
+                with live_box.container():
+                    st.info("Streaming synthesis unavailable; finishing Heavy Mode on the blocking path…")
+                answer, decision = generate_mode(mode, task_type, messages, ledger, max_tokens=max_tokens, temperature=0.2, paid_slot=session_paid_slot())
         else:
             with live_box.container():
                 st.info("Heavy Mode: draft → review → synthesis in progress…" if mode == "heavy" else "Generating…")
@@ -1277,7 +1340,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
     if clear.button("Clear chat", key=f"clear_thread_{workspace}", use_container_width=True,
                     help="Empty this chat. The messages move to the archive and leave the context; keys are untouched."):
         moved = clear_thread(int(current["id"]))
-        for bucket in ("pending_missions",):
+        for bucket in ("pending_missions", "pending_plans"):
             st.session_state.get(bucket, {}).pop(int(current["id"]), None)
         st.session_state[f"notice_{workspace}"] = f"Chat cleared: {moved} message(s) archived and out of context."
         st.rerun()
@@ -1354,7 +1417,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
         yes, no = st.columns(2, gap="small")
         if yes.button("Yes, delete this chat", type="primary", key=f"delete_yes_{workspace}", use_container_width=True):
             counts = delete_thread(int(current["id"]))
-            for bucket in ("pending_missions",):
+            for bucket in ("pending_missions", "pending_plans"):
                 st.session_state.get(bucket, {}).pop(int(current["id"]), None)
             st.session_state.pop(f"confirm_delete_{workspace}", None)
             st.session_state[f"notice_{workspace}"] = (
@@ -1429,6 +1492,15 @@ def _remember_workspace() -> None:
 def render_workspace_switch() -> str:
     """Server-side workspace choice, so the pinned chat bar knows where a message goes and a reload keeps the tab."""
     keys = list(WORKSPACE_LABEL)
+    jump = st.session_state.pop("workspace_jump", None)
+    if jump in keys:
+        # A button elsewhere (Send to Task Finder, Refine in chat) asked for a workspace; set before the widget is built.
+        st.session_state.workspace_select = jump
+        st.session_state.workspace_last = jump
+        try:
+            st.query_params["ws"] = jump
+        except Exception:  # pragma: no cover - older Streamlit without query_params
+            pass
     if st.session_state.get("workspace_select") not in keys:
         # First run honours ?ws=…; a deselect click on the segmented control lands here too and keeps the last workspace.
         remembered = st.session_state.get("workspace_last") or _query_value("ws")
@@ -1498,10 +1570,7 @@ def launch_mission(project_scope: str, ledger: QuotaLedger, thread_id: int, goal
         "paid_enabled": bool(st.session_state.get("paid_slot_enabled", False)),
     }
     # Keys go to the runner's in-memory stash for this job only; the row never holds them.
-    job_secrets = dict(st.session_state.get("byok_keys", {}) or {})
-    if task_mode == "heavy" and st.session_state.get("paid_slot_key"):
-        job_secrets["paid_slot_key"] = str(st.session_state.get("paid_slot_key"))
-    return enqueue_job(project_scope, mission_runner.KIND, payload, job_secrets, thread_id=thread_id)
+    return enqueue_job(project_scope, mission_runner.KIND, payload, job_secrets_for_session(), thread_id=thread_id)
 
 
 def render_jobs_strip(project_scope: str) -> None:
@@ -1586,6 +1655,12 @@ def render_launch_summary(job: Dict[str, Any], thread_id: int, dismissed: set) -
     if result.get("webqa"):
         http = result["webqa"].get("http", {})
         (st.success if http.get("ok") else st.error)(f"Web QA: {http.get('url', '')} → status {http.get('status')} in {http.get('elapsed_ms')} ms" + (f" · {http['error']}" if http.get("error") else ""))
+    for item in result.get("node_artifacts", []) or []:
+        st.caption(f"Step {item['step']} · {item['title']} locked as artifact v{item['version']} (id {item['artifact_id']}).")
+    for push in result.get("push_records", []) or []:
+        st.info(f"Pushed branch `{push.get('branch', '')}` · pull request {push.get('pr_url', '')}")
+    if result.get("stopped_at"):
+        st.warning(f"The mission stopped at “{result['stopped_at']}” (failure policy: stop); later steps did not run.")
     if result.get("truncated"):
         st.caption(f"{result['truncated']} workstream(s) stopped at the output budget; raise it in the sidebar for fuller results.")
     for title, error in result.get("failures", []):
@@ -1596,70 +1671,151 @@ def render_launch_summary(job: Dict[str, Any], thread_id: int, dismissed: set) -
         st.rerun()
 
 
-def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, pending: Dict[int, str]) -> None:
-    kind = classify_mission(goal)
+def mcp_server_names() -> List[str]:
+    try:
+        return [server["name"] for server in mcp_client.load_servers()]
+    except Exception:
+        return []
+
+
+def render_node_config(step: Dict[str, Any], thread_id: int) -> None:
+    """Executor-specific fields plus the output target, failure policy, and inputs of one node."""
+    key = f"node_{thread_id}_{step['id']}"
+    config = dict(step.get("config") or {})
+    executor = step.get("executor", "model")
+    if executor == "connector":
+        names = list(CONNECTORS)
+        current = str(config.get("connector") or names[0])
+        chosen = st.selectbox("Connector", names, index=names.index(current) if current in names else 0, key=f"{key}_connector",
+                              format_func=lambda name: f"{name} · {CONNECTORS[name]['description']}")
+        args_default = json.dumps({k: v for k, v in config.items() if k != "connector"}, indent=2) if len(config) > 1 else "{}"
+        raw = st.text_area("Arguments (JSON)", value=args_default, key=f"{key}_args", height=110,
+                           help=CONNECTORS[chosen]["description"])
+        try:
+            arguments = json.loads(raw or "{}")
+            if not isinstance(arguments, dict):
+                raise ValueError("arguments must be a JSON object")
+        except ValueError as exc:
+            st.error(f"Arguments are not valid JSON: {exc}")
+            arguments = {}
+        step["config"] = {"connector": chosen, **arguments}
+    elif executor == "sub_mission":
+        statement = st.text_input("Sub-mission statement", value=str(config.get("statement") or ""), key=f"{key}_statement")
+        sections = int(st.number_input("Sub-mission steps", min_value=1, max_value=8, value=int(config.get("sections") or 3), key=f"{key}_sections"))
+        step["config"] = {"statement": statement, "sections": sections}
+    elif executor == "model":
+        budget = st.number_input("Output budget override (0 = sidebar budget)", min_value=0, max_value=32000, value=int(config.get("max_tokens") or 0), key=f"{key}_budget")
+        step["config"] = {"max_tokens": int(budget)} if budget else {}
+    else:
+        step["config"] = config
+    left, middle, right = st.columns(3, gap="small")
+    step["output"] = left.selectbox("Output", list(OUTPUTS), index=list(OUTPUTS).index(step.get("output", "chat")), key=f"{key}_output",
+                                    help="chat: a message in this chat · artifact: locked under missions/ · both")
+    step["on_failure"] = middle.selectbox("On failure", list(FAILURE_POLICIES), index=list(FAILURE_POLICIES).index(step.get("on_failure", "stop")), key=f"{key}_failure",
+                                          help="stop ends the mission · skip continues · retry_once retries this node once, then stops")
+    inputs_text = right.text_input("Inputs (step numbers)", value=", ".join(str(i) for i in step.get("inputs") or []), key=f"{key}_inputs",
+                                   help="Earlier steps whose outputs are pasted in verbatim; empty means the chat history alone.")
+    parsed_inputs: List[int] = []
+    for token in inputs_text.replace(";", ",").split(","):
+        token = token.strip()
+        if token.isdigit():
+            parsed_inputs.append(int(token))
+    step["inputs"] = parsed_inputs
+
+
+def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, pending: Dict[int, str], preset: Optional[Dict[str, Any]] = None) -> None:
     budget = int(st.session_state.get("max_tokens", 2048))
     with st.container(border=True):
-        st.markdown(
-            f"**Proposed mission** · type `{kind}` · edit the workstreams, then launch. "
-            "Typing another message replaces this mission until it is launched."
-        )
-        st.markdown("> " + goal.replace("\n", "\n> "))
-        if kind == "writing":
-            target = parse_length_target(goal)
-            target_words = target["words"] if target else None
-            suggested = writing_sections(target_words or 800, budget)
-            count = int(st.number_input(
-                "Sections to draft", min_value=1, max_value=MAX_SECTIONS, value=suggested, key=f"task_sections_{thread_id}",
-                help="One drafting call per section, sized to the output token budget; a brief step and editor's notes are added around them.",
-            ))
-            st.caption(
-                (f"Length target: {target['amount']} {target['unit']}(s) ≈ {target_words} words. " if target else "No length named; about 800 words assumed. ")
-                + f"At a {budget}-token budget each section holds roughly {max(150, int(budget * 0.55))} words, so {suggested} section(s) are suggested."
-            )
+        if preset:
+            plan = normalise_plan(preset["plan"])
+            kind = str(plan[0].get("kind") or "general") if plan else "general"
+            st.markdown(f"**Mission from the chat** · {len(plan)} node(s) · edit, configure, then launch. Typing another message replaces it until it is launched.")
         else:
-            max_steps = len(MISSION_TEMPLATES[kind][1])
-            count = st.slider("Workstreams", min_value=1, max_value=max_steps, value=min(3, max_steps), key=f"task_count_{thread_id}_{kind}")
-        for hint in mission_hints(goal, kind, count):
-            st.caption(f"Note · {hint}")
-        plan = task_plan(goal, count, max_tokens=budget)
+            kind = classify_mission(goal)
+            st.markdown(
+                f"**Proposed mission** · type `{kind}` · edit the workstreams, then launch. "
+                "Typing another message replaces this mission until it is launched."
+            )
+        st.markdown("> " + goal.replace("\n", "\n> "))
+        if not preset:
+            if kind == "writing":
+                target = parse_length_target(goal)
+                target_words = target["words"] if target else None
+                suggested = writing_sections(target_words or 800, budget)
+                count = int(st.number_input(
+                    "Sections to draft", min_value=1, max_value=MAX_SECTIONS, value=suggested, key=f"task_sections_{thread_id}",
+                    help="One drafting call per section, sized to the output token budget; a brief step and editor's notes are added around them.",
+                ))
+                st.caption(
+                    (f"Length target: {target['amount']} {target['unit']}(s) ≈ {target_words} words. " if target else "No length named; about 800 words assumed. ")
+                    + f"At a {budget}-token budget each section holds roughly {max(150, int(budget * 0.55))} words, so {suggested} section(s) are suggested."
+                )
+            else:
+                max_steps = len(MISSION_TEMPLATES[kind][1])
+                count = st.slider("Workstreams", min_value=1, max_value=max_steps, value=min(3, max_steps), key=f"task_count_{thread_id}_{kind}")
+            for hint in mission_hints(goal, kind, count):
+                st.caption(f"Note · {hint}")
+            plan = normalise_plan(task_plan(goal, count, max_tokens=budget))
         edited = st.data_editor(
-            [{"#": step["id"], "workstream": step["title"], "type": step["type"], "instruction": step["description"]} for step in plan],
+            [{"#": step["id"], "workstream": step["title"], "executor": step["executor"], "type": step["type"], "instruction": step["description"]} for step in plan],
             hide_index=True,
             use_container_width=True,
             num_rows="fixed",
             column_config={
                 "#": st.column_config.NumberColumn(disabled=True, width="small"),
+                "executor": st.column_config.SelectboxColumn(options=list(EXECUTORS), required=True, width="small"),
                 "type": st.column_config.SelectboxColumn(options=list(TASK_TYPES), required=True, width="small"),
                 "instruction": st.column_config.TextColumn(width="large"),
             },
-            key=f"plan_editor_{thread_id}_{kind}_{count}",
+            key=f"plan_editor_{thread_id}_{kind}_{len(plan)}",
         )
         for step, row in zip(plan, edited):
             step["title"] = str(row.get("workstream") or step["title"])
+            step["executor"] = str(row.get("executor") or step["executor"])
             step["type"] = str(row.get("type") or step["type"])
             step["description"] = str(row.get("instruction") or step["description"])
+        for step in plan:
+            needs_form = step["executor"] in ("connector", "sub_mission") or step.get("config") or step.get("inputs") or step.get("output", "chat") != "chat" or step.get("on_failure", "stop") != "stop"
+            with st.expander(f"Configure step {step['id']} · {step['title']} ({step['executor']})", expanded=bool(needs_form and step["executor"] in ("connector", "sub_mission"))):
+                render_node_config(step, thread_id)
+        push_state = github_push_status()
+        reasons = validate_nodes(plan, push_armed=bool(push_state["armed"]), mcp_servers=mcp_server_names())
+        for reason in reasons:
+            st.error(reason)
         heavy = active_mode() == "heavy"
         passes = 3 if heavy else 1
-        calls = len(plan) * passes
+        model_nodes = sum(1 for step in plan if step["executor"] == "model")
+        sub_nodes = sum(int((step.get("config") or {}).get("sections") or 3) for step in plan if step["executor"] == "sub_mission")
+        calls = (model_nodes + sub_nodes) * passes
         per_step = heavy_pass_tokens(budget) if heavy else budget
         upto = "up to " if heavy else ""
         st.caption(
-            f"Cost preview: {len(plan)} workstream(s) × {upto}{passes} pass(es) = {upto}{calls} provider call(s), "
-            f"up to ~{len(plan) * per_step} output tokens"
+            f"Cost preview: {model_nodes} model node(s)" + (f" + {sub_nodes} sub-mission step(s)" if sub_nodes else "")
+            + f" × {upto}{passes} pass(es) = {upto}{calls} provider call(s), up to ~{(model_nodes + sub_nodes) * per_step} output tokens; "
+            f"{len(plan) - model_nodes - sum(1 for step in plan if step['executor'] == 'sub_mission')} deterministic node(s) cost nothing"
             + (" · Heavy Mode: draft b/2 + critique b/3 + synthesis b per workstream" if heavy else "")
         )
-        launch_col, discard_col = st.columns([0.7, 0.3], gap="small")
+        launch_col, refine_col, discard_col = st.columns([0.5, 0.25, 0.25], gap="small")
         if launch_col.button(
             send_label("Launch workstreams"), type="primary", key=f"launch_{thread_id}", use_container_width=True,
-            disabled=not configured_provider_names(),
-            help="Runs the workstreams strictly in order, each one seeing the results before it; results are saved to this chat.",
+            disabled=not configured_provider_names() or bool(reasons),
+            help=("Fix the reasons above first." if reasons else "Runs the nodes strictly in order, each one seeing the results before it; results are saved to this chat."),
         ):
+            save_mission_nodes(thread_id, plan)
             launch_mission(project_scope, ledger, thread_id, goal, plan)
             pending.pop(thread_id, None)
+            st.session_state.get("pending_plans", {}).pop(thread_id, None)
+            st.rerun()
+        if refine_col.button("Refine in chat", key=f"refine_{thread_id}", use_container_width=True,
+                             help="Posts these nodes into Normal Chat as a mission block so you can iterate in prose and send the result back."):
+            block = mission_block(goal, plan)
+            append_message(project_scope, "user", f"Refine this mission (from Task Finder chat #{thread_id}); answer with an updated ```mission block.\n\n{block}",
+                           mode=active_mode(), workspace="normal_chat", task_type="plan")
+            st.session_state.workspace_jump = "normal_chat"
             st.rerun()
         if discard_col.button("Discard", key=f"discard_{thread_id}", use_container_width=True):
             pending.pop(thread_id, None)
+            st.session_state.get("pending_plans", {}).pop(thread_id, None)
             st.rerun()
 
 
@@ -1677,6 +1833,7 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
     if mission:
         st.caption(f"Mission · {mission[:240]}")
     pending: Dict[int, str] = st.session_state.setdefault("pending_missions", {})
+    pending_plans: Dict[int, Dict[str, Any]] = st.session_state.setdefault("pending_plans", {})
     job_rows = list_jobs(project_scope, None, limit=1, thread_id=thread_id, kind=mission_runner.KIND)
     job = job_view(job_rows[0]) if job_rows else None
     running = bool(job and job["status"] in ACTIVE_STATUSES)
@@ -1688,6 +1845,7 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
             continuing = submission
         else:
             pending[thread_id] = submission.text.strip()
+            pending_plans.pop(thread_id, None)
     render_history(project_scope, "Mission conversation", workspace="task_finder")
     if continuing:
         dispatch_chat(project_scope, "task_finder", continuing, ledger)
@@ -1696,9 +1854,15 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
         st.caption("Mission running in the background: each workstream lands in this chat as it finishes, and the other workspaces stay usable.")
     elif job and job["id"] not in dismissed:
         render_launch_summary(job, thread_id, dismissed)
-    goal = pending.get(thread_id, "")
+    preset = pending_plans.get(thread_id)
+    goal = preset["statement"] if preset else pending.get(thread_id, "")
     if goal and not running:
-        render_mission_panel(project_scope, ledger, thread_id, goal, pending)
+        render_mission_panel(project_scope, ledger, thread_id, goal, pending, preset=preset)
+    elif has_mission and not running and mission_nodes_for(thread_id):
+        st.caption("Mission in progress: the chat bar continues it with every result in context. Start another mission with New chat.")
+        if st.button("Re-run this mission", key=f"rerun_{thread_id}", help="Reopens the stored nodes of this chat in the plan panel; nothing runs until Launch."):
+            pending_plans[thread_id] = {"statement": mission, "plan": mission_nodes_for(thread_id)}
+            st.rerun()
     elif not has_mission and not running:
         st.caption("No mission in this chat yet. Type one in the chat bar to see its proposed workstreams before anything runs.")
     else:
@@ -1711,6 +1875,9 @@ def job_secrets_for_session() -> Dict[str, str]:
     secrets = dict(st.session_state.get("byok_keys", {}) or {})
     if active_mode() == "heavy" and st.session_state.get("paid_slot_key"):
         secrets["paid_slot_key"] = str(st.session_state.get("paid_slot_key"))
+    if github_push_status()["armed"]:
+        # Connector nodes that write to GitHub use the same session-only slot as the Repository Work button.
+        secrets["github_token"] = str(st.session_state.get("github_push_token", "") or "").strip()
     return secrets
 
 
@@ -2305,6 +2472,22 @@ with st.sidebar:
             st.info("Toggle is on but no token was pasted; the slot stays disarmed.")
         else:
             st.caption("Disarmed. Nothing can be written to GitHub.")
+    with st.expander("MCP servers (VM worker)", expanded=False):
+        servers = mcp_client.load_servers()
+        self_hosted = os.environ.get("CHAT_JOHNSON_SELF_HOSTED", "").strip() == "1"
+        if not servers:
+            st.caption("No servers declared. Add entries to `mcp_servers.yaml` on the VM; mission nodes call them with the `mcp.call` connector.")
+        for server in servers:
+            st.markdown(f"**{server['name']}** · `{server['command']} {' '.join(server['args'])}`" + (f" · {server['description']}" if server["description"] else ""))
+            if st.button("List tools", key=f"mcp_probe_{server['name']}", disabled=not self_hosted,
+                         help="Starts the server over stdio and lists its tools; available on the self-hosted VM only."):
+                probe = mcp_client.probe(server)
+                if probe["ok"]:
+                    st.caption("Tools: " + (", ".join(probe["tools"]) or "none"))
+                else:
+                    st.error(probe["error"])
+        if servers and not self_hosted:
+            st.caption("Servers run inside the VM worker container; this deployment cannot start them.")
     st.divider()
     st.subheader("BYOK channels")
     for name, label, detail, configured in provider_status_rows():

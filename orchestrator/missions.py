@@ -15,6 +15,8 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import yaml
+
 MISSION_TEMPLATES: Dict[str, Tuple[Tuple[str, ...], List[Tuple[str, ...]]]] = {  # (title, task_type, description[, executor])
     "writing": (
         ("write", "writing", "essay", "article", "blog", "post", "story", "speech", "letter", "chapter", "draft",
@@ -236,3 +238,96 @@ def assemble_deliverable(goal: str, sections: Sequence[str]) -> str:
 def text_measure(text: str) -> Dict[str, int]:
     lines = [line for line in text.splitlines() if line.strip()]
     return {"lines": len(lines), "words": len(text.split())}
+
+
+# =============================================================================
+# Mission nodes: every step is a node with an executor, config, inputs, output, and failure policy
+# =============================================================================
+
+EXECUTORS = ("model", "solver", "webqa", "connector", "sub_mission")
+OUTPUTS = ("chat", "artifact", "both")
+FAILURE_POLICIES = ("stop", "skip", "retry_once")
+MAX_NODES = 12
+_MISSION_BLOCK = re.compile(r"```mission\s*\n(?P<body>.*?)```", re.S | re.I)
+
+
+class MissionBlockError(ValueError):
+    pass
+
+
+def normalise_plan(plan: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fill node defaults so older payloads and hand-written blocks share one shape; unknown values raise."""
+    out: List[Dict[str, Any]] = []
+    for index, raw in enumerate(plan, start=1):
+        node = dict(raw)
+        node["id"] = int(node.get("id") or index)
+        node["title"] = str(node.get("title") or f"Step {index}")
+        node["type"] = str(node.get("type") or "chat")  # router task types plus the mission-only "writing"; unknown ones route as chat
+        node["description"] = str(node.get("description") or node.get("instruction") or "")
+        executor = str(node.get("executor") or "model")
+        if executor not in EXECUTORS:
+            raise MissionBlockError(f"step {index}: unknown executor {executor!r}")
+        node["executor"] = executor
+        config = node.get("config") or {}
+        if not isinstance(config, dict):
+            raise MissionBlockError(f"step {index}: config must be a mapping")
+        node["config"] = config
+        inputs = node.get("inputs") or []
+        try:
+            node["inputs"] = [int(v) for v in inputs]
+        except (TypeError, ValueError) as exc:
+            raise MissionBlockError(f"step {index}: inputs must be step numbers") from exc
+        node["output"] = str(node.get("output") or "chat")
+        if node["output"] not in OUTPUTS:
+            raise MissionBlockError(f"step {index}: output must be one of {', '.join(OUTPUTS)}")
+        node["on_failure"] = str(node.get("on_failure") or "stop")
+        if node["on_failure"] not in FAILURE_POLICIES:
+            raise MissionBlockError(f"step {index}: on_failure must be one of {', '.join(FAILURE_POLICIES)}")
+        node.setdefault("status", "queued")
+        node.setdefault("kind", node.get("kind") or "general")
+        node.pop("instruction", None)
+        out.append(node)
+    return out
+
+
+def parse_mission_block(text: str) -> Optional[Dict[str, Any]]:
+    """{"statement", "plan"} from the first fenced ```mission YAML block, None when there is none; invalid blocks raise."""
+    match = _MISSION_BLOCK.search(text or "")
+    if not match:
+        return None
+    try:
+        data = yaml.safe_load(match.group("body"))
+    except yaml.YAMLError as exc:
+        raise MissionBlockError(f"the mission block is not valid YAML: {str(exc)[:120]}") from exc
+    if not isinstance(data, dict) or not str(data.get("statement") or "").strip():
+        raise MissionBlockError("a mission block needs a statement")
+    nodes = data.get("nodes") or []
+    if not isinstance(nodes, list) or not nodes:
+        raise MissionBlockError("a mission block needs a list of nodes")
+    if len(nodes) > MAX_NODES:
+        raise MissionBlockError(f"at most {MAX_NODES} nodes")
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise MissionBlockError("every node must be a mapping")
+        if "task_type" in node and "type" not in node:
+            node["type"] = node.pop("task_type")
+    plan = normalise_plan(nodes)
+    return {"statement": str(data["statement"]).strip()[:2000], "plan": plan}
+
+
+def mission_block(statement: str, plan: Sequence[Dict[str, Any]]) -> str:
+    """The fenced block for a plan, so a chat can refine it and send it back."""
+    nodes = []
+    for node in plan:
+        entry: Dict[str, Any] = {"title": node.get("title", ""), "executor": node.get("executor", "model"), "task_type": node.get("type", "chat"), "instruction": node.get("description", "")}
+        if node.get("config"):
+            entry["config"] = dict(node["config"])
+        if node.get("inputs"):
+            entry["inputs"] = list(node["inputs"])
+        if node.get("output", "chat") != "chat":
+            entry["output"] = node["output"]
+        if node.get("on_failure", "stop") != "stop":
+            entry["on_failure"] = node["on_failure"]
+        nodes.append(entry)
+    body = yaml.safe_dump({"statement": statement, "nodes": nodes}, sort_keys=False, allow_unicode=True, width=100)
+    return "```mission\n" + body + "```"

@@ -1,0 +1,13 @@
+# MCP servers the worker may call from mission nodes (connector "mcp.call") and the sidebar probe.
+# They run where this process runs: on the self-hosted VM's worker container, never on a shared host.
+# env values may be literals or "env:NAME" to pull a secret from the environment at call time.
+servers: []
+#  - name: filesystem
+#    description: read and write files under /data/shared
+#    command: npx
+#    args: ["-y", "@modelcontextprotocol/server-filesystem", "/data/shared"]
+#  - name: postgres
+#    command: npx
+#    args: ["-y", "@modelcontextprotocol/server-postgres"]
+#    env:
+#      DATABASE_URL: env:POSTGRES_URL

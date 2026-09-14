@@ -1695,11 +1695,14 @@ def _heavy_pipeline(
     messages: List[dict],
     max_tokens: int,
     paid_slot: Optional[PaidReasoningSlot] = None,
-) -> Tuple[str, RouteDecision]:
+    final_pass: Optional[Callable[[str, List[dict], int], Tuple[Any, RouteDecision]]] = None,
+) -> Tuple[Any, RouteDecision]:
     """Bounded plan/critique/synthesis without exposing private chain-of-thought.
 
     The optional paid slot, when armed for this session, handles only the
     critique pass; the draft and synthesis always run on free endpoints.
+    ``final_pass`` may return an unexhausted stream instead of text so the UI
+    can show the synthesis as it arrives; the fallbacks still return text.
     """
     draft, draft_decision = one_pass(task_type, messages, max(256, max_tokens // 2))
     # Only the operator's request travels with the draft: the system prompt, memory, and history
@@ -1746,7 +1749,7 @@ def _heavy_pipeline(
         },
     ]
     try:
-        final, final_decision = one_pass(task_type, synthesis_messages, max_tokens)
+        final, final_decision = (final_pass or one_pass)(task_type, synthesis_messages, max_tokens)
     except ProviderError:
         return draft, RouteDecision(
             critique_decision.provider,
@@ -1762,6 +1765,33 @@ def _heavy_pipeline(
         f"final={final_decision.reason}"
     )
     return final, final_decision
+
+
+def heavy_stream(
+    task_type: str,
+    messages: List[dict],
+    ledger: Optional[QuotaLedger] = None,
+    max_tokens: int = 4096,
+    temperature: float = 0.2,
+    system_prompt: str = "",
+    paid_slot: Optional[PaidReasoningSlot] = None,
+) -> Tuple[Any, RouteDecision]:
+    """Heavy Mode with the synthesis streamed: draft and critique block, the final pass returns a CortexStream.
+
+    The stream's ``text`` and ``decision.finish`` are complete only once it has been drained; when a
+    fallback fires the first element is plain text instead.
+    """
+    if not cortex_available():
+        raise ProviderError("no Cortex endpoint is keyed; Heavy Mode streaming needs one")
+
+    def one_pass(selected_type: str, selected_messages: List[dict], tokens: int) -> Tuple[str, RouteDecision]:
+        return cortex_generate(selected_type, selected_messages, ledger=ledger, max_tokens=tokens, temperature=temperature, system_prompt=system_prompt)
+
+    def final_pass(selected_type: str, selected_messages: List[dict], tokens: int) -> Tuple[CortexStream, RouteDecision]:
+        stream = CortexStream(selected_type, selected_messages, ledger, max_tokens=tokens, temperature=temperature, system_prompt=system_prompt)
+        return stream, stream.decision
+
+    return _heavy_pipeline(one_pass, task_type, messages, max_tokens, paid_slot=paid_slot, final_pass=final_pass)
 
 
 def generate_heavy(

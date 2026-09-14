@@ -44,6 +44,10 @@ approved reconstruction plan.
 | `orchestrator/patches.py` | Safe FILE-block and unified-diff application |
 | `orchestrator/test_loop.py` | pytest + traceback repair loop |
 | `orchestrator/executor.py` | goal → plan → route → verify → report |
+| `orchestrator/missions.py` | Mission templates, node model (`normalise_plan`, `parse_mission_block`, `mission_block`) |
+| `orchestrator/mission_runner.py` | The mission job: nodes in order, connector and sub-mission executors, outputs, failure policies |
+| `orchestrator/connectors_nodes.py` | Connector registry for nodes and the offline validator (`validate_nodes`) |
+| `orchestrator/mcp_client.py` | JSON-RPC 2.0 stdio MCP client (`mcp_servers.yaml`, `CHAT_JOHNSON_MCP_SERVERS`) |
 | `orchestrator/memory.py` | Task memory persisted to disk |
 | `research/project_seth_phase3.py` | Project Seth Phase 3 distribution and bias-sweep engine (research only) |
 | `docs/` | Bible, recovery audit, implementation plan, strategic outline |
@@ -119,6 +123,22 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   `webcheck` missions and Repository Work → Deploy Kit → "Check a deployed URL" run an HTTP check
   (status, latency, expected text, health JSON) and a browser check where Chromium exists (the VM
   worker), reported as unavailable elsewhere.
+- **Mission nodes, connectors, MCP, Heavy streaming (batch E)**: every Task Finder step is a node
+  with an `executor` (`model`, `solver`, `webqa`, `connector`, `sub_mission`), a `config`, `inputs`
+  (earlier steps pasted in verbatim), an `output` target (`chat`, `artifact` locked under
+  `missions/node-<chat>-<n>.md`, or `both`) and an `on_failure` policy (`stop` default, `skip`,
+  `retry_once`). Connector nodes run built-in actions without a model call: `deploy_kit.generate`,
+  `github.fetch`, `github.push` and `github.revert` (session token only; Launch is blocked while the
+  push slot is disarmed), `repository.run`, `vault.export_thread`, `vault.save_artifact`,
+  `webqa.check`, and `mcp.call` against servers declared in `mcp_servers.yaml` (a hand-rolled
+  JSON-RPC 2.0 stdio client in `orchestrator/mcp_client.py`; servers run inside the VM worker). A
+  `sub_mission` node runs a nested plan in the same chat with `[Sub n.m]` titles and returns its
+  deliverable. The plan panel has an executor column and a Configure expander per step, validates
+  offline before Launch (unknown connector, missing arguments, disarmed push, bad inputs), stores the
+  node graph (`mission_nodes`) so a chat can **Re-run this mission**, and **Refine in chat** posts the
+  nodes into Normal Chat as a fenced ```` ```mission ```` block. Any answer that ends with such a
+  block shows **Send to Task Finder**, which prefills the panel; nothing runs until Launch. Heavy
+  Mode's synthesis pass now streams like a Normal Chat answer (draft and review still block).
 - **Private scope per visitor**: chats, artifacts, jobs, and the routing log are keyed by a scope id
   minted for each browser session and kept on the URL (`?scope=`); bookmark it to come back. Nothing
   is shared between visitors of the same deployment.

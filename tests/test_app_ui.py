@@ -313,3 +313,73 @@ def test_finished_spatial_mission_renders_the_scene_preview(app):
     assert any("Layout resolved by the solver" in i.value for i in app.info)
     assert any(b.label.startswith("⬇ Download scene") for b in app.button) or "scene_preview" in app.session_state
     assert app.session_state["scene_preview"]["objects"][0]["name"] == "desk"
+
+
+MISSION_ANSWER = """Here is a plan.
+
+```mission
+statement: Ship the landing page
+nodes:
+  - title: Draft copy
+    executor: model
+    task_type: chat
+    instruction: Write the hero copy
+  - title: Push it
+    executor: connector
+    config: {connector: github.push, owner_repo: me/proj, files: [{path: a.md, body: hi}]}
+```
+"""
+
+
+def test_mission_block_in_chat_lands_in_task_finder_and_push_gates_launch(app, monkeypatch):
+    from orchestrator import vault
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake-key-for-the-launch-button")
+    app.query_params["scope"] = "visitor-handoff"
+    app.query_params["ws"] = "normal_chat"
+    app.run()
+    vault.append_message("visitor-handoff", "user", "plan this as a mission", workspace="normal_chat")
+    vault.append_message("visitor-handoff", "assistant", MISSION_ANSWER, provider="fake/m", workspace="normal_chat")
+    app.run()
+    assert not app.exception
+    send = next(b for b in app.button if b.label == "Send to Task Finder")
+    send.click().run()
+    assert not app.exception
+    assert app.session_state["workspace_select"] == "task_finder"
+    assert any("Mission from the chat" in m.value for m in app.markdown)
+    thread = int(vault.active_thread("visitor-handoff", "task_finder")["id"])
+    plan = app.session_state["pending_plans"][thread]["plan"]
+    assert [n["executor"] for n in plan] == ["model", "connector"] and plan[1]["config"]["connector"] == "github.push"
+    assert any("push slot armed" in e.value for e in app.error)
+    launch = next(b for b in app.button if b.label.startswith("Launch workstreams"))
+    assert launch.proto.disabled is True
+    assert app.selectbox(key=f"node_{thread}_2_connector").value == "github.push"
+    # Refine in chat posts the block into Normal Chat without a provider call.
+    next(b for b in app.button if b.label == "Refine in chat").click().run()
+    assert not app.exception
+    assert app.session_state["workspace_select"] == "normal_chat"
+    rows = vault.recent_messages("visitor-handoff", 10, workspace="normal_chat")
+    assert rows[-1]["role"] == "user" and "```mission" in rows[-1]["content"] and "github.push" in rows[-1]["content"]
+
+
+def test_rerun_reopens_stored_nodes_and_launch_stores_them(app, monkeypatch):
+    from orchestrator import vault
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake-key-for-the-launch-button")
+    app.query_params["scope"] = "visitor-nodes"
+    app.query_params["ws"] = "task_finder"
+    app.run()
+    app.chat_input[0].set_value("Research the history of tidal power").run()
+    next(b for b in app.button if b.label.startswith("Launch workstreams")).click().run()
+    assert not app.exception
+    thread = int(vault.active_thread("visitor-nodes", "task_finder")["id"])
+    stored = vault.mission_nodes_for(thread)
+    assert stored and stored[0]["executor"] == "model" and stored[0]["on_failure"] == "stop"
+    job = vault.list_jobs("visitor-nodes", kind="mission")[0]
+    vault.claim_job("t", ("mission",))
+    vault.finish_job(int(job["id"]), "done", {"thread_id": thread, "goal": "x", "steps": 1, "succeeded": 1, "failed": 0, "truncated": 0, "failures": [], "stopped_at": ""})
+    vault.set_thread_mission(thread, "Research the history of tidal power")
+    app.run()
+    assert not app.exception
+    next(b for b in app.button if b.label == "Re-run this mission").click().run()
+    assert not app.exception
+    assert any("Mission from the chat" in m.value for m in app.markdown)
+    assert app.session_state["pending_plans"][thread]["plan"][0]["title"] == stored[0]["title"]

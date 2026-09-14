@@ -135,6 +135,15 @@ CREATE INDEX IF NOT EXISTS idx_route_log_scope_time
 -- Older databases carried a destructive trigger; the application now
 -- texturizes (summarize + archive) before evicting from the active window.
 DROP TRIGGER IF EXISTS message_history_rolling_cap;
+CREATE TABLE IF NOT EXISTS mission_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    node TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mission_nodes_thread ON mission_nodes(thread_id, position ASC);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_scope TEXT NOT NULL,
@@ -870,6 +879,31 @@ def thread_outline(thread_id: int, limit: int = 200) -> List[Dict[str, Any]]:
         first = " ".join(str(row["content"]).strip().split())[:90]
         outline.append({"id": int(row["id"]), "role": row["role"], "text": first, "timestamp": float(row["timestamp"])})
     return outline
+
+
+def save_mission_nodes(thread_id: int, plan: Sequence[Mapping[str, Any]]) -> int:
+    """Store a chat's node graph (replacing the previous one) so it can be reopened and re-run."""
+    now = time.time()
+    with _open_database() as connection:
+        connection.execute("DELETE FROM mission_nodes WHERE thread_id = ?", (int(thread_id),))
+        for position, node in enumerate(plan):
+            connection.execute(
+                "INSERT INTO mission_nodes (thread_id, position, node, created_at) VALUES (?, ?, ?, ?)",
+                (int(thread_id), position, redact_secrets(json.dumps(dict(node), default=str)), now),
+            )
+    return len(plan)
+
+
+def mission_nodes_for(thread_id: int) -> List[Dict[str, Any]]:
+    with _open_database() as connection:
+        rows = connection.execute("SELECT node FROM mission_nodes WHERE thread_id = ? ORDER BY position ASC", (int(thread_id),)).fetchall()
+    nodes = []
+    for row in rows:
+        try:
+            nodes.append(json.loads(row["node"]))
+        except ValueError:
+            continue
+    return nodes
 
 
 def export_artifact(artifact_id: int) -> Tuple[str, str]:

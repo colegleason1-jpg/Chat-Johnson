@@ -34,6 +34,18 @@
 - Heartbeats: the worker stamps its rows every 15 s and fails rows silent for 3 minutes; the app
   never reaps rows because the worker owns them.
 
+## MCP servers (VM worker only)
+- Declare servers in `mcp_servers.yaml` (name, command, args, env; an env value `env:NAME` is read
+  from the worker's environment at call time, so tokens stay in `.env`). `CHAT_JOHNSON_MCP_SERVERS`
+  points at another file. The sidebar lists the servers; **List tools** probes one over stdio and is
+  enabled only where `CHAT_JOHNSON_SELF_HOSTED=1`.
+- A mission node with `executor: connector` and `config: {connector: mcp.call, server, tool,
+  arguments}` starts the server for that call, runs `initialize` → `tools/call`, and records the
+  text content in the chat. Errors are redacted before they are stored; a server that does not
+  answer within 30 s fails the node under its failure policy.
+- Mission nodes that push to GitHub take the session push token with the job (`github_token`,
+  memory only, never a row); Launch stays disabled while the slot is disarmed.
+
 ## Data
 - The SQLite vault lives on the container's disk. On Streamlit Community Cloud that disk is
   **ephemeral**: a reboot or redeploy starts with an empty vault. Download chats you care about

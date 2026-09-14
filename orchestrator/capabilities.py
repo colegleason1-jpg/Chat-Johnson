@@ -17,25 +17,26 @@ IMPLEMENTED: Tuple[Tuple[str, str], ...] = (
     ("Chat Bot", "developer chat with explicit file attachments; fenced file blocks can be locked as versioned artifacts"),
     ("Task Finder", "deterministic decomposition of a mission into typed workstreams run in order as a background job; "
                     "results land in the chat as each finishes"),
-    ("Background jobs", "missions run on worker threads with progress, cancel, and questions to the operator; the UI stays usable"),
+    ("Background jobs", "missions run on worker threads with progress, cancel, and questions to the operator"),
     ("Repository Work", "sandboxed pipeline on a GitHub repository (fetched through the API) or a local path: ingest, plan, patch, "
-                        "optional pytest repair loop, reviewable diff; pushable as a branch plus pull request through the session-only "
-                        "slot; the repository conversation sees the fetched tree and says so when nothing is loaded"),
-    ("Spatial layout", "a spatial mission turns a scene spec into a solver-resolved layout (floor snap, wall clamp, "
-                       "mass-weighted push-out) with a 3D preview"),
+                        "optional pytest repair loop, reviewable diff; pushable as a branch plus pull request through the session-only slot"),
+    ("Spatial layout", "a spatial mission turns a scene spec into a solver-resolved layout with a 3D preview"),
     ("Web QA", "HTTP checks of a deployed URL (status, latency, text, health JSON); browser checks where Chromium exists"),
-    ("Memory", "SQLite vault with a private scope per visitor: per-workspace chats, 200-message windows, texturized summaries, "
+    ("Mission nodes", "steps are nodes: executor model/solver/webqa/connector/sub_mission, config, inputs, output "
+                      "(chat/artifact/both), on_failure; connectors deploy_kit.generate, github.fetch/push/revert, "
+                      "repository.run, vault.export_thread/save_artifact, webqa.check, mcp.call"),
+    ("Memory", "SQLite vault, private scope per visitor: per-workspace chats, 200-message windows, summaries, "
                "vision digests, locked artifacts, transcript export"),
     ("Heavy Mode", "draft, review, synthesis passes; an optional paid slot serves only the review pass, armed per session"),
-    ("Live preview canvas", "sanitized rendering of HTML/CSS mockups"),
+    ("Live preview canvas", "sanitized HTML/CSS mockups"),
 )
 
 BOUNDARIES: Tuple[str, ...] = (
-    "deployed on Streamlit Community Cloud from the GitHub branch the operator configured; no CI/CD pipeline, Kubernetes, Terraform, Helm, "
-    "cloud account, or cloud credentials are attached to the app",
+    "deployed on Streamlit Community Cloud (or the operator's VM) from the configured GitHub branch; no CI/CD, Kubernetes, "
+    "Terraform, cloud account, or cloud credentials are attached",
     "never writes to GitHub on its own; the only write path is the session-only GitHub push slot (a token pasted per "
-    "session, never stored), which pushes one commit to a new branch and opens a pull request when the operator presses "
-    "the button; the default branch is never written to and a revert pull request can undo any push from the session",
+    "session, never stored): one commit to a new branch plus a pull request when the operator presses the button; the "
+    "default branch is never written; a revert pull request can undo any push",
     "cannot execute Docker, Terraform, Helm, kubectl, or cloud CLIs; it can write such files and check their syntax offline",
     "free-tier only: every provider call is metered against per-vendor RPM, TPM, and daily token ceilings",
 )
@@ -48,7 +49,9 @@ def capability_card() -> str:
     lines.extend(f"- {name}: {detail}" for name, detail in IMPLEMENTED)
     lines.append("Boundaries:")
     lines.extend(f"- {item}" for item in BOUNDARIES)
+    lines.append("Handoff: asked to turn an idea into a mission, end with a ```mission YAML block (statement; nodes with "
+                 "title, executor, task_type, instruction; optional config, inputs, output, on_failure).")
     lines.append("Roadmap (not usable today):")
     lines.extend(f"- {name} ({status})" for name, status, _ in ROADMAP_FEATURES)
-    lines.extend(f"- {name} connector (not implemented)" for name, _ in ROADMAP_CONNECTORS)
+    lines.append("- data connectors not implemented: " + ", ".join(name for name, _ in ROADMAP_CONNECTORS))
     return "\n".join(lines)
