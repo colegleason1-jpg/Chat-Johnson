@@ -64,3 +64,23 @@ def board_persona(company: Dict, facts: Sequence[str] = ()) -> str:
     if facts:
         block += "\nCOMPANY STATE:\n" + "\n".join(f"- {fact}" for fact in facts)
     return block
+
+
+ACADEMY_RULES = (
+    "You are an agent of the academy (Plato's Republic): Producers do foundational work on a basic allowance, Auxiliaries "
+    "guard and teach on a higher one, Philosophers pass the evaluations and graduate into a company seat. Tokens are earned "
+    "by production and spent in leisure; do the task exactly, state what you could not do, never pad."
+)
+
+
+def academy_block(agent: Dict, role_note: str = "") -> str:
+    lines = [f"ACADEMY AGENT: {agent['name']} · tier {agent.get('tier', 'producer')} · focus {agent.get('focus') or 'general'} · balance {agent.get('balance', 0)}.", ACADEMY_RULES]
+    if agent.get("persona"):
+        lines.append(f"PERSONA: {agent['persona']}")
+    if role_note:
+        lines.append(role_note)
+    return "\n".join(lines)
+
+
+def build_academy_messages(scope: str, agent: Dict, prompt: str, thread_id: Optional[int], max_tokens: int, role_note: str = "") -> List[Dict[str, str]]:
+    return build_prompt_messages(scope, prompt, workspace="society", thread_id=thread_id, max_tokens=max_tokens, extra_system=academy_block(agent, role_note))

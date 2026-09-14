@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS seats (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_scope TEXT NOT NULL, company_id INTEGER, department_id INTEGER,
     team_id INTEGER, key TEXT NOT NULL, title TEXT NOT NULL, roles TEXT NOT NULL DEFAULT '[]', reports_to INTEGER,
     kpis TEXT NOT NULL DEFAULT '{}', importance INTEGER NOT NULL DEFAULT 3, agent_id INTEGER,
-    status TEXT NOT NULL DEFAULT 'open', thread_id INTEGER
+    status TEXT NOT NULL DEFAULT 'open', thread_id INTEGER, miss_weeks INTEGER NOT NULL DEFAULT 0,
+    miss_week TEXT NOT NULL DEFAULT '', idle_cycles INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS rocks (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_scope TEXT NOT NULL, company_id INTEGER NOT NULL, quarter TEXT NOT NULL,
@@ -83,7 +84,12 @@ CREATE TABLE IF NOT EXISTS agents (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_scope TEXT NOT NULL, name TEXT NOT NULL, persona TEXT NOT NULL DEFAULT '',
     tier TEXT NOT NULL DEFAULT 'producer', employment TEXT NOT NULL DEFAULT 'free', seat_id INTEGER,
     balance INTEGER NOT NULL DEFAULT 0, allowance INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL DEFAULT 'idle',
-    wake_after REAL NOT NULL DEFAULT 0, interest TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL
+    wake_after REAL NOT NULL DEFAULT 0, interest TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
+    thread_id INTEGER, focus TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS personnel_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, project_scope TEXT NOT NULL, company_id INTEGER, seat_id INTEGER, agent_id INTEGER,
+    event TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', approved_by TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS token_ledger (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_scope TEXT NOT NULL, agent_id INTEGER NOT NULL, timestamp REAL NOT NULL,
@@ -115,7 +121,7 @@ CREATE TABLE IF NOT EXISTS cycles (
 TABLES = (
     "companies", "departments", "teams", "seats", "rocks", "issues", "todos", "meetings", "timeline", "catalog",
     "work_items", "escalations", "scorecard", "feedback", "agents", "token_ledger", "evaluations", "dream_bank",
-    "inquiries", "cycles",
+    "inquiries", "cycles", "personnel_log",
 )
 WORK_STATUSES = ("backlog", "rated", "assigned", "running", "review", "board", "done", "rejected")
 CATALOG_STAGES = ("backlog", "development", "draft", "edit", "preliminary_review", "board_feedback", "final", "published", "marketed")
@@ -273,8 +279,43 @@ def add_agent(project_scope: str, name: str, persona: str, tier: str = "producer
 
 
 def seat_agent(project_scope: str, seat_id: int, agent_id: int) -> None:
-    update("seats", seat_id, agent_id=int(agent_id), status="filled")
+    update("seats", seat_id, agent_id=int(agent_id), status="filled", miss_weeks=0, miss_week="", idle_cycles=0)
     update("agents", agent_id, seat_id=int(seat_id), employment="seated", mode="exploit")
+
+
+def log_personnel(project_scope: str, event: str, company_id: Optional[int] = None, seat_id: Optional[int] = None, agent_id: Optional[int] = None, reason: str = "", approved_by: str = "") -> int:
+    return insert("personnel_log", project_scope, company_id=company_id, seat_id=seat_id, agent_id=agent_id, event=event, reason=reason[:500], approved_by=approved_by, created_at=time.time())
+
+
+def graduate_pool(project_scope: str) -> List[Dict[str, Any]]:
+    """Free Philosophers ranked by their latest evaluation score (cooldown honoured), best first."""
+    now = time.time()
+    pool = [a for a in agents_for(project_scope, tier="philosopher", employment="free") if float(a.get("wake_after") or 0) <= now]
+
+    def rank(agent: Dict[str, Any]) -> float:
+        latest = rows("evaluations", project_scope, "agent_id = ?", (int(agent["id"]),), order="id DESC", limit=1)
+        return float(latest[0]["score"]) if latest else 0.5
+
+    return sorted(pool, key=lambda a: (-rank(a), int(a["id"])))
+
+
+def fill_open_seats(project_scope: str, company_id: Optional[int] = None, active_departments_only: bool = True) -> List[Dict[str, Any]]:
+    """Graduates take open seats by seat importance; returns the (seat, agent) pairs hired."""
+    hired: List[Dict[str, Any]] = []
+    pool = graduate_pool(project_scope)
+    inactive: set = set()
+    if active_departments_only:
+        inactive = {int(d["id"]) for d in rows("departments", project_scope, "active = 0")}
+    for seat in open_seats(project_scope, company_id):
+        if seat.get("department_id") and int(seat["department_id"]) in inactive:
+            continue
+        if not pool:
+            break
+        agent = pool.pop(0)
+        seat_agent(project_scope, int(seat["id"]), int(agent["id"]))
+        log_personnel(project_scope, "hire", company_id=seat.get("company_id"), seat_id=int(seat["id"]), agent_id=int(agent["id"]), reason="graduate filled an open seat", approved_by="ceo")
+        hired.append({"seat": seat, "agent": agent})
+    return hired
 
 
 def unseat_agent(project_scope: str, seat_id: int, note: str = "", fired: bool = False) -> None:

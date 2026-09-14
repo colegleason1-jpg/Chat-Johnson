@@ -230,3 +230,20 @@ def test_company_workspace_seeds_and_queues_a_cycle(app, monkeypatch):
     rows = vault.list_jobs("visitor-company", ("queued",), kind="company_cycle")
     assert len(rows) == 1 and vault.job_view(rows[0])["payload"]["company_id"] == store.company_by_key("visitor-company", "avs_studio")["id"]
     assert any("Company cycle #" in m.value for m in app.markdown)  # the jobs strip shows it
+
+
+def test_academy_workspace_seeds_and_queues_a_cycle(app, monkeypatch):
+    from orchestrator import vault
+    from orchestrator.society import store
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake-key")
+    app.query_params["scope"] = "visitor-academy"
+    app.query_params["ws"] = "academy"
+    app.run()
+    assert not app.exception
+    next(b for b in app.button if b.label.startswith("Seed the society to")).click().run()
+    assert not app.exception
+    assert len(store.agents_for("visitor-academy")) == 100
+    next(b for b in app.button if b.label == "Run an academy cycle now").click().run()
+    assert not app.exception
+    rows = vault.list_jobs("visitor-academy", ("queued",), kind="academy_cycle")
+    assert len(rows) == 1 and any("Academy cycle #" in m.value for m in app.markdown)

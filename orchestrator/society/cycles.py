@@ -38,6 +38,13 @@ DELEGATE_PROMPT = (
 )
 BREAKDOWN_PROMPT = "Break this item into 2–4 concrete sub-items a single seat can finish in one sitting. Reply lines only, exactly '- <title> :: <one-paragraph brief>'.\nITEM: {title}\nBRIEF: {brief}"
 REVIEW_PROMPT = "Review the deliverable against its brief. First line exactly PASS or FAIL, then up to 5 lines of specific notes.\nBRIEF: {brief}\nDELIVERABLE:\n{body}"
+FIRE_PROMPT = (
+    "Personnel decision. The seat {title} ({key}), held by {agent}, missed its KPIs two weeks running: {details}. "
+    "Reply exactly APPROVE to release the agent back to the society (a graduate takes the seat), or HOLD followed by one line on why."
+)
+EXEC_KEYS = ("ea_board", "ceo", "ea_ceo")
+FIRES_PER_CYCLE = 2
+IDLE_CYCLES_TO_RETIRE = 4
 REPORT_PROMPT = "Write this cycle's report for the board in under 200 words: what moved, what waits for the board, issues, and the next cycle. Facts:\n{facts}"
 
 _RATE_RE = re.compile(r"#\s*(\d+)\s*[:\-–]\s*([1-5])")
@@ -127,6 +134,74 @@ def run_now(
     return enqueue(scope, KIND_COMPANY, payload, secrets, thread_id=board_thread_id, run_after=run_after)
 
 
+def personnel_review(
+    scope: str, company: Dict[str, Any], seats: Sequence[Dict[str, Any]], seats_by_id: Dict[int, Dict[str, Any]], agents: Dict[int, Dict[str, Any]],
+    misses: Sequence[Dict[str, Any]], load: Dict[int, int], active_depts: set, ask,
+) -> Dict[str, Any]:
+    """The EA's personnel routine with the CEO's approval: fire after two missed weeks, add or retire seats by load, hire graduates."""
+    company_id = int(company["id"])
+    week = eos.iso_week()
+    missed = {m["seat"] for m in misses}
+    events = {"fired": 0, "held": 0, "created": 0, "retired": 0, "hired": 0}
+    fires = 0
+    for seat in [s for s in seats if s.get("agent_id") and s["status"] == "filled"]:
+        if seat["key"] in missed:
+            miss_weeks = int(seat.get("miss_weeks") or 0) + (1 if seat.get("miss_week") != week else 0)
+            store.update("seats", int(seat["id"]), miss_weeks=miss_weeks, miss_week=week)
+        else:
+            miss_weeks = 0
+            store.update("seats", int(seat["id"]), miss_weeks=0)
+        if miss_weeks >= 2 and seat["key"] not in EXEC_KEYS and fires < FIRES_PER_CYCLE:
+            fires += 1
+            agent = agents.get(int(seat["agent_id"]), {})
+            details = "; ".join(f"{m['kpi']} {m['actual']} < {m['target']}" for m in misses if m["seat"] == seat["key"])
+            verdict = ask("ceo", FIRE_PROMPT.format(title=seat["title"], key=seat["key"], agent=agent.get("name", "?"), details=details), tokens=120)
+            if verdict.strip().upper().startswith("APPROVE"):
+                store.update("seats", int(seat["id"]), agent_id=None, status="open", miss_weeks=0, miss_week="")
+                store.update("agents", int(seat["agent_id"]), seat_id=None, employment="free", mode="idle", wake_after=time.time() + 7 * eos.DAY, note=f"released from {seat['title']} at {company['name']}: {details}"[:500])
+                store.log_personnel(scope, "fire", company_id=company_id, seat_id=int(seat["id"]), agent_id=int(seat["agent_id"]), reason=details, approved_by="ceo")
+                events["fired"] += 1
+            else:
+                store.log_personnel(scope, "hold", company_id=company_id, seat_id=int(seat["id"]), agent_id=int(seat["agent_id"]), reason=verdict.strip()[:300] or "no CEO verdict", approved_by="ceo")
+                events["held"] += 1
+    # Seats follow load: one new seat per cycle where a department's assigned work exceeds twice its filled seats;
+    # a worker seat idle for four cycles retires when its department keeps at least one other worker.
+    by_dept: Dict[int, List[Dict[str, Any]]] = {}
+    for seat in seats:
+        by_dept.setdefault(int(seat.get("department_id") or 0), []).append(seat)
+    created = False
+    for dept_id, members in by_dept.items():
+        if dept_id not in active_depts:
+            continue
+        workers = [s for s in members if s["key"] not in EXEC_KEYS and s["status"] == "filled"]
+        if not workers:
+            continue
+        dept_load = sum(load.get(int(s["id"]), 0) for s in workers)
+        if not created and dept_load > 2 * len(workers):
+            busiest = max(workers, key=lambda s: load.get(int(s["id"]), 0))
+            number = 1 + sum(1 for s in members if s["key"].startswith(busiest["key"] + "_added"))
+            new_id = store.insert("seats", scope, company_id=company_id, department_id=dept_id, team_id=busiest.get("team_id"), key=f"{busiest['key']}_added_{number}",
+                                  title=f"{busiest['title']} (added)", roles=store.load_json(busiest.get("roles"), []), reports_to=busiest.get("reports_to"),
+                                  kpis=store.load_json(busiest.get("kpis"), {}), importance=int(busiest.get("importance") or 3), status="open")
+            store.log_personnel(scope, "create_seat", company_id=company_id, seat_id=new_id, reason=f"department load {dept_load} over {len(workers)} seat(s)", approved_by="ea_ceo")
+            events["created"] += 1
+            created = True
+        leaders = {int(s["reports_to"]) for s in seats if s.get("reports_to")}
+        for seat in workers:
+            if int(seat["id"]) in leaders:
+                continue
+            idle = int(seat.get("idle_cycles") or 0) + 1 if load.get(int(seat["id"]), 0) == 0 else 0
+            store.update("seats", int(seat["id"]), idle_cycles=idle)
+            if idle >= IDLE_CYCLES_TO_RETIRE and len(workers) > 1 and events["retired"] == 0:
+                store.update("seats", int(seat["id"]), status="retired", agent_id=None, idle_cycles=0)
+                if seat.get("agent_id"):
+                    store.update("agents", int(seat["agent_id"]), seat_id=None, employment="free", mode="idle", note=f"seat retired at {company['name']}")
+                store.log_personnel(scope, "retire_seat", company_id=company_id, seat_id=int(seat["id"]), agent_id=seat.get("agent_id"), reason=f"idle for {IDLE_CYCLES_TO_RETIRE} cycles", approved_by="ea_ceo")
+                events["retired"] += 1
+    events["hired"] = len(store.fill_open_seats(scope, company_id))
+    return events
+
+
 def _lines_for_items(items: Sequence[Dict[str, Any]]) -> str:
     return "\n".join(f"#{i['id']} · {i['title']} — {i['brief'][:160]}" for i in items)
 
@@ -178,6 +253,15 @@ def company_cycle(ctx: JobContext) -> Dict[str, Any]:
         misses = eos.scorecard_review(scope, company_id, cycle_id)
         log.append({"step": "scorecard", "misses": len(misses)})
         ctx.progress(step=1, total=total_steps, text=f"Scorecard: {len(misses)} miss(es)")
+        stage = "personnel"
+        events = personnel_review(scope, company, seats, seats_by_id, agents, misses, load, active_depts, ask)
+        if events["fired"] or events["hired"] or events["created"] or events["retired"]:
+            # Seats changed hands: reload the org before delegating.
+            seats = store.seats_for(scope, company_id)
+            seats_by_id = {int(s["id"]): s for s in seats}
+            seats_by_key = {s["key"]: s for s in seats}
+            agents = {int(a["id"]): a for a in store.agents_for(scope)}
+        log.append({"step": "personnel", **events})
 
         # 2 · Level 10 meeting (EA to the CEO)
         stage = "l10"

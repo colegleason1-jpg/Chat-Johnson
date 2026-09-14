@@ -45,6 +45,12 @@
   cycle with `run_after`; the chain lives only while the process and its session keys survive
   (the VM worker with env keys makes it 24/7). Pause cancels the queued successor.
 
+## Academy cycles and personnel
+- `academy_cycle` jobs are bounded to 12 calls and the academy's treasury share. Promotions are
+  capped per cycle and every grade is paired with the deterministic check, so a model cannot promote
+  by flattery alone. Firing needs two missed scorecard weeks and the CEO's APPROVE; released agents
+  keep their history and sit out a week before graduation can seat them again.
+
 ## Quota caps
 - Per-vendor daily token ceilings default to the `DAILY_CAPS` table; set `CHAT_JOHNSON_DAILY_<VENDOR>`
   (for example `CHAT_JOHNSON_DAILY_GEMINI=2000000`, `0` = uncapped) on the host to change them.

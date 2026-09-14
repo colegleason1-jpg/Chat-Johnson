@@ -896,6 +896,7 @@ WORKSPACE_TABS = (
     ("Chat Bot", "chat_bot"),
     ("Normal Chat", "normal_chat"),
     ("Company", "company"),
+    ("Academy", "academy"),
 )
 assert set(key for _, key in WORKSPACE_TABS) <= set(VAULT_WORKSPACES)  # "society" and "academy" have no tab of their own
 WORKSPACE_LABEL = {key: label for label, key in WORKSPACE_TABS}
@@ -906,7 +907,7 @@ CHAT_INPUT_ACCEPTS_FILES = "accept_file" in inspect.signature(st.chat_input).par
 INJECTION_BUDGET_CHARS = 120_000
 ROUTING_LOG_LIMIT = 40
 MISSION_PREFIX = "MISSION: "
-JOB_LABELS = {"mission": "Mission", "company_cycle": "Company cycle"}
+JOB_LABELS = {"mission": "Mission", "company_cycle": "Company cycle", "academy_cycle": "Academy cycle"}
 BACKLOG_LINE = re.compile(r"^\s*BACKLOG:\s*(.+?)\s*::\s*(.+?)\s*$", re.M)
 CHAT_MAX_WAIT_SECONDS = 65  # one free-tier window; longer waits surface as the plain error instead
 KEY_GUIDES = (
@@ -1317,6 +1318,8 @@ def chat_placeholder(workspace: str, ready: bool) -> str:
         return "Discuss the repository work: the diff, the next change, a review…"
     if workspace == "company":
         return "Tell the Executive Assistant an idea, a directive, or a question…"
+    if workspace == "academy":
+        return "The academy has no chat: talk to a company's Executive Assistant in the Company workspace"
     return "Message Normal Chat…"
 
 
@@ -1844,12 +1847,83 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
                 st.rerun()
 
 
+
+def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
+    st.subheader("Academy")
+    st.caption(
+        "Plato's Republic as a training society: Producers do foundational work on a basic allowance, Auxiliaries grade and guard "
+        "on a higher one, Philosophers pass the evaluation and graduate into open company seats. One society feeds both companies."
+        + mode_caption()
+    )
+    if submission and submission.text.strip():
+        st.info("The academy has no chat. Talk to a company's Executive Assistant in the Company workspace.")
+    agents = society_store.agents_for(project_scope)
+    tiers = {tier: sum(1 for a in agents if a["tier"] == tier) for tier in ("producer", "auxiliary", "philosopher")}
+    seated = sum(1 for a in agents if a["employment"] == "seated")
+    cols = st.columns(5)
+    cols[0].metric("Agents", len(agents))
+    cols[1].metric("Producers", tiers["producer"])
+    cols[2].metric("Auxiliaries", tiers["auxiliary"])
+    cols[3].metric("Philosophers", tiers["philosopher"])
+    cols[4].metric("Seated", seated)
+    seed_col, run_col, chain_col = st.columns([0.35, 0.35, 0.3])
+    target = int(st.session_state.get("academy_target", 100))
+    if seed_col.button(f"Seed the society to {target} agents", key="seed_academy", type="primary", use_container_width=True, disabled=len(agents) >= target):
+        created = society.seed_academy(project_scope, target)
+        st.success(f"{created} agent(s) created.")
+        st.rerun()
+    chain = chain_col.checkbox("Keep cycling (3 h)", key="academy_chain", value=False)
+    if run_col.button("Run an academy cycle now", key="run_academy", use_container_width=True, disabled=not configured_provider_names() or not agents):
+        society.run_academy_now(project_scope, job_secrets_for_session(), mode=active_mode(), call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 900), chain=chain)
+        st.rerun()
+    queued = [job_view(r) for r in list_jobs(project_scope, ("queued",), limit=50, kind=society.KIND_ACADEMY)]
+    if queued and st.button("Pause chain (cancel queued academy cycles)", key="pause_academy"):
+        for job in queued:
+            request_cancel(job["id"])
+        st.rerun()
+    st.number_input("Society size target", min_value=10, max_value=500, value=target, step=10, key="academy_target")
+    classes, evals, personnel, cycle_tab = st.tabs(["Classes", "Evaluations", "Personnel log", "Academy cycles"])
+    with classes:
+        if agents:
+            seats = {int(s["id"]): s for s in society_store.rows("seats", project_scope, limit=2000)}
+            st.dataframe(
+                [{"agent": a["name"], "tier": a["tier"], "employment": a["employment"], "seat": seats.get(int(a["seat_id"] or 0), {}).get("title", ""), "focus": a["focus"], "balance": a["balance"], "allowance": a["allowance"], "mode": a["mode"], "interest": a["interest"][:60]} for a in agents],
+                hide_index=True, use_container_width=True,
+            )
+        else:
+            st.caption("No agents yet. Seed the society, or create a company (its founding agents join the society).")
+    with evals:
+        rows = society_store.rows("evaluations", project_scope, order="id DESC", limit=60)
+        names = {int(a["id"]): a["name"] for a in agents}
+        if rows:
+            st.dataframe([{"when": time.strftime("%m-%d %H:%M", time.gmtime(float(r["timestamp"]))), "agent": names.get(int(r["agent_id"]), r["agent_id"]), "kind": r["kind"], "prompt": r["prompt_key"], "score": r["score"], "passed": bool(r["passed"]), "grader": names.get(int(r["grader_agent_id"] or 0), "check only")} for r in rows], hide_index=True, use_container_width=True)
+        else:
+            st.caption("Evaluations appear when the first academy cycle grades producer work.")
+    with personnel:
+        rows = society_store.rows("personnel_log", project_scope, order="id DESC", limit=60)
+        names = {int(a["id"]): a["name"] for a in agents}
+        seats = {int(s["id"]): s for s in society_store.rows("seats", project_scope, limit=2000)}
+        if rows:
+            st.dataframe([{"when": time.strftime("%m-%d %H:%M", time.gmtime(float(r["created_at"]))), "event": r["event"], "seat": seats.get(int(r["seat_id"] or 0), {}).get("title", ""), "agent": names.get(int(r["agent_id"] or 0), ""), "reason": r["reason"][:120], "approved by": r["approved_by"]} for r in rows], hide_index=True, use_container_width=True)
+        else:
+            st.caption("Hires, fires, promotions, graduations, and seat changes are logged here.")
+    with cycle_tab:
+        cycles = [c for c in society_store.rows("cycles", project_scope, "kind = 'academy'", order="id DESC", limit=20)]
+        if cycles:
+            st.dataframe([{"cycle": c["id"], "status": c["status"], "started": time.strftime("%m-%d %H:%M", time.gmtime(float(c["started_at"]))), "calls": c["calls"], "tokens": c["tokens_used"], "budget": c["tokens_planned"]} for c in cycles], hide_index=True, use_container_width=True)
+            with st.expander("Last academy cycle log", expanded=False):
+                st.json(society_store.load_json(cycles[0]["log"], []), expanded=False)
+        else:
+            st.caption("An academy cycle pays allowances, runs producer tasks, grades them, promotes, examines one graduation candidate, and fills open seats.")
+
+
 WORKSPACE_RENDERERS = {
     "task_finder": render_task_finder,
     "repository": render_repository_work,
     "chat_bot": render_chat_bot,
     "normal_chat": render_normal_chat,
     "company": render_company,
+    "academy": render_academy,
 }
 
 

@@ -253,3 +253,36 @@ def match_seat(item_title: str, item_brief: str, seats: Sequence[Dict], exclude_
         if score > best_score:
             best, best_score = seat, score
     return best
+
+
+ALLOWANCES = {"producer": 500, "auxiliary": 1_500, "philosopher": 2_000}
+FOCUSES = ("research", "drafting", "editing", "data", "design", "marketing", "support", "planning", "analysis", "dialogue")
+TIER_MIX = (("producer", 0.60), ("auxiliary", 0.25), ("philosopher", 0.15))
+
+
+def seed_academy(scope: str, total: int = 100) -> int:
+    """Top the society up to ``total`` agents (seated founders count); returns how many were created.
+
+    Deterministic names and personas, no model calls: Producers on a basic allowance, Auxiliaries
+    (guardians and teachers) on more, Philosophers ready to graduate into open seats.
+    """
+    existing = store.agents_for(scope)
+    missing = max(0, int(total) - len(existing))
+    if missing == 0:
+        return 0
+    counts = {tier: int(round(missing * share)) for tier, share in TIER_MIX}
+    counts["producer"] += missing - sum(counts.values())
+    created = 0
+    start = len(existing) + 1
+    for tier, _ in TIER_MIX:
+        for _ in range(counts[tier]):
+            number = start + created
+            focus = FOCUSES[number % len(FOCUSES)]
+            persona = {
+                "producer": f"Producer {number:03d}, focus {focus}: does foundational work exactly as briefed, states what it could not do.",
+                "auxiliary": f"Auxiliary {number:03d}, focus {focus}: a guardian and teacher; grades producers strictly against the brief and flags unsafe or empty work.",
+                "philosopher": f"Philosopher {number:03d}, focus {focus}: plans before writing, uses only the facts given, and synthesises inputs into one result.",
+            }[tier]
+            store.add_agent(scope, f"{tier.title()} {number:03d}", persona, tier=tier, allowance=ALLOWANCES[tier], focus=focus)
+            created += 1
+    return created

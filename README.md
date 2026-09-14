@@ -73,6 +73,17 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   bar in the Company workspace talks to the Executive Assistant to the Board, whose BACKLOG lines
   become work items. Cycles are bounded by calls and by a treasury share of today's real token
   budget, and can chain at the company interval while the app is awake.
+- **Academy workspace (batch S2)**: the society on Plato's Republic. "Seed the society" creates agents up
+  to a target (100 by default): Producers on a basic allowance, Auxiliaries (guardians and teachers)
+  on a higher one, Philosophers ready to graduate. An **academy cycle** pays allowances, gives the
+  least-tried Producers a foundational task, has Auxiliaries grade and audit each one with the
+  deterministic check alongside, promotes Producers after three graded passes, examines one Auxiliary
+  whose gradings agreed with the checker three times (a three-rubric evaluation graded by a
+  Philosopher), and lets graduates fill open seats in both companies by seat importance. The company
+  cycle's **personnel routine** counts missed scorecard weeks per seat, asks the CEO to APPROVE or HOLD
+  a release after two, returns released agents to the society with a cooldown, adds a seat where a
+  department's load exceeds twice its seats, retires worker seats idle for four cycles, and hires
+  graduates into every open seat. Every event is in the personnel log.
 - **Private scope per visitor**: chats, artifacts, jobs, and the routing log are keyed by a scope id
   minted for each browser session and kept on the URL (`?scope=`); bookmark it to come back. Nothing
   is shared between visitors of the same deployment.

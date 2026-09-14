@@ -12,7 +12,7 @@ sys.path.insert(0, ROOT)
 
 from orchestrator import jobs, vault  # noqa: E402
 from orchestrator.router import RouteDecision  # noqa: E402
-from orchestrator.society import cycles, economy, evaluate, store, templates  # noqa: E402
+from orchestrator.society import academy, cycles, economy, evaluate, store, templates  # noqa: E402
 from orchestrator.society.personas import board_persona, persona_block  # noqa: E402
 
 
@@ -128,7 +128,7 @@ def test_company_cycle_moves_work_through_the_pipeline(db, monkeypatch):
     result = view["result"]
     assert result["status"] == "done" and result["calls"] == len(calls) and 8 <= result["calls"] <= 31
     steps = [entry["step"] for entry in result["log"]]
-    assert steps == ["scorecard", "l10", "rate", "delegate", "analytics", "execute", "review", "report"]
+    assert steps == ["scorecard", "personnel", "l10", "rate", "delegate", "analytics", "execute", "review", "report"]
     statuses = {}
     for item in store.work_items_for(db, avs, limit=500):
         statuses[item["status"]] = statuses.get(item["status"], 0) + 1
@@ -157,3 +157,103 @@ def test_company_cycle_stops_cleanly_when_the_budget_runs_out(db, monkeypatch):
     assert view["result"]["log"][-1]["step"] in ("rate", "delegate") and "budget exhausted" in view["result"]["log"][-1]["stopped"]
     assert store.cycles_for(db, avs, limit=1)[0]["status"] == "budget"
     assert not store.work_items_for(db, avs, ("running",))  # nothing left half-done
+
+
+def test_seed_academy_tops_the_society_up_to_the_target(db):
+    avs = templates.seed_company(db, "avs_studio")
+    created = templates.seed_academy(db, 100)
+    agents = store.agents_for(db)
+    assert created == 100 - 19 and len(agents) == 100 and templates.seed_academy(db, 100) == 0
+    tiers = {tier: sum(1 for a in agents if a["tier"] == tier and a["employment"] == "free") for tier in ("producer", "auxiliary", "philosopher")}
+    assert tiers == {"producer": 49, "auxiliary": 20, "philosopher": 12}
+    assert all(a["allowance"] == templates.ALLOWANCES[a["tier"]] for a in agents)
+    assert len(store.seats_for(db, avs, "filled")) == 19  # seeding the society hires nobody by itself
+
+
+def fake_academy_model(calls):
+    def generate_mode(mode, task_type, messages, ledger, max_tokens=4096, temperature=0.2, paid_slot=None):
+        prompt = messages[-1]["content"]
+        calls.append(prompt[:40])
+        if "Auxiliary guardian grading" in prompt:
+            text = "SCORE: 85\nPASS\nClear and complete.\nAUDIT: ok"
+        elif "Philosopher evaluation" in prompt:
+            text = ("CONTEXT\n" + "six works editorial review two writers idle board review ten days marketing opens after wave one unknown budget " * 6
+                    + "\nPLAN\n" + "step one brief writers step two review step three board " * 8 + "\nSYNTHESIS\n" + "assign the idle writers and hold the board review date " * 4)
+        elif "Grade this evaluation answer" in prompt:
+            text = "CONTEXT: 90\nPLANNING: 85\nSYNTHESIS: 80\nPASS"
+        elif "Personnel decision" in prompt:
+            text = "APPROVE"
+        else:
+            text = " ".join(prompt.split()[:120]) + " " + " ".join(prompt.split()[:120])  # echo the brief: on-topic, long enough
+        return text, RouteDecision("fake", "m1", task_type, "r")
+    return generate_mode
+
+
+def test_academy_cycle_grades_promotes_graduates_and_fills_open_seats(db, monkeypatch):
+    avs = templates.seed_company(db, "avs_studio")
+    templates.seed_academy(db, 30)  # 11 new: 7 producers, 3 auxiliaries, 1 philosopher (rounding)
+    producers = store.agents_for(db, tier="producer", employment="free")
+    auxiliaries = store.agents_for(db, tier="auxiliary", employment="free")
+    assert producers and auxiliaries
+    # A producer with three graded passes (promoted this cycle) and an auxiliary with three agreeing gradings (examined this cycle).
+    for _ in range(3):
+        store.insert("evaluations", db, agent_id=int(producers[0]["id"]), kind="task", prompt_key="seeded", score=0.9, rubric={}, passed=1, timestamp=time.time())
+    for _ in range(3):
+        store.insert("evaluations", db, agent_id=int(producers[1]["id"]), grader_agent_id=int(auxiliaries[0]["id"]), kind="task", prompt_key="seeded", score=0.8, rubric={"agree": True}, passed=1, timestamp=time.time())
+    writer = store.seat_by_key(db, avs, "writer_2")
+    store.unseat_agent(db, int(writer["id"]), note="left")
+    assert store.open_seats(db, avs)[0]["key"] in {s["key"] for s in store.seats_for(db, avs, "open")}
+    free_philosophers_before = len(store.agents_for(db, tier="philosopher", employment="free"))
+    allowances_before = sum(int(a["allowance"]) for a in store.agents_for(db))  # paid before promotions raise anyone's allowance
+    calls = []
+    monkeypatch.setattr(academy, "generate_mode", fake_academy_model(calls))
+    monkeypatch.setattr(academy, "cortex_wait_seconds", lambda ledger, messages, budget: 0.0)
+    monkeypatch.setattr(economy.Treasury, "daily_remaining", lambda self: 10_000_000)
+    job_id = academy.run_now(db, {"GEMINI_API_KEY": "AIza-fake"}, chain=True)
+    jobs.run_job(vault.claim_job("t", (academy.KIND_ACADEMY,)))
+    view = vault.job_view(vault.job_by_id(job_id))
+    assert view["status"] == "done", view
+    result = view["result"]
+    assert result["status"] == "done" and result["calls"] <= academy.DEFAULT_MAX_CALLS
+    steps = [entry["step"] for entry in result["log"]]
+    assert steps == ["allowance", "producers", "grading", "promotions", "hiring"]
+    assert result["log"][1]["tasks"] == academy.PRODUCERS_PER_CYCLE and result["log"][2]["graded"] == academy.PRODUCERS_PER_CYCLE
+    graded = store.rows("evaluations", db, "kind = 'task' AND cycle_id = ?", (result["cycle_id"],))
+    assert len(graded) == academy.PRODUCERS_PER_CYCLE and all(g["grader_agent_id"] and g["passed"] for g in graded)
+    assert store.load_json(graded[0]["rubric"], {})["agree"] is True and store.load_json(graded[0]["rubric"], {})["audit"] == "ok"
+    assert store.row("agents", int(producers[0]["id"]))["tier"] == "auxiliary"  # three graded passes
+    assert result["promoted"] >= 1 and result["graduated"] == 1
+    assert store.row("agents", int(auxiliaries[0]["id"]))["tier"] in ("philosopher",) or store.rows("evaluations", db, "kind = 'graduation'")
+    assert result["hired"] >= 1 and store.row("seats", int(writer["id"]))["status"] == "filled"
+    assert len(store.agents_for(db, tier="philosopher", employment="free")) <= free_philosophers_before + 1
+    events = [r["event"] for r in store.rows("personnel_log", db)]
+    assert "promote" in events and "graduate" in events and "hire" in events
+    assert sum(r["amount"] for r in store.rows("token_ledger", db, "kind = 'allowance'")) == allowances_before
+    assert store.rows("cycles", db, "kind = 'academy'")[0]["status"] == "done"
+    assert vault.list_jobs(db, ("queued",), kind=academy.KIND_ACADEMY)  # chained successor
+
+
+def test_personnel_routine_fires_after_two_missed_weeks_and_hires_a_graduate(db, monkeypatch):
+    avs = templates.seed_company(db, "avs_studio")
+    graduate = store.add_agent(db, "Philosopher 900", "ready", tier="philosopher", allowance=2000)
+    writer = store.seat_by_key(db, avs, "writer_1")
+    old_agent = int(writer["agent_id"])
+    store.update("seats", int(writer["id"]), miss_weeks=1, miss_week="2000-W01")  # missed last week; this week's scorecard misses again
+    calls = []
+    monkeypatch.setattr(cycles, "generate_mode", fake_academy_model(calls))
+    monkeypatch.setattr(cycles, "cortex_wait_seconds", lambda ledger, messages, budget: 0.0)
+    monkeypatch.setattr(economy.Treasury, "daily_remaining", lambda self: 10_000_000)
+    job_id = cycles.run_now(db, avs, {"GEMINI_API_KEY": "AIza-fake"}, max_calls=3)
+    jobs.run_job(vault.claim_job("t", (cycles.KIND_COMPANY,)))
+    result = vault.job_view(vault.job_by_id(job_id))["result"]
+    personnel = next(entry for entry in result["log"] if entry["step"] == "personnel")
+    assert personnel["fired"] == 1 and personnel["hired"] == 1 and any("Personnel decision" in c for c in calls)
+    seat = store.row("seats", int(writer["id"]))
+    assert seat["status"] == "filled" and seat["agent_id"] == graduate and seat["miss_weeks"] == 0
+    released = store.row("agents", old_agent)
+    assert released["employment"] == "free" and released["seat_id"] is None and released["wake_after"] > time.time() + 6 * 86400
+    assert "released from Writer" in released["note"]
+    events = [r["event"] for r in store.rows("personnel_log", db)]
+    assert events == ["fire", "hire"]
+    # Other missing seats only reach one missed week this cycle: no other firing.
+    assert store.count("seats", db, "company_id = ? AND miss_weeks >= 2", (avs,)) == 0

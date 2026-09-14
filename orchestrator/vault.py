@@ -193,6 +193,10 @@ def initialize_database() -> None:
         from .society.store import SOCIETY_SCHEMA_SQL  # local import: the society package imports this module
 
         connection.executescript(SOCIETY_SCHEMA_SQL)
+        for column, ddl in (("miss_weeks", "INTEGER NOT NULL DEFAULT 0"), ("miss_week", "TEXT NOT NULL DEFAULT ''"), ("idle_cycles", "INTEGER NOT NULL DEFAULT 0")):
+            _ensure_column(connection, "seats", column, ddl)
+        _ensure_column(connection, "agents", "thread_id", "INTEGER")
+        _ensure_column(connection, "agents", "focus", "TEXT NOT NULL DEFAULT ''")
         # Backfill: every scope that has thread-less rows gets one "Main thread".
         scopes = {
             row[0]
