@@ -29,7 +29,7 @@ IMPLEMENTED: Tuple[Tuple[str, str], ...] = (
 )
 
 BOUNDARIES: Tuple[str, ...] = (
-    "deployed on Streamlit Community Cloud from the GitHub main branch; no CI/CD pipeline, Kubernetes, Terraform, Helm, "
+    "deployed on Streamlit Community Cloud from the GitHub branch the operator configured; no CI/CD pipeline, Kubernetes, Terraform, Helm, "
     "cloud account, or cloud credentials are attached to the app",
     "never writes to GitHub on its own; the only write path is the session-only GitHub push slot (a token pasted per "
     "session, never stored), which pushes one commit to a new branch and opens a pull request when the operator presses "

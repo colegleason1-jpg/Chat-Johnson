@@ -1,7 +1,9 @@
 # Runbook · Chat Johnson on Streamlit Community Cloud
 
 ## Deploy
-1. Merge the pull request into `main`. Streamlit Community Cloud redeploys from `main` automatically.
+1. Push to the branch the Streamlit Community Cloud app is configured to deploy (today the working
+   branch itself). Every push redeploys and restarts the container, which empties the vault: download
+   any chat you want to keep before a push lands.
 2. If the app still shows the old build marker after a few minutes, open *Manage app* and reboot.
 3. Set `CHAT_JOHNSON_BUILD` in the app's secrets/environment to the deployed commit when you want
    the build marker verified; without it the marker reads `unknown` on platforms that strip `.git`.
