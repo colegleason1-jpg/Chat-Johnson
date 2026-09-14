@@ -17,17 +17,20 @@ def keywords(query: str) -> List[str]:
     return _WORD.findall((query or "").lower())
 
 
-def _score(text: str, words: Sequence[str]) -> Tuple[int, int, int]:
-    """Lower is better: (words not at a word boundary, first match position, length)."""
+def _score(text: str, words: Sequence[str]) -> Tuple[int, int, int, int]:
+    """Lower is better: (keywords that are not a whole word, not at a word start, first match position, length)."""
     lowered = text.lower()
-    boundary_misses = 0
+    whole_misses = start_misses = 0
     first = len(lowered)
     for word in words:
         position = lowered.find(word)
         first = min(first, position)
-        if not (position == 0 or not lowered[position - 1].isalnum()):
-            boundary_misses += 1
-    return boundary_misses, first, len(lowered)
+        starts = position == 0 or not lowered[position - 1].isalnum()
+        end = position + len(word)
+        ends = end >= len(lowered) or not lowered[end].isalnum()
+        start_misses += int(not starts)
+        whole_misses += int(not (starts and ends))
+    return whole_misses, start_misses, first, len(lowered)
 
 
 def keyword_rank(query: str, candidates: Iterable[T], key: Callable[[T], str] = str, limit: int = 20) -> List[T]:
