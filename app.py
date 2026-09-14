@@ -97,7 +97,7 @@ from orchestrator.connectors import ROADMAP_FEATURES, connector_status
 from orchestrator.deploykit import CLOUDS, LANGUAGES, TARGETS, KitSpec, generate_kit, kit_zip, summarize, validate_kit
 from orchestrator.github_auth import mint_state, verify_state
 from orchestrator.github_push import GitHubPushError, GitHubWriter, PushRecord, branch_name_for
-from orchestrator.github_repo import GitHubRepoError, collect_changed_files, fetch_tree, list_repositories, looks_like_owner_repo
+from orchestrator.github_repo import GitHubRepoError, collect_changed_files, fetch_tree, list_repositories, looks_like_owner_repo, qualify_repository, whoami
 from orchestrator.repo_ingest import repo_prompt_context
 from orchestrator.missions import (
     MAX_SECTIONS,
@@ -249,7 +249,21 @@ def github_push_status() -> Dict[str, Any]:
     token = str(st.session_state.get("github_push_token", "") or "").strip()
     fetched = st.session_state.get("repo_fetched") or {}
     repo = f"{fetched['owner']}/{fetched['repo']}" if fetched else ""
-    return {"enabled": enabled, "repo": repo, "armed": enabled and bool(token), "connected": bool(repo)}
+    return {"enabled": enabled, "repo": repo, "armed": enabled and bool(token), "connected": bool(repo), "login": github_login(token if enabled else "")}
+
+
+def github_login(token: str) -> str:
+    """The token's GitHub login, looked up once per token (one API call) and remembered for the session."""
+    if not token:
+        return ""
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    cache: Dict[str, str] = st.session_state.setdefault("github_login_cache", {})
+    if digest not in cache:
+        try:
+            cache[digest] = whoami(token)
+        except GitHubRepoError:
+            cache[digest] = ""
+    return cache[digest]
 
 
 def provider_status_rows() -> List[Tuple[str, str, str, bool]]:
@@ -603,7 +617,7 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
                 if choices:
                     pick = st.selectbox("Repository", choices, key="repo_pick", help="Type to filter. Newest activity first.")
                 else:
-                    pick = st.text_input("Repository (owner/name)", key="repo_manual", placeholder="owner/repo")
+                    pick = st.text_input("Repository", key="repo_manual", placeholder="name, or owner/name" if push_state["login"] else "owner/repo")
                 if st.button("Refresh list", key="repo_list"):
                     st.session_state.pop("repo_choices", None)
                     st.rerun()
@@ -612,6 +626,7 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
                 st.caption("Arm GitHub push in the sidebar to pick from your repositories and read private ones.")
             with st.expander("Advanced: branch, tag, or commit", expanded=False):
                 ref = st.text_input("Ref", value="", key="repo_fetch_ref", placeholder="default branch")
+            pick = qualify_repository(pick, push_state["login"])  # a bare name means one of yours
             valid = looks_like_owner_repo(pick)
             if pick.strip() and not valid:
                 st.warning("Enter owner/name, for example colegleason1-jpg/Chat-Johnson.")
@@ -829,7 +844,9 @@ def render_deploy_kit(project_scope: str) -> None:
             runtime_version = c4.text_input("Runtime version", value=defaults.runtime_version)
             port = c5.number_input("Port", min_value=1, max_value=65535, value=defaults.port)
             c6, c7 = st.columns(2)
-            registry = c6.text_input("Image registry / namespace", value=defaults.registry)
+            fetched_repo = st.session_state.get("repo_fetched") or {}
+            registry_default = f"ghcr.io/{fetched_repo['owner']}/{fetched_repo['repo']}".lower() if fetched_repo else defaults.registry
+            registry = c6.text_input("Image registry / namespace", value=registry_default)
             cloud = c7.selectbox("Cloud", CLOUDS, index=CLOUDS.index(defaults.cloud), help="Terraform skeleton and the serverless flavour follow this choice.")
             c8, c9 = st.columns(2)
             health_path = c8.text_input("Health path", value=defaults.health_path)
@@ -1774,6 +1791,10 @@ with st.sidebar:
         st.checkbox("Enable GitHub push for this session", key="github_push_enabled", value=False)
         st.text_input("GitHub token (session memory only)", key="github_push_token", type="password", value="")
         push_state = github_push_status()
+        if push_state["armed"] and push_state["login"]:
+            st.caption(f"Signed in as **{push_state['login']}**.")
+        elif push_state["armed"]:
+            st.caption("Token accepted, but it cannot read its own account (needs at least read access to your profile).")
         if push_state["armed"] and push_state["connected"]:
             st.warning(f"ARMED: pushes go to {push_state['repo']} as new branches with pull requests.")
         elif push_state["armed"]:

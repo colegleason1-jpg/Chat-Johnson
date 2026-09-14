@@ -46,6 +46,8 @@ SKIP_OLD = pytest.mark.skipif(Version(st.__version__) < Version("1.40"), reason=
 
 def fake_github_get(url, headers=None, stream=False, timeout=None, allow_redirects=True):
     from tests.test_github_repo import FakeResponse, make_tarball
+    if url.endswith("/user"):
+        return FakeResponse(200, {"login": "me"})
     if "/user/repos" in url:
         return FakeResponse(200, [{"full_name": "me/proj"}, {"full_name": "me/other"}])
     if url.endswith("/repos/me/proj"):
@@ -63,6 +65,7 @@ def arm_and_connect(app, monkeypatch):
     app.checkbox(key="github_push_enabled").check().run()
     app.text_input(key="github_push_token").input("ghp_secret_token_123").run()
     assert any("Token armed" in i.value for i in app.info)
+    assert any("Signed in as **me**" in c.value for c in app.caption)
     assert app.selectbox(key="repo_pick").value == "me/proj"  # listed automatically from the token
     next(b for b in app.button if b.label == "Connect me/proj").click().run()
     assert not app.exception

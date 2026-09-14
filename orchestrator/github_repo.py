@@ -95,6 +95,22 @@ def looks_like_owner_repo(value: str) -> bool:
         return False
 
 
+def whoami(token: str) -> str:
+    """The login the token belongs to (GET /user); empty when the token cannot read it."""
+    if not (token or "").strip():
+        return ""
+    data = _get(f"{API_ROOT}/user", token).json()
+    return str(data.get("login") or "") if isinstance(data, dict) else ""
+
+
+def qualify_repository(value: str, login: str) -> str:
+    """'Chat-Johnson' becomes '<login>/Chat-Johnson' when the operator is known; owner/name passes through."""
+    cleaned = (value or "").strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
+    if cleaned and "/" not in cleaned and login:
+        return f"{login}/{cleaned}"
+    return cleaned
+
+
 def list_repositories(token: str, limit: int = 100) -> List[str]:
     """Repositories the token can see (owner, collaborator, org member), newest activity first, as owner/name."""
     if not (token or "").strip():

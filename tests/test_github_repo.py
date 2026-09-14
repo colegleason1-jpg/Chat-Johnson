@@ -115,3 +115,12 @@ def test_list_repositories_and_owner_repo_shape(monkeypatch):
     assert "sort=updated" in seen["url"] and "affiliation=owner,collaborator,organization_member" in seen["url"]
     with pytest.raises(gr.GitHubRepoError, match="token is required"):
         gr.list_repositories("")
+
+
+def test_whoami_and_bare_names_resolve_to_the_signed_in_user(monkeypatch):
+    monkeypatch.setattr(gr.requests, "get", lambda url, headers=None, **kw: FakeResponse(200, {"login": "colegleason1-jpg"}) if url.endswith("/user") else FakeResponse(404, text="x"))
+    assert gr.whoami("ghp_x") == "colegleason1-jpg" and gr.whoami("") == ""
+    assert gr.qualify_repository("Chat-Johnson", "colegleason1-jpg") == "colegleason1-jpg/Chat-Johnson"
+    assert gr.qualify_repository("someone/else", "colegleason1-jpg") == "someone/else"
+    assert gr.qualify_repository("https://github.com/me/proj.git", "") == "me/proj"
+    assert gr.qualify_repository("Chat-Johnson", "") == "Chat-Johnson"  # nobody signed in: left alone, caught by the shape check
