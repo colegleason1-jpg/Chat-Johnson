@@ -84,6 +84,18 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   a release after two, returns released agents to the society with a cooldown, adds a seat where a
   department's load exceeds twice its seats, retires worker seats idle for four cycles, and hires
   graduates into every open seat. Every event is in the personnel log.
+- **Leisure, dream bank, and the society tick (batch S3)**: off the clock, an agent with enough
+  balance chooses an inquiry on a free knowledge source (Wikipedia, Project Gutenberg, arXiv, Open
+  Library, Hacker News, or an operator-declared API), the fetch is free, the notes call is charged
+  to its balance, and the notes land in its **dream bank**; the agent names its next interest and
+  how long it sleeps. The next time it works, the keyword-ranked excerpt of its own research rides in
+  its persona. The **society tick** is one chained job (every 30 minutes by default) that wakes due
+  agents for leisure and queues company and academy cycles on their intervals; it stops with the
+  app process and runs around the clock on the VM worker. The **release loop**: board feedback on a
+  work opens a final-edit item, Publish locks the artifact, opens marketing and sales, and queues
+  positioning, landing copy (rendered in the preview), a launch plan, outreach drafts, and pricing
+  notes; feedback themes are extracted for marketing. **Skip-level escalations** in a seat's output
+  are routed one level above the superior or below a subordinate and answered in the next cycle.
 - **Private scope per visitor**: chats, artifacts, jobs, and the routing log are keyed by a scope id
   minted for each browser session and kept on the URL (`?scope=`); bookmark it to come back. Nothing
   is shared between visitors of the same deployment.

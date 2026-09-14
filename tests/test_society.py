@@ -128,7 +128,7 @@ def test_company_cycle_moves_work_through_the_pipeline(db, monkeypatch):
     result = view["result"]
     assert result["status"] == "done" and result["calls"] == len(calls) and 8 <= result["calls"] <= 31
     steps = [entry["step"] for entry in result["log"]]
-    assert steps == ["scorecard", "personnel", "l10", "rate", "delegate", "analytics", "execute", "review", "report"]
+    assert steps == ["scorecard", "personnel", "l10", "rate", "delegate", "analytics", "execute", "review", "escalations", "feedback", "report"]
     statuses = {}
     for item in store.work_items_for(db, avs, limit=500):
         statuses[item["status"]] = statuses.get(item["status"], 0) + 1

@@ -70,7 +70,10 @@ def call_free(ctx: JobContext, budget: CycleBudget, cycle_id: int, agent: Dict[s
     """One metered call by an academy agent in its own thread (the seat-less twin of cycles.call)."""
     scope = ctx.project_scope
     thread_id = ensure_agent_thread(scope, agent)
-    messages = build_academy_messages(scope, agent, prompt, thread_id, max_tokens, role_note=role_note)
+    from .leisure import dream_excerpt_for  # local: leisure imports this module
+
+    excerpt = dream_excerpt_for(scope, agent.get("id"), prompt)
+    messages = build_academy_messages(scope, agent, prompt, thread_id, max_tokens, role_note=(role_note + ("\nFROM YOUR OWN RESEARCH (leisure notes):\n" + excerpt if excerpt else "")).strip())
     if not budget.allows(_estimate_tokens(messages) + int(max_tokens)):
         raise CycleBudgetExceeded(f"{budget.calls} calls / {budget.tokens} tokens used")
     ctx.check_cancel()

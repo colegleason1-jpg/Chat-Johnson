@@ -75,6 +75,7 @@ from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runne
 from orchestrator import society
 from orchestrator.society import store as society_store
 from orchestrator.society.personas import board_persona
+from orchestrator.keyword_search import keyword_rank
 from orchestrator.prompting import build_prompt_messages as _build_prompt_messages
 from orchestrator.quota import QuotaLedger
 from orchestrator.quota_registry import get_quota_ledger, get_request_lock
@@ -907,7 +908,7 @@ CHAT_INPUT_ACCEPTS_FILES = "accept_file" in inspect.signature(st.chat_input).par
 INJECTION_BUDGET_CHARS = 120_000
 ROUTING_LOG_LIMIT = 40
 MISSION_PREFIX = "MISSION: "
-JOB_LABELS = {"mission": "Mission", "company_cycle": "Company cycle", "academy_cycle": "Academy cycle"}
+JOB_LABELS = {"mission": "Mission", "company_cycle": "Company cycle", "academy_cycle": "Academy cycle", "society_tick": "Society tick"}
 BACKLOG_LINE = re.compile(r"^\s*BACKLOG:\s*(.+?)\s*::\s*(.+?)\s*$", re.M)
 CHAT_MAX_WAIT_SECONDS = 65  # one free-tier window; longer waits surface as the plain error instead
 KEY_GUIDES = (
@@ -1762,6 +1763,8 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
                 with st.expander(f"#{item['id']} · {item['title']}", expanded=False):
                     if item.get("artifact_id"):
                         filename, body = export_artifact(int(item["artifact_id"]))
+                        if "<html" in body.lower() or "<div" in body.lower() or "<section" in body.lower():
+                            components.html(safe_preview_document(extract_preview_source(body) or body), height=360, scrolling=True)
                         st.markdown(body[:4000])
                         st.download_button("⬇ Download", data=body, file_name=filename, mime="text/markdown", key=f"dl_item_{item['id']}")
                     if item.get("feedback"):
@@ -1771,16 +1774,31 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
                     if ok.button("Approve", key=f"approve_{item['id']}", use_container_width=True):
                         society_store.set_work_status(int(item["id"]), "done", feedback=note or item["feedback"])
                         if note.strip():
-                            society_store.insert("feedback", project_scope, company_id=company_id, catalog_id=item.get("catalog_id"), source="board", text=note.strip(), created_at=time.time())
+                            society.record_board_feedback(project_scope, company_id, item.get("catalog_id"), note)
                         if item.get("catalog_id"):
                             cat = society_store.row("catalog", int(item["catalog_id"]))
                             if cat and cat["stage"] == "preliminary_review":
-                                society_store.update("catalog", int(cat["id"]), stage="board_feedback" if note.strip() else "final")
+                                if note.strip():
+                                    # Feedback opens the final edit: one high-priority item carries it back to the seats.
+                                    society_store.update("catalog", int(cat["id"]), stage="board_feedback")
+                                    society.request_final_edit(project_scope, company_id, int(cat["id"]), note)
+                                else:
+                                    society_store.update("catalog", int(cat["id"]), stage="final")
+                            elif cat and cat["stage"] == "board_feedback" and item["title"].startswith("Final edit with board feedback"):
+                                society_store.update("catalog", int(cat["id"]), stage="final")
                         st.rerun()
                     if back.button("Return with feedback", key=f"return_{item['id']}", use_container_width=True):
                         society_store.set_work_status(int(item["id"]), "assigned", feedback=note or "returned by the board")
-                        society_store.insert("feedback", project_scope, company_id=company_id, catalog_id=item.get("catalog_id"), source="board", text=note.strip() or "returned", created_at=time.time())
+                        society.record_board_feedback(project_scope, company_id, item.get("catalog_id"), note or "returned")
                         st.rerun()
+        finals = [c for c in catalog if c["stage"] == "final"]
+        if finals:
+            st.markdown("**Ready to publish**")
+            for cat in finals:
+                if st.button(f"Publish · {cat['title']}", key=f"publish_{cat['id']}"):
+                    society.publish_work(project_scope, int(cat["id"]))
+                    st.success(f"Published {cat['title']}: the artifact is locked and marketing and sales work is queued.")
+                    st.rerun()
     with rocks_tab:
         st.markdown("**Rocks (this quarter)**")
         st.dataframe([{"rock": r["title"], "status": r["status"], "due": time.strftime("%Y-%m-%d", time.gmtime(float(r["due_at"] or 0)))} for r in society_store.rows("rocks", project_scope, "company_id = ?", (company_id,))], hide_index=True, use_container_width=True)
@@ -1794,6 +1812,14 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
         if todos:
             st.markdown("**To-dos**")
             st.dataframe([{"to-do": t["text"], "seat": by_id.get(int(t["seat_id"] or 0), {}).get("title", ""), "done": bool(t["done"])} for t in todos], hide_index=True, use_container_width=True)
+        escalations = society_store.rows("escalations", project_scope, "company_id = ?", (company_id,), order="id DESC", limit=20)
+        if escalations:
+            st.markdown("**Skip-level escalations**")
+            st.dataframe([{"from": by_id.get(int(e["from_seat"] or 0), {}).get("title", ""), "to": by_id.get(int(e["to_seat"] or 0), {}).get("title", "unroutable"), "direction": e["direction"], "message": e["text"][:140], "reply": e["reply"][:140], "status": e["status"]} for e in escalations], hide_index=True, use_container_width=True)
+        feedback = society_store.rows("feedback", project_scope, "company_id = ?", (company_id,), order="id DESC", limit=10)
+        if feedback:
+            st.markdown("**Board feedback and themes**")
+            st.dataframe([{"when": time.strftime("%m-%d", time.gmtime(float(f["created_at"]))), "feedback": f["text"][:160], "themes": ", ".join(society_store.load_json(f["themes"], []))} for f in feedback], hide_index=True, use_container_width=True)
     with score_tab:
         rows = society_store.rows("scorecard", project_scope, "seat_id IN (SELECT id FROM seats WHERE company_id = ?)", (company_id,), order="id DESC", limit=200)
         if rows:
@@ -1882,7 +1908,25 @@ def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional
             request_cancel(job["id"])
         st.rerun()
     st.number_input("Society size target", min_value=10, max_value=500, value=target, step=10, key="academy_target")
-    classes, evals, personnel, cycle_tab = st.tabs(["Classes", "Evaluations", "Personnel log", "Academy cycles"])
+    with st.container(border=True):
+        st.markdown("**Society tick** · wakes due agents for leisure and queues company and academy cycles on their intervals.")
+        state = society.tick_state(project_scope)
+        t1, t2, t3 = st.columns(3)
+        tick_minutes = int(t1.number_input("Tick every (minutes)", min_value=5, max_value=240, value=30, step=5, key="tick_minutes"))
+        academy_hours = int(t2.number_input("Academy every (hours)", min_value=1, max_value=48, value=3, key="tick_academy_hours"))
+        leisure_cap = int(t3.number_input("Agents exploring per tick", min_value=0, max_value=10, value=3, key="tick_leisure_cap"))
+        s1, s2 = st.columns(2)
+        if s1.button("Start the society tick", key="start_tick", type="primary", use_container_width=True, disabled=state["running"] or not configured_provider_names()):
+            society.start_tick(project_scope, job_secrets_for_session(), mode=active_mode(), interval_s=tick_minutes * 60, academy_interval_s=academy_hours * 3600, leisure_cap=leisure_cap, call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 1200))
+            st.rerun()
+        if s2.button("Stop the tick", key="stop_tick", use_container_width=True, disabled=not state["running"]):
+            society.stop_tick(project_scope)
+            st.rerun()
+        if state["running"]:
+            st.caption(f"Running · next tick at {time.strftime('%H:%M UTC', time.gmtime(state['next_run_after']))} · it stops with the app process; the VM worker keeps it 24/7.")
+        else:
+            st.caption("Stopped. Cycles can still be run by hand from the Company and Academy workspaces.")
+    classes, evals, personnel, dreams, cycle_tab = st.tabs(["Classes", "Evaluations", "Personnel log", "Dream bank", "Academy cycles"])
     with classes:
         if agents:
             seats = {int(s["id"]): s for s in society_store.rows("seats", project_scope, limit=2000)}
@@ -1907,11 +1951,27 @@ def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional
             st.dataframe([{"when": time.strftime("%m-%d %H:%M", time.gmtime(float(r["created_at"]))), "event": r["event"], "seat": seats.get(int(r["seat_id"] or 0), {}).get("title", ""), "agent": names.get(int(r["agent_id"] or 0), ""), "reason": r["reason"][:120], "approved by": r["approved_by"]} for r in rows], hide_index=True, use_container_width=True)
         else:
             st.caption("Hires, fires, promotions, graduations, and seat changes are logged here.")
+    with dreams:
+        names = {int(a["id"]): a["name"] for a in agents}
+        query = st.text_input("Search the dream bank", key="dream_query", placeholder="keywords, any order")
+        rows = society_store.rows("dream_bank", project_scope, order="id DESC", limit=200)
+        if query.strip():
+            rows = keyword_rank(query, rows, key=lambda r: f"{r['query']} {r['findings']} {r['tags']}", limit=30)
+        if rows:
+            for r in rows[:30]:
+                with st.expander(f"{names.get(int(r['agent_id']), r['agent_id'])} · {r['source']} · {r['query'][:80]}", expanded=False):
+                    st.markdown(r["findings"][:3000])
+                    st.caption(f"{time.strftime('%m-%d %H:%M', time.gmtime(float(r['timestamp'])))} · {r['tokens']} tokens · tags: {r['tags'][:120]}")
+        else:
+            st.caption("Leisure research lands here: each agent's notes feed its own persona the next time it works.")
+        inquiries = society_store.rows("inquiries", project_scope, order="id DESC", limit=20)
+        if inquiries:
+            st.dataframe([{"when": time.strftime("%m-%d %H:%M", time.gmtime(float(i["created_at"]))), "agent": names.get(int(i["agent_id"]), i["agent_id"]), "source": i["source"], "status": i["status"], "cost": i["cost_tokens"]} for i in inquiries], hide_index=True, use_container_width=True)
     with cycle_tab:
-        cycles = [c for c in society_store.rows("cycles", project_scope, "kind = 'academy'", order="id DESC", limit=20)]
+        cycles = [c for c in society_store.rows("cycles", project_scope, "kind IN ('academy', 'leisure', 'tick')", order="id DESC", limit=30)]
         if cycles:
-            st.dataframe([{"cycle": c["id"], "status": c["status"], "started": time.strftime("%m-%d %H:%M", time.gmtime(float(c["started_at"]))), "calls": c["calls"], "tokens": c["tokens_used"], "budget": c["tokens_planned"]} for c in cycles], hide_index=True, use_container_width=True)
-            with st.expander("Last academy cycle log", expanded=False):
+            st.dataframe([{"cycle": c["id"], "kind": c["kind"], "status": c["status"], "started": time.strftime("%m-%d %H:%M", time.gmtime(float(c["started_at"]))), "calls": c["calls"], "tokens": c["tokens_used"], "budget": c["tokens_planned"]} for c in cycles], hide_index=True, use_container_width=True)
+            with st.expander("Last cycle log", expanded=False):
                 st.json(society_store.load_json(cycles[0]["log"], []), expanded=False)
         else:
             st.caption("An academy cycle pays allowances, runs producer tasks, grades them, promotes, examines one graduation candidate, and fills open seats.")

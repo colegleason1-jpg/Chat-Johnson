@@ -51,6 +51,12 @@
   by flattery alone. Firing needs two missed scorecard weeks and the CEO's APPROVE; released agents
   keep their history and sit out a week before graduation can seat them again.
 
+## Society tick and leisure
+- Start the tick in the Academy workspace; it queues cycles on their intervals and runs a few
+  leisure inquiries per tick. Leisure fetches go to public APIs (Wikipedia, gutendex, arXiv, Open
+  Library, Hacker News); a blocked source is logged as an error on the inquiry and costs the agent
+  its leisure fee only. Stop the tick before a redeploy if you want a clean cycle log.
+
 ## Quota caps
 - Per-vendor daily token ceilings default to the `DAILY_CAPS` table; set `CHAT_JOHNSON_DAILY_<VENDOR>`
   (for example `CHAT_JOHNSON_DAILY_GEMINI=2000000`, `0` = uncapped) on the host to change them.

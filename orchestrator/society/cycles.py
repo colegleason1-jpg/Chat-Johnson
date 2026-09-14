@@ -50,6 +50,12 @@ REPORT_PROMPT = "Write this cycle's report for the board in under 200 words: wha
 _RATE_RE = re.compile(r"#\s*(\d+)\s*[:\-–]\s*([1-5])")
 _ASSIGN_RE = re.compile(r"#\s*(\d+)\s*(?:->|→|:)\s*([a-z0-9_]+)", re.I)
 _SUB_RE = re.compile(r"^\s*[-*]\s*(.+?)\s*::\s*(.+?)\s*$", re.M)
+_ESCALATE_RE = re.compile(r"^\s*ESCALATE\s*:\s*(up|down)\s*::\s*(.+?)\s*$", re.I | re.M)
+_THEME_RE = re.compile(r"^\s*[-*]\s*(.+?)\s*$", re.M)
+ESCALATION_REPLY_PROMPT = "A colleague reached you under the skip-level rule ({direction} one level). Answer in under 120 words with advice or a decision, or say who should decide.\nFROM: {seat}\nMESSAGE: {text}"
+THEMES_PROMPT = "Extract 3–5 themes from this board feedback for marketing and the company vision. Reply lines only, each '- <theme>'.\nFEEDBACK:\n{text}"
+ESCALATIONS_PER_CYCLE = 2
+THEMES_PER_CYCLE = 3
 
 
 class CycleBudgetExceeded(Exception):
@@ -87,7 +93,9 @@ def call(
 ) -> Tuple[str, Any]:
     """One metered model call in a seat's own thread; raises CycleBudgetExceeded before overspending."""
     thread_id = ensure_seat_thread(ctx.project_scope, seat, company)
-    messages = build_agent_messages(ctx.project_scope, agent, seat, company, prompt, thread_id, max_tokens, seats_by_id=seats_by_id)
+    from .leisure import dream_excerpt_for  # local: leisure imports this module
+
+    messages = build_agent_messages(ctx.project_scope, agent, seat, company, prompt, thread_id, max_tokens, seats_by_id=seats_by_id, dream_excerpt=dream_excerpt_for(ctx.project_scope, agent.get("id"), prompt))
     estimate = _estimate_tokens(messages) + int(max_tokens)
     if not budget.allows(estimate):
         raise CycleBudgetExceeded(f"{budget.calls} calls / {budget.tokens} tokens used")
@@ -200,6 +208,29 @@ def personnel_review(
                 events["retired"] += 1
     events["hired"] = len(store.fill_open_seats(scope, company_id))
     return events
+
+
+def skip_level_target(seat: Dict[str, Any], seats_by_id: Dict[int, Dict[str, Any]], direction: str) -> Optional[Dict[str, Any]]:
+    """One seat above the superior, or one seat below a subordinate."""
+    if direction == "up":
+        superior = seats_by_id.get(int(seat["reports_to"])) if seat.get("reports_to") else None
+        return seats_by_id.get(int(superior["reports_to"])) if superior and superior.get("reports_to") else None
+    subordinates = [s for s in seats_by_id.values() if s.get("reports_to") == seat["id"]]
+    for sub in subordinates:
+        for below in seats_by_id.values():
+            if below.get("reports_to") == sub["id"] and below.get("agent_id"):
+                return below
+    return None
+
+
+def record_escalations(scope: str, company_id: int, seat: Dict[str, Any], seats_by_id: Dict[int, Dict[str, Any]], text: str) -> int:
+    """ESCALATE lines in a deliverable become escalation rows routed by the skip-level rule."""
+    count = 0
+    for direction, message in _ESCALATE_RE.findall(text or ""):
+        target = skip_level_target(seat, seats_by_id, direction.lower())
+        store.insert("escalations", scope, company_id=company_id, from_seat=int(seat["id"]), to_seat=int(target["id"]) if target else None, direction=direction.lower(), text=message.strip()[:1000], status="open" if target else "unroutable", created_at=time.time())
+        count += 1
+    return count
 
 
 def _lines_for_items(items: Sequence[Dict[str, Any]]) -> str:
@@ -352,6 +383,7 @@ def company_cycle(ctx: JobContext) -> Dict[str, Any]:
                     prompt = f"WORK ITEM: {item['title']} (importance {item['importance']})\nBRIEF: {item['brief']}{feedback}\n\nTASK: {step['description']}"
                     text, _ = call(ctx, budget, cycle_id, agent, seat, company, prompt, str(step["type"]), seats_by_id, call_tokens, mode=mode)
                     outputs.append((str(step["title"]), text))
+                    record_escalations(scope, company_id, seat, seats_by_id, text)
             except CycleBudgetExceeded:
                 store.set_work_status(int(item["id"]), "assigned")
                 raise
@@ -401,6 +433,32 @@ def company_cycle(ctx: JobContext) -> Dict[str, Any]:
         log.append({"step": "review", "passed": passed_count, "failed": failed_count})
         ctx.progress(step=7, total=total_steps, text=f"Review: {passed_count} passed, {failed_count} returned")
         to_board = store.count("work_items", scope, "company_id = ? AND status = 'board'", (company_id,))
+
+        # 7b · skip-level escalations get an answer from the seat they reached
+        stage = "escalations"
+        answered = 0
+        for esc in store.rows("escalations", scope, "company_id = ? AND status = 'open' AND to_seat IS NOT NULL", (company_id,), limit=ESCALATIONS_PER_CYCLE):
+            target = seats_by_id.get(int(esc["to_seat"]))
+            origin = seats_by_id.get(int(esc["from_seat"] or 0), {"title": "a colleague"})
+            target_agent = agents.get(int(target["agent_id"])) if target and target.get("agent_id") else None
+            if not target or not target_agent:
+                continue
+            reply, _ = call(ctx, budget, cycle_id, target_agent, target, company, ESCALATION_REPLY_PROMPT.format(direction=esc["direction"], seat=origin["title"], text=esc["text"]), "quick_text", seats_by_id, min(call_tokens, 300), mode=mode)
+            store.update("escalations", int(esc["id"]), reply=reply.strip()[:2000], status="answered")
+            if origin.get("thread_id"):
+                vault.append_message(scope, "user", f"REPLY TO YOUR ESCALATION ({esc['direction']}, from {target['title']}):\n{reply.strip()}", thread_id=int(origin["thread_id"]), workspace=WORKSPACE, task_type="escalation")
+            answered += 1
+        log.append({"step": "escalations", "answered": answered})
+
+        # 7c · board feedback becomes themes for marketing and the vision
+        stage = "feedback"
+        themed = 0
+        for fb in store.rows("feedback", scope, "company_id = ? AND themes = '[]'", (company_id,), order="id ASC", limit=THEMES_PER_CYCLE):
+            text = ask("ea_board", THEMES_PROMPT.format(text=fb["text"][:2000]), task_type="quick_text", tokens=min(call_tokens, 200))
+            themes = [t.strip()[:120] for t in _THEME_RE.findall(text)][:5]
+            store.update("feedback", int(fb["id"]), themes=themes or ["(no themes extracted)"])
+            themed += 1
+        log.append({"step": "feedback", "themed": themed})
 
         # 8 · report to the board
         stage = "report"

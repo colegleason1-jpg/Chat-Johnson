@@ -247,3 +247,19 @@ def test_academy_workspace_seeds_and_queues_a_cycle(app, monkeypatch):
     assert not app.exception
     rows = vault.list_jobs("visitor-academy", ("queued",), kind="academy_cycle")
     assert len(rows) == 1 and any("Academy cycle #" in m.value for m in app.markdown)
+
+
+def test_academy_workspace_starts_and_stops_the_society_tick(app, monkeypatch):
+    from orchestrator import vault
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake-key")
+    app.query_params["scope"] = "visitor-tick"
+    app.query_params["ws"] = "academy"
+    app.run()
+    next(b for b in app.button if b.label == "Start the society tick").click().run()
+    assert not app.exception
+    rows = vault.list_jobs("visitor-tick", ("queued",), kind="society_tick")
+    assert len(rows) == 1 and vault.job_view(rows[0])["payload"]["interval_s"] == 1800.0
+    assert any("Running · next tick" in c.value for c in app.caption)
+    next(b for b in app.button if b.label == "Stop the tick").click().run()
+    assert not app.exception
+    assert vault.job_by_id(rows[0]["id"])["status"] == "cancelled"
