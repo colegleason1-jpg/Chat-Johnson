@@ -22,7 +22,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 DEFAULT_DB_PATH = "chat_johnson_vault.db"
 MESSAGE_WINDOW = 200
-WORKSPACES = ("task_finder", "repository", "chat_bot", "normal_chat")
+# "company" is the board inbox, "society" holds every seat's working thread, "academy" the training society.
+WORKSPACES = ("task_finder", "repository", "chat_bot", "normal_chat", "company", "society", "academy")
 DEFAULT_WORKSPACE = "normal_chat"
 
 
@@ -188,6 +189,10 @@ def initialize_database() -> None:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_message_thread ON message_history(thread_id, timestamp ASC, id ASC)"
         )
+        _ensure_column(connection, "jobs", "run_after", "REAL NOT NULL DEFAULT 0")
+        from .society.store import SOCIETY_SCHEMA_SQL  # local import: the society package imports this module
+
+        connection.executescript(SOCIETY_SCHEMA_SQL)
         # Backfill: every scope that has thread-less rows gets one "Main thread".
         scopes = {
             row[0]
@@ -933,16 +938,21 @@ def _job_json(text: Optional[str]) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def enqueue_job(project_scope: str, kind: str, payload: Mapping[str, Any], thread_id: Optional[int] = None) -> int:
-    """Queue one job. The payload is redacted like a message; secrets belong to the runner, never here."""
+def enqueue_job(
+    project_scope: str, kind: str, payload: Mapping[str, Any], thread_id: Optional[int] = None, run_after: float = 0.0
+) -> int:
+    """Queue one job. The payload is redacted like a message; secrets belong to the runner, never here.
+
+    ``run_after`` (epoch seconds) holds the row back until then: the scheduler primitive behind chained cycles.
+    """
     scope = project_scope.strip() or "default"
     now = time.time()
     body = redact_secrets(json.dumps(dict(payload), default=str))
     with _open_database() as connection:
         cursor = connection.execute(
-            "INSERT INTO jobs (project_scope, thread_id, kind, status, payload, created_at, updated_at) "
-            "VALUES (?, ?, ?, 'queued', ?, ?, ?)",
-            (scope, int(thread_id) if thread_id is not None else None, kind, body, now, now),
+            "INSERT INTO jobs (project_scope, thread_id, kind, status, payload, created_at, updated_at, run_after) "
+            "VALUES (?, ?, ?, 'queued', ?, ?, ?, ?)",
+            (scope, int(thread_id) if thread_id is not None else None, kind, body, now, now, float(run_after or 0.0)),
         )
         return int(cursor.lastrowid)
 
@@ -955,7 +965,8 @@ def claim_job(worker: str, kinds: Sequence[str]) -> Optional[sqlite3.Row]:
     with _open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
-            f"SELECT id FROM jobs WHERE status = 'queued' AND kind IN ({marks}) ORDER BY id ASC LIMIT 1", tuple(kinds)
+            f"SELECT id FROM jobs WHERE status = 'queued' AND kind IN ({marks}) AND run_after <= ? ORDER BY id ASC LIMIT 1",
+            (*kinds, time.time()),
         ).fetchone()
         if row is None:
             connection.commit()
@@ -1090,6 +1101,7 @@ def job_view(row: sqlite3.Row) -> Dict[str, Any]:
         "payload": _job_json(row["payload"]), "progress": _job_json(row["progress"]), "result": _job_json(row["result"]),
         "question": str(row["question"] or ""), "answer": row["answer"], "cancel_requested": bool(row["cancel_requested"]),
         "created_at": float(row["created_at"]), "updated_at": float(row["updated_at"]), "finished_at": row["finished_at"],
+        "run_after": float(row["run_after"]) if "run_after" in row.keys() and row["run_after"] is not None else 0.0,
     }
 
 

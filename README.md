@@ -61,6 +61,18 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   lands in the workspace's chat as it finishes, and the chat bar and the other workspaces stay usable.
   A jobs strip above the workspace shows progress, a Cancel button, and an answer box when a job
   asks the operator a question.
+- **Company workspace (agent society, batch S1)**: two companies run on Traction/EOS from templates,
+  AVS Studio (17-project IP catalog, six-work first wave, editorial/research/production/art seats)
+  and AVS Software (one product manager per product, docs, support, marketing, sales, release, QA).
+  Every seat has 3–5 roles and KPIs; founding agents fill the active seats until the academy
+  graduates replacements. A **company cycle** is a background job: weekly scorecard → Level 10
+  meeting (minutes locked as an artifact, issues and to-dos recorded) → the CEO rates the backlog →
+  the Executive Assistant delegates by role and load → analytics breaks large items down → seats
+  produce deliverables in their own threads → the managing editor (or QA reviewer) passes or
+  returns them with a deterministic check alongside → a report lands in the Board inbox. The chat
+  bar in the Company workspace talks to the Executive Assistant to the Board, whose BACKLOG lines
+  become work items. Cycles are bounded by calls and by a treasury share of today's real token
+  budget, and can chain at the company interval while the app is awake.
 - **Private scope per visitor**: chats, artifacts, jobs, and the routing log are keyed by a scope id
   minted for each browser session and kept on the URL (`?scope=`); bookmark it to come back. Nothing
   is shared between visitors of the same deployment.

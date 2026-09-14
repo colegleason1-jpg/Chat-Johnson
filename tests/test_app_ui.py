@@ -211,3 +211,22 @@ def test_sidebar_has_key_guides_overrides_and_no_oauth(app):
     next(b for b in app.button if b.label == "Apply overrides").click().run()
     assert app.session_state["byok_keys"].get("CORTEX_GROQ_MODEL") == "llama-custom"
     assert any("Model overrides applied" in s.value for s in app.success)
+
+
+def test_company_workspace_seeds_and_queues_a_cycle(app, monkeypatch):
+    from orchestrator import vault
+    from orchestrator.society import store
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake-key")
+    app.query_params["scope"] = "visitor-company"
+    app.query_params["ws"] = "company"
+    app.run()
+    assert not app.exception
+    next(b for b in app.button if b.label == "Create AVS Studio").click().run()
+    assert not app.exception
+    assert len(store.seats_for("visitor-company", store.company_by_key("visitor-company", "avs_studio")["id"])) == 23
+    assert any("23 seats" in c.value for c in app.caption)
+    next(b for b in app.button if b.label == "Run a cycle now").click().run()
+    assert not app.exception
+    rows = vault.list_jobs("visitor-company", ("queued",), kind="company_cycle")
+    assert len(rows) == 1 and vault.job_view(rows[0])["payload"]["company_id"] == store.company_by_key("visitor-company", "avs_studio")["id"]
+    assert any("Company cycle #" in m.value for m in app.markdown)  # the jobs strip shows it

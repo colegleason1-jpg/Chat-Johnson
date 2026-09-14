@@ -38,6 +38,13 @@
   push flow can read the changed files. Running a fetched repository's tests executes its code in
   the app's container; the box is off by default for GitHub sources.
 
+## Company cycles
+- A cycle is a `company_cycle` job. Its budget is the smaller of the cycle's hard cap and the
+  company's treasury share of what the keyed vendors can still serve today; it stops cleanly
+  (`status = budget`) when either runs out and reports what it did. "Keep cycling" queues the next
+  cycle with `run_after`; the chain lives only while the process and its session keys survive
+  (the VM worker with env keys makes it 24/7). Pause cancels the queued successor.
+
 ## Quota caps
 - Per-vendor daily token ceilings default to the `DAILY_CAPS` table; set `CHAT_JOHNSON_DAILY_<VENDOR>`
   (for example `CHAT_JOHNSON_DAILY_GEMINI=2000000`, `0` = uncapped) on the host to change them.

@@ -72,6 +72,9 @@ from orchestrator.errors import plain_error
 from orchestrator.executor import Orchestrator
 from orchestrator import mission_runner  # noqa: F401  (registers the mission job handler)
 from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner
+from orchestrator import society
+from orchestrator.society import store as society_store
+from orchestrator.society.personas import board_persona
 from orchestrator.prompting import build_prompt_messages as _build_prompt_messages
 from orchestrator.quota import QuotaLedger
 from orchestrator.quota_registry import get_quota_ledger, get_request_lock
@@ -262,11 +265,12 @@ def build_prompt_messages(
     injected_context: str = "",
     workspace: Optional[str] = None,
     thread_id: Optional[int] = None,
+    extra_system: str = "",
 ) -> List[Dict[str, str]]:
     """The shared prompt builder with this session's output budget."""
     return _build_prompt_messages(
         project_scope, user_prompt, injected_context, workspace=workspace, thread_id=thread_id,
-        max_tokens=int(st.session_state.get("max_tokens", 2048)),
+        max_tokens=int(st.session_state.get("max_tokens", 2048)), extra_system=extra_system,
     )
 
 
@@ -891,8 +895,9 @@ WORKSPACE_TABS = (
     ("Repository Work", "repository"),
     ("Chat Bot", "chat_bot"),
     ("Normal Chat", "normal_chat"),
+    ("Company", "company"),
 )
-assert tuple(key for _, key in WORKSPACE_TABS) == VAULT_WORKSPACES
+assert set(key for _, key in WORKSPACE_TABS) <= set(VAULT_WORKSPACES)  # "society" and "academy" have no tab of their own
 WORKSPACE_LABEL = {key: label for label, key in WORKSPACE_TABS}
 DEFAULT_WORKSPACE_KEY = "normal_chat"
 CHAT_FILE_TYPES = ["py", "js", "ts", "tsx", "jsx", "json", "md", "txt", "yml", "yaml", "toml", "css", "html"]
@@ -901,7 +906,8 @@ CHAT_INPUT_ACCEPTS_FILES = "accept_file" in inspect.signature(st.chat_input).par
 INJECTION_BUDGET_CHARS = 120_000
 ROUTING_LOG_LIMIT = 40
 MISSION_PREFIX = "MISSION: "
-JOB_LABELS = {"mission": "Mission"}
+JOB_LABELS = {"mission": "Mission", "company_cycle": "Company cycle"}
+BACKLOG_LINE = re.compile(r"^\s*BACKLOG:\s*(.+?)\s*::\s*(.+?)\s*$", re.M)
 CHAT_MAX_WAIT_SECONDS = 65  # one free-tier window; longer waits surface as the plain error instead
 KEY_GUIDES = (
     ("Google AI Studio (Gemini)", "https://aistudio.google.com/app/apikey", ("Sign in with a Google account", "Create API key", "Copy it into GEMINI_API_KEY")),
@@ -1036,6 +1042,7 @@ def run_generation(
     injected_context: str = "",
     workspace: Optional[str] = None,
     attachment_notes: Optional[Sequence[str]] = None,
+    extra_system: str = "",
 ) -> Optional[int]:
     clean_prompt = prompt.strip()
     if not clean_prompt:
@@ -1049,7 +1056,7 @@ def run_generation(
             + f". Digest locked as artifact {migration['digest_artifact_id']} ({migration['method']})."
         )
     user_message_id = append_message(project_scope, "user", clean_prompt, mode=mode, workspace=workspace, task_type=task_type)
-    messages = build_prompt_messages(project_scope, clean_prompt, injected_context, workspace=workspace)
+    messages = build_prompt_messages(project_scope, clean_prompt, injected_context, workspace=workspace, extra_system=extra_system)
     max_tokens = int(st.session_state.get("max_tokens", 2048))
     with st.chat_message("user"):
         st.markdown(clean_prompt)
@@ -1308,6 +1315,8 @@ def chat_placeholder(workspace: str, ready: bool) -> str:
         return "Ask the developer bot" + (" · attach files with the paperclip" if CHAT_INPUT_ACCEPTS_FILES else "") + "…"
     if workspace == "repository":
         return "Discuss the repository work: the diff, the next change, a review…"
+    if workspace == "company":
+        return "Tell the Executive Assistant an idea, a directive, or a question…"
     return "Message Normal Chat…"
 
 
@@ -1606,11 +1615,241 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
         st.caption("Mission in progress: the chat bar continues it with every result in context. Start another mission with New chat.")
 
 
+
+def job_secrets_for_session() -> Dict[str, str]:
+    """Keys handed to a background job for its lifetime only; never written anywhere."""
+    secrets = dict(st.session_state.get("byok_keys", {}) or {})
+    if active_mode() == "heavy" and st.session_state.get("paid_slot_key"):
+        secrets["paid_slot_key"] = str(st.session_state.get("paid_slot_key"))
+    return secrets
+
+
+def ingest_board_reply(project_scope: str, company_id: int, text: str) -> List[str]:
+    """Work items the Executive Assistant filtered out of the board's message (BACKLOG lines)."""
+    titles: List[str] = []
+    for title, brief in BACKLOG_LINE.findall(text or ""):
+        society_store.add_work_item(project_scope, company_id, title, brief, importance=3)
+        titles.append(title)
+    return titles
+
+
+def company_facts(project_scope: str, company: Dict[str, Any]) -> List[str]:
+    cid = int(company["id"])
+    counts = {status: society_store.count("work_items", project_scope, "company_id = ? AND status = ?", (cid, status)) for status in ("backlog", "assigned", "review", "board", "done")}
+    latest = society_store.cycles_for(project_scope, cid, limit=1)
+    facts = [
+        f"work items: {counts['backlog']} backlog, {counts['assigned']} assigned, {counts['review']} in review, {counts['board']} waiting for the board, {counts['done']} done",
+        f"seats: {len(society_store.seats_for(project_scope, cid, 'filled'))} filled, {len(society_store.open_seats(project_scope, cid))} open",
+        "open issues: " + (", ".join(i["title"] for i in society_store.rows("issues", project_scope, "company_id = ? AND status = 'open'", (cid,), limit=5)) or "none"),
+        "rocks: " + (", ".join(r["title"] for r in society_store.rows("rocks", project_scope, "company_id = ?", (cid,), limit=5)) or "none"),
+    ]
+    if latest:
+        facts.append(f"last cycle: {latest[0]['status']}, {latest[0]['calls']} calls, {latest[0]['tokens_used']} tokens")
+    return facts
+
+
+def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
+    st.subheader("Company")
+    companies = society_store.companies_for(project_scope)
+    if not companies:
+        st.caption(
+            "Two companies run on Traction/EOS with seats, a scorecard, and Level 10 meetings; one agent society feeds both. "
+            "Seed a company from its template: founding agents fill the active seats so a cycle can run before the academy exists."
+        )
+        left, right = st.columns(2)
+        if left.button("Create AVS Studio", key="seed_avs", type="primary", use_container_width=True):
+            society.seed_company(project_scope, "avs_studio")
+            st.rerun()
+        if right.button("Create AVS Software (3 products)", key="seed_sw", use_container_width=True):
+            society.seed_company(project_scope, "software_co")
+            st.rerun()
+        return
+    names = {int(c["id"]): str(c["name"]) for c in companies}
+    company_id = int(st.selectbox("Company", list(names), format_func=names.get, key="company_pick"))
+    company = society_store.row("companies", company_id) or {}
+    st.caption(f"{company.get('core_focus', '')} · cycle every {int(company.get('interval_s', 21600)) // 3600} h · treasury share {int(float(company.get('daily_share', 0.35)) * 100)} %" + mode_caption())
+    thread = render_thread_bar(project_scope, "company", ledger)
+    thread_id = int(thread["id"])
+    inbox, org, backlog_tab, rocks_tab, score_tab, cycle_tab, settings_tab = st.tabs(
+        ["Board inbox", "Org chart", "Backlog & catalog", "Rocks & timeline", "Scorecard", "Cycle log", "Settings"]
+    )
+    with inbox:
+        render_history(project_scope, "Board inbox", workspace="company")
+        if submission and submission.text.strip():
+            if not configured_provider_names():
+                st.warning("Add a BYOK key in the sidebar to talk to the Executive Assistant.")
+            else:
+                answer_id = run_generation(
+                    project_scope, submission.text, "chat", ledger, workspace="company",
+                    extra_system=board_persona(company, company_facts(project_scope, company)),
+                )
+                if answer_id:
+                    rows = recent_messages(project_scope, 2, thread_id=thread_id)
+                    created = ingest_board_reply(project_scope, company_id, rows[-1]["content"] if rows else "")
+                    if created:
+                        st.info("Added to the backlog: " + "; ".join(created) + ". The CEO rates it in the next cycle.")
+    with org:
+        seats = society_store.seats_for(project_scope, company_id)
+        agents = {int(a["id"]): a for a in society_store.agents_for(project_scope)}
+        depts = {int(d["id"]): d for d in society_store.departments_for(project_scope, company_id)}
+        teams = {int(t["id"]): t for t in society_store.teams_for(project_scope, company_id)}
+        by_id = {int(s["id"]): s for s in seats}
+        load: Dict[int, int] = {}
+        for item in society_store.work_items_for(project_scope, company_id, ("assigned", "running"), limit=500):
+            if item.get("seat_id"):
+                load[int(item["seat_id"])] = load.get(int(item["seat_id"]), 0) + 1
+        st.dataframe(
+            [
+                {
+                    "department": depts.get(int(s["department_id"] or 0), {}).get("name", ""),
+                    "team": teams.get(int(s["team_id"] or 0), {}).get("name", ""),
+                    "seat": s["title"], "reports to": by_id.get(int(s["reports_to"] or 0), {}).get("title", "board"),
+                    "roles": "; ".join(society_store.load_json(s.get("roles"), [])),
+                    "agent": agents.get(int(s["agent_id"] or 0), {}).get("name", "open seat"),
+                    "tier": agents.get(int(s["agent_id"] or 0), {}).get("tier", ""),
+                    "balance": agents.get(int(s["agent_id"] or 0), {}).get("balance"),  # None for an open seat keeps the column numeric
+                    "load": load.get(int(s["id"]), 0), "status": s["status"],
+                }
+                for s in seats
+            ],
+            hide_index=True, use_container_width=True,
+        )
+        st.caption(f"{len(seats)} seats · {len([s for s in seats if s['status'] == 'filled'])} filled · departments marked inactive open when wave 1 is published.")
+        threaded = [s for s in seats if s.get("thread_id")]
+        if threaded:
+            pick = st.selectbox("Open a seat's working thread", threaded, format_func=lambda s: s["title"], key="seat_thread_pick")
+            for row in recent_messages(project_scope, 6, thread_id=int(pick["thread_id"])):
+                with st.chat_message("user" if row["role"] == "user" else "assistant"):
+                    st.markdown(row["content"][:1500])
+    with backlog_tab:
+        st.markdown("**Catalog**")
+        catalog = society_store.catalog_for(project_scope, company_id)
+        edited = st.data_editor(
+            [{"id": c["id"], "key": c["key"], "title": c["title"], "field": c["field"], "logline": c["logline"], "stage": c["stage"], "wave": c["release_wave"]} for c in catalog],
+            hide_index=True, use_container_width=True, num_rows="fixed", key=f"catalog_editor_{company_id}",
+            column_config={"id": st.column_config.NumberColumn(disabled=True, width="small"), "key": st.column_config.TextColumn(disabled=True), "stage": st.column_config.TextColumn(disabled=True), "wave": st.column_config.NumberColumn(disabled=True, width="small")},
+        )
+        if st.button("Save catalog titles and loglines", key=f"save_catalog_{company_id}"):
+            for row in edited:
+                society_store.update("catalog", int(row["id"]), title=str(row["title"])[:200], logline=str(row["logline"])[:1000], field=str(row["field"])[:40])
+            st.success("Catalog saved.")
+        st.markdown("**Backlog and work in flight**")
+        items = society_store.work_items_for(project_scope, company_id, limit=300)
+        by_id = {int(s["id"]): s for s in society_store.seats_for(project_scope, company_id)}
+        editable = st.data_editor(
+            [{"id": i["id"], "title": i["title"], "status": i["status"], "importance": i["importance"], "seat": by_id.get(int(i["seat_id"] or 0), {}).get("title", ""), "feedback": i["feedback"][:120]} for i in items],
+            hide_index=True, use_container_width=True, num_rows="fixed", key=f"items_editor_{company_id}",
+            column_config={"id": st.column_config.NumberColumn(disabled=True, width="small"), "title": st.column_config.TextColumn(disabled=True), "status": st.column_config.TextColumn(disabled=True), "seat": st.column_config.TextColumn(disabled=True), "feedback": st.column_config.TextColumn(disabled=True), "importance": st.column_config.NumberColumn(min_value=1, max_value=5, width="small")},
+        )
+        if st.button("Save importance", key=f"save_items_{company_id}"):
+            for row in editable:
+                society_store.update("work_items", int(row["id"]), importance=max(1, min(5, int(row["importance"]))))
+            st.success("Importance saved; the board's rating overrides the CEO's.")
+        with st.form(f"add_item_{company_id}", clear_on_submit=True):
+            title = st.text_input("New work item title")
+            brief = st.text_area("Brief", height=80)
+            importance = st.slider("Importance", 1, 5, 3)
+            if st.form_submit_button("Add to backlog") and title.strip():
+                society_store.add_work_item(project_scope, company_id, title, brief, importance)
+                st.rerun()
+        waiting = [i for i in items if i["status"] == "board"]
+        if waiting:
+            st.markdown("**Waiting for the board**")
+            for item in waiting:
+                with st.expander(f"#{item['id']} · {item['title']}", expanded=False):
+                    if item.get("artifact_id"):
+                        filename, body = export_artifact(int(item["artifact_id"]))
+                        st.markdown(body[:4000])
+                        st.download_button("⬇ Download", data=body, file_name=filename, mime="text/markdown", key=f"dl_item_{item['id']}")
+                    if item.get("feedback"):
+                        st.caption(f"Editor notes: {item['feedback']}")
+                    note = st.text_input("Feedback for the company", key=f"fb_{item['id']}")
+                    ok, back = st.columns(2)
+                    if ok.button("Approve", key=f"approve_{item['id']}", use_container_width=True):
+                        society_store.set_work_status(int(item["id"]), "done", feedback=note or item["feedback"])
+                        if note.strip():
+                            society_store.insert("feedback", project_scope, company_id=company_id, catalog_id=item.get("catalog_id"), source="board", text=note.strip(), created_at=time.time())
+                        if item.get("catalog_id"):
+                            cat = society_store.row("catalog", int(item["catalog_id"]))
+                            if cat and cat["stage"] == "preliminary_review":
+                                society_store.update("catalog", int(cat["id"]), stage="board_feedback" if note.strip() else "final")
+                        st.rerun()
+                    if back.button("Return with feedback", key=f"return_{item['id']}", use_container_width=True):
+                        society_store.set_work_status(int(item["id"]), "assigned", feedback=note or "returned by the board")
+                        society_store.insert("feedback", project_scope, company_id=company_id, catalog_id=item.get("catalog_id"), source="board", text=note.strip() or "returned", created_at=time.time())
+                        st.rerun()
+    with rocks_tab:
+        st.markdown("**Rocks (this quarter)**")
+        st.dataframe([{"rock": r["title"], "status": r["status"], "due": time.strftime("%Y-%m-%d", time.gmtime(float(r["due_at"] or 0)))} for r in society_store.rows("rocks", project_scope, "company_id = ?", (company_id,))], hide_index=True, use_container_width=True)
+        st.markdown("**Timeline**")
+        st.dataframe([{"milestone": m["milestone"], "due": time.strftime("%Y-%m-%d", time.gmtime(float(m["due_at"] or 0))), "status": m["status"]} for m in society_store.rows("timeline", project_scope, "company_id = ?", (company_id,), order="due_at ASC")], hide_index=True, use_container_width=True)
+        issues = society_store.rows("issues", project_scope, "company_id = ?", (company_id,), order="id DESC", limit=20)
+        todos = society_store.rows("todos", project_scope, "company_id = ?", (company_id,), order="id DESC", limit=20)
+        if issues:
+            st.markdown("**Issues**")
+            st.dataframe([{"issue": i["title"], "status": i["status"], "resolution": i["resolution"]} for i in issues], hide_index=True, use_container_width=True)
+        if todos:
+            st.markdown("**To-dos**")
+            st.dataframe([{"to-do": t["text"], "seat": by_id.get(int(t["seat_id"] or 0), {}).get("title", ""), "done": bool(t["done"])} for t in todos], hide_index=True, use_container_width=True)
+    with score_tab:
+        rows = society_store.rows("scorecard", project_scope, "seat_id IN (SELECT id FROM seats WHERE company_id = ?)", (company_id,), order="id DESC", limit=200)
+        if rows:
+            st.dataframe([{"week": r["week"], "seat": by_id.get(int(r["seat_id"]), {}).get("title", r["seat_id"]), "kpi": r["kpi"], "target": r["target"], "actual": round(float(r["actual"]), 2), "met": bool(r["met"])} for r in rows], hide_index=True, use_container_width=True)
+        else:
+            st.caption("The scorecard fills in when the first cycle runs.")
+    with cycle_tab:
+        chain = st.checkbox("Keep cycling at the company interval while the app is awake", key=f"chain_{company_id}", value=False)
+        left, right = st.columns(2)
+        if left.button("Run a cycle now", key=f"run_cycle_{company_id}", type="primary", use_container_width=True, disabled=not configured_provider_names()):
+            society.run_now(project_scope, company_id, job_secrets_for_session(), mode=active_mode(), call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 1500), chain=chain, board_thread_id=thread_id)
+            st.rerun()
+        queued = [job_view(r) for r in list_jobs(project_scope, ("queued",), limit=50, kind=society.KIND_COMPANY) if job_view(r)["payload"].get("company_id") == company_id]
+        if right.button("Pause chain (cancel queued cycles)", key=f"pause_{company_id}", use_container_width=True, disabled=not queued):
+            for job in queued:
+                request_cancel(job["id"])
+            st.rerun()
+        if queued:
+            st.caption(f"{len(queued)} cycle(s) queued; next at {time.strftime('%H:%M UTC', time.gmtime(max(j['run_after'] for j in queued)))}.")
+        cycles = society_store.cycles_for(project_scope, company_id, limit=20)
+        if cycles:
+            st.dataframe([{"cycle": c["id"], "status": c["status"], "started": time.strftime("%m-%d %H:%M", time.gmtime(float(c["started_at"]))), "calls": c["calls"], "tokens": c["tokens_used"], "budget": c["tokens_planned"]} for c in cycles], hide_index=True, use_container_width=True)
+            with st.expander("Last cycle log", expanded=False):
+                st.json(society_store.load_json(cycles[0]["log"], []), expanded=False)
+        else:
+            st.caption("No cycle yet. A cycle runs the L10, rates and delegates the backlog, produces deliverables, reviews them, and reports here.")
+    with settings_tab:
+        with st.form(f"company_settings_{company_id}"):
+            vision = st.text_area("Vision", value=str(company.get("vision", "")), height=80)
+            values = st.text_input("Core values (comma separated)", value=", ".join(society_store.load_json(company.get("core_values"), [])))
+            focus = st.text_input("Core focus", value=str(company.get("core_focus", "")))
+            ten = st.text_input("10-year target", value=str(company.get("ten_year", "")))
+            three = st.text_input("3-year picture", value=str(company.get("three_year", "")))
+            one = st.text_input("1-year plan", value=str(company.get("one_year", "")))
+            hours = st.number_input("Cycle interval (hours)", min_value=1, max_value=168, value=max(1, int(company.get("interval_s", 21600)) // 3600))
+            share = st.slider("Treasury share (% of today's tokens)", 5, 60, int(float(company.get("daily_share", 0.35)) * 100))
+            if st.form_submit_button("Save V/TO and settings"):
+                society_store.update("companies", company_id, vision=vision[:2000], core_values=[v.strip() for v in values.split(",") if v.strip()], core_focus=focus[:500], ten_year=ten[:500], three_year=three[:500], one_year=one[:500], interval_s=int(hours) * 3600, daily_share=share / 100)
+                st.success("Saved.")
+        if company.get("kind") == "software":
+            with st.form(f"add_product_{company_id}", clear_on_submit=True):
+                p_title = st.text_input("Product title")
+                p_logline = st.text_input("One line on what it does")
+                if st.form_submit_button("Add product (seat, catalog row, backlog)") and p_title.strip():
+                    society.add_product(project_scope, company_id, deliverable_slug(p_title), p_title.strip(), p_logline.strip())
+                    st.rerun()
+        missing = [key for key in ("avs_studio", "software_co") if not society_store.company_by_key(project_scope, key)]
+        for key in missing:
+            if st.button(f"Create {'AVS Studio' if key == 'avs_studio' else 'AVS Software'}", key=f"seed_{key}_settings"):
+                society.seed_company(project_scope, key)
+                st.rerun()
+
+
 WORKSPACE_RENDERERS = {
     "task_finder": render_task_finder,
     "repository": render_repository_work,
     "chat_bot": render_chat_bot,
     "normal_chat": render_normal_chat,
+    "company": render_company,
 }
 
 

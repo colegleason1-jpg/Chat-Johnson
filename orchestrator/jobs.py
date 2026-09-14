@@ -99,11 +99,17 @@ def handler_kinds() -> Tuple[str, ...]:
     return tuple(_HANDLERS)
 
 
-def enqueue(project_scope: str, kind: str, payload: Mapping[str, Any], secrets: Mapping[str, str], thread_id: Optional[int] = None) -> int:
-    """Queue a job; ``secrets`` (env-name → key) stay in memory and are bound for that job's context only."""
+def enqueue(
+    project_scope: str, kind: str, payload: Mapping[str, Any], secrets: Mapping[str, str], thread_id: Optional[int] = None,
+    run_after: float = 0.0,
+) -> int:
+    """Queue a job; ``secrets`` (env-name → key) stay in memory and are bound for that job's context only.
+
+    ``run_after`` delays the claim (epoch seconds): chained cycles use it as their scheduler.
+    """
     if kind not in _HANDLERS:
         raise KeyError(f"no handler registered for job kind {kind!r}")
-    job_id = vault.enqueue_job(project_scope, kind, payload, thread_id=thread_id)
+    job_id = vault.enqueue_job(project_scope, kind, payload, thread_id=thread_id, run_after=run_after)
     with _SECRETS_LOCK:
         _SECRETS[job_id] = {name: value for name, value in secrets.items() if value}
     return job_id

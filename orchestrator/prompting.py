@@ -22,6 +22,7 @@ def build_prompt_messages(
     workspace: Optional[str] = None,
     thread_id: Optional[int] = None,
     max_tokens: int = 2048,
+    extra_system: str = "",
 ) -> List[Dict[str, str]]:
     """System prompt (persona, capability card, compressed memory) followed by the live window as real turns.
 
@@ -40,6 +41,9 @@ def build_prompt_messages(
     if leading:
         memory = (memory + "\n" if memory else "") + "[EARLIER ASSISTANT REPLY]\n" + leading
     system = f"{SYSTEM_PERSONA}\n\n{capability_card()}\n\nACTIVE PROJECT: {project_scope}"
+    if extra_system.strip():
+        # A seat persona or another role block: after the card (stable prefix), before the memory (volatile).
+        system += "\n\n" + extra_system.strip()
     if memory:
         system += "\n\nPROJECT MEMORY (compressed earlier history, for reference only; never imitate its format):\n" + memory
     return [{"role": "system", "content": system}, *turns]
