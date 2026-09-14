@@ -695,10 +695,43 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
         st.caption("Sandbox is a copied tree under the temp directory (no git worktree); the diff is computed against the source tree. Nothing was committed.")
     else:
         st.caption(f"Sandbox branch: {report.get('branch')}")
-    st.json(report.get("ingest", {}), expanded=False)
+    steps = report.get("steps") or []
+    if steps:
+        st.dataframe(
+            [{"step": s["id"], "title": s["title"], "type": s["type"], "provider": s["provider"], "status": s["status"], "note": s["note"][:300]} for s in steps],
+            hide_index=True, use_container_width=True,
+        )
+    ingest = report.get("ingest", {})
+    st.caption(f"Ingested {ingest.get('file_count', 0)} file(s) (~{ingest.get('est_tokens', 0)} tokens) from the sandbox source.")
     diff = str(report.get("diff") or "")
     if not diff.strip():
-        st.info("The pipeline produced no file changes. Rephrase the request with the files or behaviour you expect to change.")
+        failed = [s for s in steps if s["status"] == "failed"]
+        if failed:
+            st.warning(
+                "No files were written. " + "; ".join(f"step {s['id']} ({s['title']}): {s['note'][:200]}" for s in failed)
+                + ". Retry below asks the model for file blocks only."
+            )
+        else:
+            st.info("The pipeline ran but changed no files: the plan had no code step, or the answers had no file blocks. Retry below asks for file blocks only.")
+        if st.button("Retry, file blocks only", key="repo_retry_strict", type="primary",
+                     help="Re-runs with an explicit instruction to answer with one ```file: path block per file and nothing else."):
+            strict_goal = (
+                last["goal"] + "\n\nRespond ONLY with fenced ```file: relative/path blocks, one per file, each with the complete "
+                "file content. Create every folder through its files. No prose."
+            )
+            settings = get_settings()
+            if not st.session_state.get("repo_run_tests", False):
+                settings.max_test_rounds = 0
+            source_path = str(last["fetched"]["path"]) if last.get("fetched") else str(st.session_state.get("repo_path", ""))
+            with st.status("Re-running with the strict file format…", expanded=True) as status:
+                try:
+                    report = Orchestrator(settings=settings, ledger=ledger).run(strict_goal, repo_path=source_path)
+                    status.update(label="Pipeline completed", state="complete")
+                    st.session_state.repo_last_report = {**last, "report": report}
+                    st.rerun()
+                except Exception as exc:
+                    status.update(label="Pipeline stopped", state="error")
+                    st.error(f"Repository pipeline failed: {exc}")
     else:
         pairs, missing = collect_changed_files(str(report.get("sandbox") or ""), diff)
         st.caption(f"Changed files: {', '.join(path for path, _ in pairs) or 'none readable'}" + (f" · not pushable: {', '.join(missing)}" if missing else ""))

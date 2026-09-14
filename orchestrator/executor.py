@@ -72,7 +72,11 @@ class Orchestrator:
             "goal": goal,
             "branch": branch,
             "sandbox": sandbox_path,
-            "steps": [s.__dict__ if hasattr(s, "__dict__") else s for s in plan],
+            "plan": plan,
+            "steps": [
+                {"id": s.step_id, "title": s.title, "type": s.task_type, "provider": s.provider, "status": s.status, "note": s.note}
+                for s in memory.steps
+            ],
             "memory": memory.context_block(),
             "ingest": ingest_stats,
             "ledger": {p: self.ledger.usage(p) for p in self.ledger._limits},
@@ -108,6 +112,9 @@ class Orchestrator:
 
         if task_type in ("code_patch", "test_fix") and sandbox_path:
             record.note = self._apply_and_verify(text, sandbox_path, goal, memory, decision.provider)
+            if record.note.startswith("FAILED") and "no file blocks" in record.note:
+                # Keep the head of the answer so the operator can see what came back instead of files.
+                record.note += " · answer began: " + text.strip()[:300].replace("\n", " ")
             record.status = "done" if not record.note.startswith("FAILED") else "failed"
         else:
             record.note = text[:400].replace("\n", " ")
@@ -165,8 +172,11 @@ class Orchestrator:
             parts.append("\nMEMORY:\n" + mem)
         if repo_context and step["type"] == "context_load":
             parts.append("\n" + repo_context[: self.settings.repo_ingest_budget * 4])
-        elif repo_context and step.get("targets"):
-            parts.append("\nRelevant repo files may already be summarized in MEMORY.")
+        elif repo_context and step["type"] in ("code_patch", "test_fix"):
+            # Patch steps see the file map and the highest-value files, bounded, so edits target real paths.
+            parts.append("\nREPOSITORY (file map, then key files; other files exist but are not shown):\n" + repo_context[:20_000])
+        elif not repo_context and step["type"] in ("code_patch", "test_fix"):
+            parts.append("\nThe repository is EMPTY: create the complete project structure as file blocks (every folder needs a file).")
         return "\n".join(parts)
 
     def _cheap_summarizer(self, text: str) -> str:

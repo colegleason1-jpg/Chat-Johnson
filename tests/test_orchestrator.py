@@ -103,3 +103,23 @@ def test_worktree_and_copy_mode(tmp_path):
     assert os.path.isfile(os.path.join(sandbox_path, "README.md"))
     cleanup_worktree(str(repo), sandbox_path)
     assert not os.path.exists(sandbox_path)
+
+
+def test_parse_file_blocks_accepts_common_model_dialects():
+    text = (
+        "Here is the project.\n\n"
+        "### src/app.py\n```python\nprint('a')\n```\n\n"
+        "**tests/test_app.py**\n```python\ndef test_x():\n    assert True\n```\n\n"
+        "```yaml title=\".github/workflows/ci.yml\"\nname: ci\n```\n\n"
+        "```dockerfile\n# Dockerfile\nFROM python:3.12\n```\n\n"
+        "```js\n// web/index.js\nconsole.log(1)\n```\n\n"
+        "Run it with:\n```bash\npytest -q\n```\n\n"
+        "```text\nsome output\n```\n\n"
+        "```file: README.md\n# Title\n```\n"
+    )
+    blocks = parse_file_blocks(text)
+    assert set(blocks) == {"src/app.py", "tests/test_app.py", ".github/workflows/ci.yml", "web/index.js", "README.md"}
+    assert blocks["src/app.py"] == "print('a')\n" and blocks["web/index.js"] == "console.log(1)\n"
+    assert blocks[".github/workflows/ci.yml"] == "name: ci\n"
+    assert parse_file_blocks("```python\nprint(1)\n```") == {}  # a fence that names no file is not a file
+    assert parse_file_blocks("### ../../etc/passwd\n```text\nx\n```") == {}

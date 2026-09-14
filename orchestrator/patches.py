@@ -22,20 +22,82 @@ FILE_BLOCK_RE = re.compile(
     r"```file:\s*(?P<path>[^\n`]+)\n(?P<body>.*?)```", re.DOTALL
 )
 DIFF_BLOCK_RE = re.compile(r"```diff\s*\n(?P<body>.*?)```", re.DOTALL)
+# Any fenced block, with its info string and the two lines above it (models name the file there in many ways).
+ANY_FENCE_RE = re.compile(r"(?P<lead>(?:[^\n]*\n){0,2})```(?P<info>[^\n]*)\n(?P<body>.*?)\n?```", re.DOTALL)
+_EXTENSIONLESS = {"Dockerfile", "Makefile", "LICENSE", "Procfile", "Jenkinsfile", "Vagrantfile", ".gitignore", ".dockerignore",
+                  ".env.example", ".editorconfig", ".gitattributes", "CODEOWNERS"}
+_PATH_TOKEN = re.compile(r"(?<![\w./-])((?:[\w.@-]+/)*[\w.@-]+)(?![\w/-])")
+_NOT_A_FILE_INFO = {"diff", "output", "console", "text", "txt", "plaintext", "log", "mermaid", ""}
 
 PATCH_INSTRUCTIONS = """OUTPUT FORMAT (mandatory):
-- To change a file, emit a fenced block exactly like:
+- Emit every file you create or change as its own fenced block that names the path, exactly like:
 ```file: relative/path/from/repo/root.py
 <complete new content of that file>
 ```
-- Only emit files you actually change. Never use placeholders like
-  "... rest unchanged ..." — always write the complete file content.
-- Prefer many small file blocks over one giant rewrite.
+- Write the complete content of each file. Never use placeholders like "... rest unchanged ...".
+- Folders exist only through file paths, so give every folder at least one file (a README.md or __init__.py is fine).
+- Prefer many small file blocks over one giant rewrite. Do not wrap the blocks in prose that repeats them.
+- Example for two files:
+```file: README.md
+# Project
+```
+```file: src/app.py
+print("hello")
+```
 """
 
 
+def _looks_like_path(token: str) -> bool:
+    token = token.strip().strip("`*_\"'")
+    if not token or " " in token or not _safe_relpath(token):
+        return False
+    name = token.rsplit("/", 1)[-1]
+    if name in _EXTENSIONLESS or name.startswith(".") and len(name) > 1:
+        return True
+    return bool(re.search(r"\.[A-Za-z0-9]{1,8}$", name)) and not token.endswith(".")
+
+
+def _path_from_info(info: str) -> str:
+    """```file: x, ```python title="x", ```python:x, ```python x, ```x  → x."""
+    info = info.strip()
+    m = re.search(r"(?:title|filename|file|path)\s*[=:]\s*[\"']?([^\"'\s]+)", info, re.I)
+    if m and _looks_like_path(m.group(1)):
+        return m.group(1)
+    for part in re.split(r"[\s:]+", info):
+        if _looks_like_path(part) and part not in _NOT_A_FILE_INFO:
+            return part.strip("`")
+    return ""
+
+
+def _path_from_lead(lead: str) -> str:
+    """A heading, bold name, backticked name, or 'File: x' line just above the fence."""
+    for line in reversed([ln.strip() for ln in lead.splitlines() if ln.strip()]):
+        cleaned = re.sub(r"^(?:#+\s*|\*\*|file\s*[:=]\s*|path\s*[:=]\s*|\d+[.)]\s*|[-*]\s*)+", "", line, flags=re.I).strip().rstrip(":").strip("`*_ ")
+        if _looks_like_path(cleaned):
+            return cleaned
+        for token in _PATH_TOKEN.findall(line):
+            if "/" in token and _looks_like_path(token):
+                return token
+        return ""
+    return ""
+
+
+def _path_from_first_line(body: str) -> Tuple[str, str]:
+    """A first-line comment naming the file: '# src/app.py', '// x.js', '<!-- x.html -->', '/* x.css */'."""
+    first, _, rest = body.partition("\n")
+    m = re.match(r"^\s*(?:#|//|<!--|/\*|--|;)\s*(?:file\s*:\s*)?([\w.@/-]+)\s*(?:-->|\*/)?\s*$", first, re.I)
+    if m and "/" in m.group(1) and _looks_like_path(m.group(1)):
+        return m.group(1), rest
+    return "", body
+
+
 def parse_file_blocks(text: str) -> Dict[str, str]:
-    """Extract {relative_path: full_new_content} from FILE blocks."""
+    """Extract {relative_path: full_new_content} from fenced blocks that name a file.
+
+    The canonical form is ```file: path. Models also write ```python title="path", a heading or
+    bold path just above the fence, or a first-line comment with the path; all are accepted so a
+    correct answer in a different dialect is not thrown away. Fences that name no file are ignored.
+    """
     patches: Dict[str, str] = {}
     for m in FILE_BLOCK_RE.finditer(text):
         path = m.group("path").strip()
@@ -46,6 +108,19 @@ def parse_file_blocks(text: str) -> Dict[str, str]:
             body += "\n"
         if _safe_relpath(path):
             patches[path] = body
+    for m in ANY_FENCE_RE.finditer(text):
+        info = m.group("info").strip()
+        if info.lower().startswith("file:") or info.lower().startswith("diff"):
+            continue
+        body = m.group("body")
+        path = _path_from_info(info) or _path_from_lead(m.group("lead"))
+        if not path:
+            path, body = _path_from_first_line(body)
+        if not path or not _safe_relpath(path) or path in patches:
+            continue
+        if not body.endswith("\n"):
+            body += "\n"
+        patches[path] = body
     return patches
 
 
