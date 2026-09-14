@@ -782,20 +782,21 @@ def artifact_by_id(artifact_id: int) -> Optional[sqlite3.Row]:
 
 
 def search_artifacts(project_scope: str, query: str, limit: int = 20) -> List[sqlite3.Row]:
-    """Case-insensitive search over name, path, and structural summary."""
-    needle = f"%{query.strip()}%"
+    """Keyword search over name, path, and structural summary: every word must match, in any field, any order."""
+    from .keyword_search import like_clauses  # local import: keyword_search has no vault dependency
+
+    clause, params = like_clauses(query, ("name", "file_path", "structural_summary"))
     with _open_database() as connection:
         return list(
             connection.execute(
-                """
+                f"""
                 SELECT id, name, file_path, version, structural_summary, created_at
                 FROM artifact_store
-                WHERE project_scope = ?
-                  AND (name LIKE ? OR file_path LIKE ? OR structural_summary LIKE ?)
+                WHERE project_scope = ? AND {clause}
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """,
-                (project_scope.strip() or "default", needle, needle, needle, max(1, min(int(limit), 100))),
+                [project_scope.strip() or "default", *params, max(1, min(int(limit), 100))],
             ).fetchall()
         )
 

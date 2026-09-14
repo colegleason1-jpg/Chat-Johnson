@@ -126,8 +126,10 @@ def test_user_name_alone_is_flagged_and_the_token_can_list_repositories(app, mon
     warnings = [w.value for w in app.warning]
     assert any("not owner/name" in w for w in warnings), warnings
     assert any("No repository loaded" in i.value and "owner/name" in i.value for i in app.info)
-    next(b for b in app.button if b.label == "List repositories this token can see").click().run()
-    assert app.selectbox(key="repo_pick").value == "Chazzzer/Chat-Johnson"
+    # the token's repositories were listed automatically; keyword search narrows them
+    app.text_input(key="repo_search").input("chat johnson").run()
+    picker = next(s for s in app.selectbox if "repositories match" in s.label)
+    assert picker.value == "Chazzzer/Chat-Johnson" and picker.label.startswith("1 of 1")
     next(b for b in app.button if b.label.startswith("Use Chazzzer/Chat-Johnson")).click().run()
     assert not app.exception
     assert app.session_state["github_push_repo"] == "Chazzzer/Chat-Johnson"

@@ -98,6 +98,7 @@ from orchestrator.deploykit import CLOUDS, LANGUAGES, TARGETS, KitSpec, generate
 from orchestrator.github_auth import mint_state, verify_state
 from orchestrator.github_push import GitHubPushError, GitHubWriter, PushRecord, branch_name_for
 from orchestrator.github_repo import GitHubRepoError, collect_changed_files, fetch_tree, list_repositories, looks_like_owner_repo
+from orchestrator.keyword_search import keyword_rank
 from orchestrator.repo_ingest import repo_prompt_context
 from orchestrator.missions import (
     MAX_SECTIONS,
@@ -586,18 +587,25 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
         if owner_repo.strip() and not valid:
             st.warning("Enter the repository as owner/name (for example Chazzzer/Chat-Johnson); a user name alone is not a repository.")
         if token:
-            if st.button("List repositories this token can see", key="repo_list", help="One API call; newest activity first."):
+            # The token's repositories are listed once per session (one API call) and searched by keyword from then on.
+            if "repo_choices" not in st.session_state or st.button("Refresh the repository list", key="repo_list", help="One API call; newest activity first."):
                 try:
                     st.session_state.repo_choices = list_repositories(token)
                 except GitHubRepoError as exc:
+                    st.session_state.repo_choices = []
                     st.error(f"Could not list repositories: {exc}")
             choices: List[str] = st.session_state.get("repo_choices", [])
             if choices:
-                pick = st.selectbox("Pick a repository", choices, key="repo_pick")
-                if st.button(f"Use {pick} and connect it", key="repo_use_pick", type="primary"):
-                    st.session_state.pending_repo_choice = pick
-                    st.session_state.pending_fetch = pick
-                    st.rerun()
+                query = st.text_input("Find a repository", key="repo_search", placeholder="keywords, any order (e.g. chat johnson)")
+                matches = keyword_rank(query, choices, limit=25)
+                if matches:
+                    pick = st.selectbox(f"{len(matches)} of {len(choices)} repositories match", matches, key=f"repo_pick_{len(matches)}_{matches[0]}")
+                    if st.button(f"Use {pick} and connect it", key="repo_use_pick", type="primary"):
+                        st.session_state.pending_repo_choice = pick
+                        st.session_state.pending_fetch = pick
+                        st.rerun()
+                else:
+                    st.caption("No repository matches those keywords.")
         else:
             st.caption("Public repositories only until GitHub push is armed in the sidebar (then private ones too, and the token can list them).")
         auto = st.session_state.pop("pending_fetch", None)
@@ -1178,7 +1186,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
 
     st.selectbox(
         "Chat", ids, format_func=lambda value: labels.get(value, str(value)), key=select_key,
-        on_change=_on_select, label_visibility="collapsed",
+        on_change=_on_select, label_visibility="collapsed", help="Type in the box to filter chats by keyword.",
     )
     new, clear, delete, more = st.columns(4, gap="small")  # four equal buttons stay readable at iPad width
     if new.button("New chat", key=f"new_thread_{workspace}", use_container_width=True,
@@ -1797,7 +1805,7 @@ with st.sidebar:
         st.warning("No provider keys detected. Paste them in the API keys panel above or set environment variables; this app never stores them in SQLite.")
     st.divider()
     st.subheader("Locked artifacts")
-    artifact_query = st.text_input("Search artifacts", key="artifact_query", placeholder="name, path, or summary")
+    artifact_query = st.text_input("Search artifacts", key="artifact_query", placeholder="keywords, any order: name, path, or summary")
     artifacts = (
         search_artifacts(st.session_state.project_scope, artifact_query, 12)
         if artifact_query.strip()

@@ -191,3 +191,17 @@ def test_route_log_persists_and_stats_summarize_latency_and_finish(db):
     csv = db.routes_csv("scope")
     assert csv.startswith("id,timestamp_utc,workspace,task_type,route,mode,ms,finish,reason") and csv.count("\n") == 6
     assert db.route_stats("scope", hours=0.0) == [] or all(r["sends"] >= 1 for r in db.route_stats("scope", hours=0.0))
+
+
+def test_artifact_search_matches_keywords_across_fields_in_any_order(db):
+    db.save_artifact("scope", "router.py", "orchestrator/router.py", "def route():\n    return 1\n", "python")
+    db.save_artifact("scope", "notes.md", "docs/notes.md", "# utf8 handling in the router\n", "markdown")
+    db.save_artifact("scope", "other.py", "pkg/other.py", "x = 1\n", "python")
+
+    def names(rows):
+        return sorted(r["name"] for r in rows)
+
+    assert names(db.search_artifacts("scope", "router")) == ["notes.md", "router.py"]
+    assert names(db.search_artifacts("scope", "docs router")) == ["notes.md"]  # path and summary/name in one query
+    assert names(db.search_artifacts("scope", "ROUTER py")) == ["router.py"]
+    assert db.search_artifacts("scope", "router missing") == []
