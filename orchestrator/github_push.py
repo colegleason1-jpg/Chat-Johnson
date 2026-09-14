@@ -120,6 +120,15 @@ class GitHubWriter:
     def create_branch(self, branch: str, sha: str) -> None:
         self._request("POST", self._repo("/git/refs"), {"ref": f"refs/heads/{branch}", "sha": sha})
 
+    def update_branch(self, branch: str, sha: str) -> None:
+        self._request("PATCH", self._repo(f"/git/refs/heads/{branch}"), {"sha": sha, "force": False}, ok=(200,))
+
+    def put_content(self, path: str, content: str, branch: str, message: str) -> str:
+        """Create one file through the Contents API; on an empty repository this makes the first commit and the branch."""
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        data = self._request("PUT", self._repo(f"/contents/{path}"), {"message": message, "content": encoded, "branch": branch}, ok=(200, 201))
+        return str((data or {}).get("commit", {}).get("sha", ""))
+
     def open_pull_request(self, head: str, base: str, title: str, body: str) -> Dict[str, Any]:
         return self._request("POST", self._repo("/pulls"), {"title": title, "head": head, "base": base, "body": body})
 
@@ -143,6 +152,28 @@ class GitHubWriter:
         return PushRecord(
             owner=self.owner, repo=self.repo, base_branch=base, base_sha=base_sha, branch=branch, commit_sha=commit,
             pr_number=int(pull.get("number", 0)), pr_url=str(pull.get("html_url", "")), files=[path for path, _ in files], previous=previous,
+        )
+
+    def initialize_repository(self, files: Sequence[Tuple[str, str]], branch: str, message: str) -> PushRecord:
+        """First commit(s) on an empty repository: the Contents API creates the branch with the first file,
+        then one Git Data commit adds the rest. No pull request exists without a base to compare against."""
+        if not files:
+            raise GitHubPushError("nothing to push")
+        first_path, first_body = files[0]
+        first_sha = self.put_content(first_path, first_body, branch, message)
+        head = first_sha or self.branch_sha(branch)
+        if len(files) > 1:
+            entries = [
+                {"path": path, "mode": "100755" if path.endswith(".sh") else "100644", "type": "blob", "sha": self.create_blob(body)}
+                for path, body in files[1:]
+            ]
+            tree = self.create_tree(self.commit_tree(head), entries)
+            head = self.create_commit(message, tree, head)
+            self.update_branch(branch, head)
+        return PushRecord(
+            owner=self.owner, repo=self.repo, base_branch=branch, base_sha=first_sha, branch=branch, commit_sha=head,
+            pr_number=0, pr_url=f"https://github.com/{self.owner}/{self.repo}/tree/{branch}", files=[path for path, _ in files],
+            previous={path: None for path, _ in files}, kind="init",
         )
 
     def open_revert(self, record: PushRecord) -> PushRecord:

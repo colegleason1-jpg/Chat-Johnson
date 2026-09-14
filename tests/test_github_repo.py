@@ -124,3 +124,27 @@ def test_whoami_and_bare_names_resolve_to_the_signed_in_user(monkeypatch):
     assert gr.qualify_repository("someone/else", "colegleason1-jpg") == "someone/else"
     assert gr.qualify_repository("https://github.com/me/proj.git", "") == "me/proj"
     assert gr.qualify_repository("Chat-Johnson", "") == "Chat-Johnson"  # nobody signed in: left alone, caught by the shape check
+
+
+def test_empty_repository_connects_as_a_blank_sandbox(monkeypatch, tmp_path):
+    monkeypatch.setattr(gr, "staging_root", lambda: str(tmp_path))
+
+    def fake_get(url, headers=None, stream=False, timeout=None, allow_redirects=True):
+        if url.endswith("/repos/me/blank"):
+            return FakeResponse(200, {"default_branch": "main"})
+        return FakeResponse(409, text='{"message":"Git Repository is empty."}')
+
+    monkeypatch.setattr(gr.requests, "get", fake_get)
+    fetched = gr.fetch_tree("me/blank", "")
+    assert fetched.empty and fetched.files == 0 and fetched.sha == "" and fetched.ref == "main"
+    assert os.path.isdir(fetched.path) and os.listdir(fetched.path) == []
+    with pytest.raises(gr.EmptyRepositoryError):
+        gr.resolve_sha("me/blank", "main")
+
+
+def test_plain_language_for_common_statuses(monkeypatch):
+    for status, phrase in ((401, "token was rejected"), (403, "lacks access"), (404, "not found")):
+        monkeypatch.setattr(gr.requests, "get", lambda url, headers=None, s=status, **kw: FakeResponse(s, text="raw detail"))
+        with pytest.raises(gr.GitHubRepoError) as excinfo:
+            gr.resolve_sha("me/proj", "main", token="ghp_x")
+        assert phrase in str(excinfo.value) and "raw detail" in str(excinfo.value)

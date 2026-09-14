@@ -121,3 +121,30 @@ def test_disconnect_clears_the_connection(app, monkeypatch):
     assert not app.exception
     assert "repo_fetched" not in app.session_state or not app.session_state["repo_fetched"]
     assert any("No repository connected" in i.value for i in app.info)
+
+
+@SKIP_OLD
+def test_empty_repository_connects_and_offers_the_first_commit(app, monkeypatch):
+    from orchestrator import github_repo as gr
+    from tests.test_github_repo import FakeResponse
+
+    def fake_get(url, headers=None, stream=False, timeout=None, allow_redirects=True):
+        if url.endswith("/user"):
+            return FakeResponse(200, {"login": "me"})
+        if "/user/repos" in url:
+            return FakeResponse(200, [{"full_name": "me/blank"}])
+        if url.endswith("/repos/me/blank"):
+            return FakeResponse(200, {"default_branch": "main"})
+        return FakeResponse(409, text='{"message":"Git Repository is empty."}')
+
+    monkeypatch.setattr(gr.requests, "get", fake_get)
+    app.query_params["ws"] = "repository"
+    app.run()
+    app.checkbox(key="github_push_enabled").check().run()
+    app.text_input(key="github_push_token").input("ghp_secret_token_123").run()
+    next(b for b in app.button if b.label == "Connect me/blank").click().run()
+    assert not app.exception
+    assert any("empty repository (no commits yet)" in s.value for s in app.success), [s.value for s in app.success]
+    assert any("empty, nothing committed yet" in c.value for c in app.caption)
+    next(b for b in app.button if b.label == "Generate kit").click().run()
+    assert any(b.label.startswith("Create the first commit on main with") for b in app.button), [b.label for b in app.button]

@@ -30,6 +30,10 @@ class GitHubRepoError(Exception):
     pass
 
 
+class EmptyRepositoryError(GitHubRepoError):
+    """The repository exists but has no commits yet; there is nothing to download, everything to build."""
+
+
 @dataclass
 class FetchedRepo:
     owner: str
@@ -39,6 +43,7 @@ class FetchedRepo:
     path: str
     files: int
     size_bytes: int
+    empty: bool = False  # no commits yet: the sandbox starts blank and the first push creates the initial commit
 
     def as_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -68,18 +73,28 @@ def _get(url: str, token: str, stream: bool = False, timeout: int = 60) -> reque
         raise GitHubRepoError(_redact(f"GitHub network error: {exc}", token)) from None
     if response.status_code >= 400:
         detail = _redact((getattr(response, "text", "") or "")[:200], token)
-        hint = " (private repository? arm GitHub push with a token that can read it)" if response.status_code in (401, 403, 404) and not token else ""
-        raise GitHubRepoError(f"GitHub GET {url.replace(API_ROOT, '')} -> HTTP {response.status_code}: {detail}{hint}")
+        where = url.replace(API_ROOT, "")
+        if response.status_code == 409 and "empty" in detail.lower():
+            raise EmptyRepositoryError(f"{where}: the repository has no commits yet")
+        plain = {
+            401: "the token was rejected",
+            403: "the token lacks access to this, or the API rate limit was hit",
+            404: "not found, or the token cannot see it" + ("" if token else " (private repository? arm GitHub push with a token that can read it)"),
+        }.get(response.status_code, "")
+        raise GitHubRepoError(f"GitHub {where} -> HTTP {response.status_code}: {plain + ' · ' if plain else ''}{detail}")
     return response
 
 
-def resolve_sha(owner_repo: str, ref: str = "", token: str = "") -> Tuple[str, str]:
-    """(ref, sha): the default branch is used when ``ref`` is empty."""
+def default_branch(owner_repo: str, token: str = "") -> str:
     owner, repo = parse_owner_repo(owner_repo)
-    chosen = (ref or "").strip()
-    if not chosen:
-        data = _get(f"{API_ROOT}/repos/{owner}/{repo}", token).json()
-        chosen = str(data.get("default_branch") or "main")
+    data = _get(f"{API_ROOT}/repos/{owner}/{repo}", token).json()
+    return str(data.get("default_branch") or "main")
+
+
+def resolve_sha(owner_repo: str, ref: str = "", token: str = "") -> Tuple[str, str]:
+    """(ref, sha): the default branch is used when ``ref`` is empty. Raises EmptyRepositoryError on a commitless repository."""
+    owner, repo = parse_owner_repo(owner_repo)
+    chosen = (ref or "").strip() or default_branch(owner_repo, token)
     data = _get(f"{API_ROOT}/repos/{owner}/{repo}/commits/{chosen}", token).json()
     sha = str(data.get("sha") or "")
     if not re.fullmatch(r"[0-9a-f]{7,64}", sha):
@@ -158,7 +173,13 @@ def extract_tarball(tar_bytes: bytes, dest: str) -> Tuple[int, int]:
 def fetch_tree(owner_repo: str, ref: str = "", token: str = "", max_bytes: int = MAX_TARBALL_BYTES) -> FetchedRepo:
     """Download one commit's tree into a fresh directory under the staging root."""
     owner, repo = parse_owner_repo(owner_repo)
-    chosen, sha = resolve_sha(owner_repo, ref, token)
+    try:
+        chosen, sha = resolve_sha(owner_repo, ref, token)
+    except EmptyRepositoryError:
+        # Nothing to download: start a blank sandbox so the pipeline can build the structure from scratch.
+        branch = (ref or "").strip() or default_branch(owner_repo, token)
+        dest = tempfile.mkdtemp(prefix=f"{repo}-empty-", dir=staging_root())
+        return FetchedRepo(owner=owner, repo=repo, ref=branch, sha="", path=dest, files=0, size_bytes=0, empty=True)
     response = _get(f"{API_ROOT}/repos/{owner}/{repo}/tarball/{sha}", token, stream=True, timeout=120)
     chunks: List[bytes] = []
     total = 0

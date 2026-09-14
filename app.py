@@ -572,6 +572,13 @@ def repository_context(max_tokens: int) -> Tuple[str, str, bool]:
             else "arm the GitHub token in the sidebar to pick from your repositories, or enter a public owner/name in the Work tab and press Connect"
         )
         return NO_REPOSITORY_CONTEXT, f"No repository connected: {hint}. The chat cannot reach GitHub on its own.", False
+    if fetched and fetched.get("empty"):
+        text = (
+            f"REPOSITORY CONTEXT ({fetched['owner']}/{fetched['repo']}): connected but EMPTY, no commits and no files yet. "
+            "Propose and build the structure: name folders and files with their purpose; the Repository Work pipeline creates "
+            "them and the first push makes the initial commit."
+        )
+        return text, f"Repository in context: {fetched['owner']}/{fetched['repo']} · empty, nothing committed yet. Ask the chat to propose a structure, then run the pipeline to create it.", True
     label = f"{fetched['owner']}/{fetched['repo']}@{str(fetched['sha'])[:7]}" if fetched else os.path.basename(path.rstrip("/"))
     budget = repository_context_chars(max_tokens)
     key = (path, str(fetched["sha"]) if fetched else "", budget)
@@ -595,10 +602,16 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
         token = str(st.session_state.get("github_push_token", "")) if push_state["armed"] else ""
         if fetched:
             c1, c2 = st.columns([0.8, 0.2], gap="small")
-            c1.success(
-                f"Connected {fetched['owner']}/{fetched['repo']} @ {fetched['ref']} ({str(fetched['sha'])[:7]}) · "
-                f"{fetched['files']} file(s) · {int(fetched['size_bytes']) // 1024} KB. The conversation below sees it; pushes go here."
-            )
+            if fetched.get("empty"):
+                c1.success(
+                    f"Connected {fetched['owner']}/{fetched['repo']} · empty repository (no commits yet). Describe the structure "
+                    f"you want below; the pipeline creates the files, and the first push makes the initial commit on {fetched['ref']}."
+                )
+            else:
+                c1.success(
+                    f"Connected {fetched['owner']}/{fetched['repo']} @ {fetched['ref']} ({str(fetched['sha'])[:7]}) · "
+                    f"{fetched['files']} file(s) · {int(fetched['size_bytes']) // 1024} KB. The conversation below sees it; pushes go here."
+                )
             if c2.button("Disconnect", key="repo_disconnect", use_container_width=True):
                 for key in ("repo_fetched", "repo_context_cache", "repo_last_report"):
                     st.session_state.pop(key, None)
@@ -692,7 +705,9 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
         st.code(diff[:20_000], language="diff")
         st.download_button("⬇ Download patch (.diff)", data=diff, file_name="chat-johnson-change.diff", mime="text/x-diff", key="repo_patch_download")
         if last["source"] == "GitHub repository" and last.get("fetched") and pairs:
-            if push_state["armed"] and push_state["connected"]:
+            if push_state["armed"] and push_state["connected"] and last["fetched"].get("empty"):
+                render_initial_commit_push(pairs, f"Chat Johnson: {last['goal'][:60]}", "repo_init_push")
+            elif push_state["armed"] and push_state["connected"]:
                 base = str(last["fetched"]["ref"])
                 default_branch = f"chat-johnson/{deliverable_slug(last['goal'])}-{str(last['fetched']['sha'])[:7]}"
                 branch = st.text_input("Branch name", value=default_branch, key="repo_push_branch")
@@ -717,6 +732,30 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
                 st.caption("Arm **GitHub push (session only)** in the sidebar (and keep the repository connected) to push this change as a branch with a pull request.")
     with st.expander("Execution memory", expanded=False):
         st.text(report.get("memory", "") or "(empty)")
+
+
+def render_initial_commit_push(pairs: Sequence[Tuple[str, str]], message: str, key: str) -> None:
+    """Empty repository: the push creates the first commit on the default branch; there is no base for a pull request."""
+    fetched = st.session_state.get("repo_fetched") or {}
+    branch = str(fetched.get("ref") or "main")
+    st.info(
+        f"{fetched.get('owner')}/{fetched.get('repo')} has no commits, so this push creates the initial commit on **{branch}** "
+        "directly. A pull request needs a base to compare against; after this first commit, every later push goes to a new "
+        "branch with a pull request."
+    )
+    if st.button(f"Create the first commit on {branch} with {len(pairs)} file(s)", type="primary", key=key, use_container_width=True):
+        token = str(st.session_state.get("github_push_token", ""))
+        repo = f"{fetched.get('owner')}/{fetched.get('repo')}"
+        try:
+            with st.spinner("Creating the first commit…"):
+                record = GitHubWriter(token, repo).initialize_repository(pairs, branch, message)
+                refreshed = fetch_tree(repo, branch, token)
+            st.session_state.setdefault("kit_pushes", []).append(record)
+            st.session_state.repo_fetched = refreshed.as_dict()
+            st.session_state.pop("repo_context_cache", None)
+            st.success(f"Initial commit {record.commit_sha[:7]} on {branch} with {len(record.files)} file(s): {record.pr_url}. The repository is now connected at that commit.")
+        except (GitHubPushError, GitHubRepoError) as exc:
+            st.error(f"Push failed: {exc}")
 
 
 def render_github_tab() -> None:
@@ -777,8 +816,9 @@ def render_push_ledger() -> None:
         st.caption("No pushes this session.")
         return
     for index, record in enumerate(pushes):
-        label = "revert" if record.kind == "revert" else "push"
-        st.caption(f"{label} · {record.owner}/{record.repo} · branch {record.branch} · PR #{record.pr_number} · {record.pr_url}")
+        label = {"revert": "revert", "init": "initial commit"}.get(record.kind, "push")
+        target = f"PR #{record.pr_number}" if record.pr_number else "no pull request (first commit)"
+        st.caption(f"{label} · {record.owner}/{record.repo} · branch {record.branch} · {target} · {record.pr_url}")
         if record.kind == "push" and state["armed"] and st.button("Open revert PR", key=f"ledger_revert_{index}"):
             try:
                 reverted = GitHubWriter(str(st.session_state.get("github_push_token", "")), f"{record.owner}/{record.repo}").open_revert(record)
@@ -808,6 +848,8 @@ reviewable result. It never touches your default branch, never stores a token, a
 6. The GitHub tab lists the push; **Open revert PR** restores the touched paths.
 
 **Local path** works the same on a self-hosted run: point at a repository on the machine that runs the app; a git worktree is used when possible.
+
+**Empty repositories** connect too: the sandbox starts blank, the chat proposes a structure, the pipeline creates the files, and the first push makes the initial commit on the default branch (later pushes get a branch and a pull request).
 
 **When the diff is empty** the model answered without file blocks. Name the files or behaviour you expect to change and run again; the *Execution memory* shows what each step returned.
 
@@ -899,6 +941,8 @@ def render_kit_push(spec: KitSpec, files: Sequence[Any]) -> None:
     pushes: List[PushRecord] = st.session_state.setdefault("kit_pushes", [])
     if not (state["armed"] and state["connected"]):
         st.caption("To push this kit as a branch with a pull request, arm **GitHub push (session only)** in the sidebar and connect a repository in the Work tab.")
+    elif (st.session_state.get("repo_fetched") or {}).get("empty"):
+        render_initial_commit_push(pairs, f"Add deploy kit for {spec.app_name}", "kit_init_push")
     else:
         st.markdown(f"**Push to {state['repo']}** · one commit on a new branch, then a pull request. Nothing touches the default branch.")
         branch = st.text_input("Branch name", value=branch_name_for(spec.app_name, pairs), key="kit_branch")

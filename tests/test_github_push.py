@@ -118,3 +118,37 @@ def test_branch_name_is_stable_for_the_same_kit():
     assert gp.branch_name_for("My App", files) == gp.branch_name_for("My App", list(reversed(files)))
     assert gp.branch_name_for("My App", files).startswith("deploy-kit/my-app-")
     assert gp.branch_name_for("My App", files) != gp.branch_name_for("My App", [("a", "changed")])
+
+
+def test_initialize_repository_uses_contents_api_then_one_commit(monkeypatch):
+    calls = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        path = url.replace(gp.API_ROOT, "")
+        calls.append((method, path, json))
+        if method == "PUT" and path.startswith("/repos/me/blank/contents/"):
+            return FakeResponse(201, {"commit": {"sha": "first111"}})
+        if path.startswith("/repos/me/blank/git/commits/first111"):
+            return FakeResponse(200, {"tree": {"sha": "tree-first"}})
+        if path == "/repos/me/blank/git/blobs":
+            return FakeResponse(201, {"sha": "blob"})
+        if path == "/repos/me/blank/git/trees":
+            return FakeResponse(201, {"sha": "tree2"})
+        if path == "/repos/me/blank/git/commits":
+            return FakeResponse(201, {"sha": "second22"})
+        if method == "PATCH" and path == "/repos/me/blank/git/refs/heads/main":
+            return FakeResponse(200, {"object": {"sha": json["sha"]}})
+        return FakeResponse(500, text="unexpected " + path)
+
+    monkeypatch.setattr(gp.requests, "request", fake_request)
+    writer = gp.GitHubWriter("ghp_secret_token_123", "me/blank")
+    record = writer.initialize_repository([("README.md", "# hi\n"), ("src/app.py", "print(1)\n"), ("run.sh", "#!/bin/sh\n")], "main", "Scaffold")
+    assert record.kind == "init" and record.pr_number == 0 and record.pr_url.endswith("/tree/main")
+    assert record.base_sha == "first111" and record.commit_sha == "second22" and record.branch == "main"
+    methods = [(m, p) for m, p, _ in calls]
+    assert methods[0] == ("PUT", "/repos/me/blank/contents/README.md")
+    assert ("PATCH", "/repos/me/blank/git/refs/heads/main") == methods[-1]
+    tree = next(j for m, p, j in calls if p.endswith("/git/trees"))
+    assert {e["path"]: e["mode"] for e in tree["tree"]} == {"src/app.py": "100644", "run.sh": "100755"}
+    single = writer.initialize_repository([("README.md", "x")], "main", "one file")
+    assert single.commit_sha == "first111"
