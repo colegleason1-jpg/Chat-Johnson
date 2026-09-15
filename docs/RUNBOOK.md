@@ -137,8 +137,9 @@
   setting before changing the bounds; `docs/MONTE_CARLO_PROCTOR.md` lists the next candidates.
 
 ## Monte Carlo proctor
-- Routing expander → *Run routing fragility report*: win rates per endpoint at x1/x2/x4 chaos for a
-  task type, the deterministic winner's fragility, outliers. A blocked or unkeyed endpoint never wins.
+- Routing expander → *Run routing fragility report*: 2,048 paths per amplification (x1/x2/x4/x8) for a
+  task type; win rates per endpoint, decision entropy in bits against the maximum the feasible set allows,
+  the deterministic winner's fragility, outliers. A blocked or unkeyed endpoint never wins.
 - The budget forecast table renders on every open of the expander: per keyed vendor, tokens used and
   left, today's rate, the probability of capping, the median and early-tail cap hour (UTC). The society
   tick logs `deferred: …` in its cycle row when the forecast made it skip company and academy cycles;

@@ -533,3 +533,37 @@ opening=[0.05, 0.25], capture=[0.6, 0.8], alpha=1.0, sigma=0.2
 
 
 ```
+
+## Part D · Claim register (bible against code)
+
+Every claim the bible makes, against what the code does, in three states: **built** (as described),
+**narrowed** (built, but smaller than the claim, with what was cut named), **not built**. This part
+exists because the pre-routing Monte Carlo was claimed above, narrowed to one realization per endpoint
+in the first remediation, marked "implemented (routing signal only)", and then treated as done for
+weeks. A narrowed claim must say what was cut; a claim with no code footprint must say so here, not in
+a parenthetical. Keep this table current in the same commit that changes the code.
+
+| Bible claim | State | What exists · what was cut |
+|---|---|---|
+| Tri-Processor Cortex: Cortex 1 generation, Cortex 2 selection, Cortex 3 stochastic signal | narrowed | A pipeline, not three processors: Cortex 1 streams and retries; Cortex 2 is a MILP over exclusivity, RPM, TPM, daily-cap and key rows (an exact argmax with a solver in front); Cortex 3 is an observed-telemetry penalty with a one-realization Project Seth term at a tenth of its weight. Cut: any parallel processing; any claim that the stochastic term measures provider quality. |
+| Pre-routing Monte Carlo simulation calibrated by a 1/f pink-noise filter | narrowed | `orchestrator/proctor.py` (September 2026): thousands of pink-wave realizations at 1× to 8× chaos over the selector's own rows, reporting win rates, decision entropy, fragility, outliers; a cached per-minute fragility on every send. Cut: the proctor reports and warns, it never selects; it did not exist before September 2026 despite the "implemented" label. |
+| 1/f pink-noise generation, Project Seth SDE, Shannon entropy | built | `router.generate_one_over_f_noise`, `advance_stochastic_project_seth_step`, `shannon_entropy`; alpha recovery and the stencil are tested against the research engine. |
+| Pink waves as a system-wide controlled-chaos signal | built | `orchestrator/pinkwave.py`: three frequency profiles, per-scope gain, bounded nudges to routing near-ties, the Heavy temperature schedule, recall share, digest recall; gain 0 is deterministic. |
+| Monte Carlo budget forecast / free-tier pacing into headroom | built | `proctor.forecast_budget` (1/f-bursty demand, p(cap today), median and early-tail cap hour); the society tick defers cycles on it. |
+| Gravitic propulsion, lift, or any physical mechanism from the Project Seth math | not built | Never will be: the research engine states it is a numerical experiment; the app carries the disclaimer. |
+| Heavy Mode (draft, review, synthesis) | built | Bounded three-pass pipeline, paid slot for the review pass only, synthesis streamed, pink-wave temperature schedule. |
+| Quintessence gradient, fractal memory bridge | not built | No code footprint; the terms describe the memory layer below in aspirational language. |
+| Memory context layer: rolling 200-chat cache texturized into compressed context nodes | narrowed | 200-message windows per chat, extractive summaries, thread-health migration into a vision digest, long-distance recall (FTS5, decay, superseding). Cut: Supabase offload; the "nodes" are summaries and digests in SQLite. |
+| Historical logs offloaded to Supabase buckets / Upstash rolling cache | not built | SQLite is the only store; connector rows are stubs that cannot be enabled. |
+| Cross-thread semantic search | narrowed | FTS5/BM25 keyword recall across the project's chats with recency decay and superseding. Cut: embeddings. |
+| 10-cloud connector matrix (Supabase, Neon, Upstash, Mongo, Pinecone, D1, PlanetScale, DynamoDB, BigQuery, Toro) | not built | Listed as stubs in the sidebar and the capability card so the model never claims them. |
+| BYOK key panel, session-only keys, seven providers | built | Keys live in session memory (env keys on the VM worker only); encrypted per-job hand-off to the worker. |
+| Four operational driving modes | narrowed | Normal and Heavy exist as modes; the workspaces (Task Finder, Repository Work, Chat Bot, Normal Chat, Company, Society, Academy) carry the rest of the intent. Cut: the other two named modes as switches. |
+| Background Git-Streamer (autosave commits) | not built | Nothing commits automatically; the session-only push slot is the only write path. |
+| Live SDK document scraper | not built | No code. |
+| Self-correcting execution sandbox | narrowed | Exists inside the Repository Work pipeline (pytest repair loop, self-hosted only). Cut: chat output is never executed. |
+| Repository sandbox with AST guardrail and reviewable diff | built | Worktree or copy mode, AST checks, unified diffs, GitHub fetch and push, revert PR. |
+| Deploy Kit (CI, Docker, Helm, Terraform, serverless, observability) | narrowed | Generation and offline validation only. Cut: nothing is applied or pushed. |
+| Live preview canvas | built | Sanitized HTML/CSS with a nonce CSP. |
+| Two companies on Traction/EOS with an agent society, academy, leisure, dream bank | built | Seats, scorecards, L10 minutes, release waves per company, manuscripts, per-project briefs, editable roles; academy tiers, exams, allowances; leisure with custom sources. Scale is bounded by the free-tier treasury and stated as such. |
+| Manga-style illustration sub-agents for the books | not built | Noted in `docs/MONTE_CARLO_PROCTOR.md`; the shape is an image node through a BYOK endpoint storing PNG artifacts. |

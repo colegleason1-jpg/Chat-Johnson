@@ -28,10 +28,10 @@ from . import pinkwave
 from .config import daily_cap
 from .quota import QuotaLedger
 
-AMPLIFICATIONS: Tuple[float, ...] = (1.0, 2.0, 4.0)   # 1.0 is production strength at gain 1
-DEFAULT_PATHS = 64
+AMPLIFICATIONS: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)   # 1.0 is production strength at gain 1
+DEFAULT_PATHS = 2048          # realizations per amplification for the on-demand report
 FRAGILITY_TTL_SECONDS = 60.0
-FRAGILITY_PATHS = 24
+FRAGILITY_PATHS = 512         # for the per-minute cached fragility that rides the outcome log
 FORECAST_PATHS = 256
 FORECAST_STEP_HOURS = 0.25
 FORECAST_SIGMA = 0.6            # relative burstiness of demand around the observed rate
@@ -49,35 +49,69 @@ class RoutingReport:
     deterministic: str
     paths: int
     amplifications: Tuple[float, ...]
-    win_rates: Dict[str, Dict[str, float]] = field(default_factory=dict)  # "x1.0" -> endpoint -> rate
+    win_rates: Dict[str, Dict[str, float]] = field(default_factory=dict)  # "x1" -> endpoint -> rate
+    entropy_bits: Dict[str, float] = field(default_factory=dict)          # "x1" -> Shannon entropy of the win distribution
     fragility: float = 0.0            # 1 - win rate of the deterministic winner at production strength
     fragility_amplified: float = 0.0  # the same at the strongest amplification
     outliers: List[str] = field(default_factory=list)
     blocked: List[str] = field(default_factory=list)
     ms: int = 0
 
+    @property
+    def max_entropy_bits(self) -> float:
+        feasible = sum(1 for name in self.win_rates.get(next(iter(self.win_rates), ""), {}) if name not in self.blocked)
+        return math.log2(feasible) if feasible > 1 else 0.0
+
     def rows(self) -> List[Dict[str, Any]]:
         names = sorted({name for rates in self.win_rates.values() for name in rates})
         return [
-            {"endpoint": name, **{label: round(rates.get(name, 0.0), 3) for label, rates in self.win_rates.items()},
+            {"endpoint": name, **{label: round(rates.get(name, 0.0), 4) for label, rates in self.win_rates.items()},
              "deterministic": name == self.deterministic, "outlier": name in self.outliers, "blocked": name in self.blocked}
             for name in names
         ]
 
     def summary(self) -> str:
         outliers = ", ".join(self.outliers) or "none"
+        strongest = f"x{max(self.amplifications):g}"
         return (
-            f"{self.task_type}: {self.deterministic} wins {1 - self.fragility:.0%} of {self.paths} paths at production strength "
-            f"(fragility {self.fragility:.2f}, {self.fragility_amplified:.2f} at x{max(self.amplifications):g}); outliers: {outliers}"
+            f"{self.task_type}: {self.deterministic} wins {1 - self.fragility:.1%} of {self.paths} paths at production strength "
+            f"(fragility {self.fragility:.3f}, {self.fragility_amplified:.3f} at {strongest}); decision entropy "
+            f"{self.entropy_bits.get('x1', 0.0):.2f} -> {self.entropy_bits.get(strongest, 0.0):.2f} of {self.max_entropy_bits:.2f} bits; outliers: {outliers}"
         )
 
 
-def _path_jitter(names: Sequence[str], path_seed: int, amplification: float, profile: str) -> Dict[str, float]:
-    """One realization: endpoint k reads its own stretch of a fresh 1/f series, scaled like production at gain 1."""
-    return {
-        name: min(1.0, amplification * pinkwave.ROUTING_MAX_JITTER * pinkwave.unit("proctor", index * pinkwave.PHASE, profile, seed=path_seed))
-        for index, name in enumerate(names)
-    }
+REALIZATION_LENGTH = 512  # samples per simulated realization; endpoint k reads sample k * PHASE, as production does
+
+
+def jitter_matrix(paths: int, endpoints: int, amplification: float, profile: str, seed: int) -> List[List[float]]:
+    """``paths`` independent 1/f^alpha realizations at once (one 2-D rFFT), each read at endpoint k's stretch and squashed to [0, 1].
+
+    The construction is the router's generator, vectorized: amplitude f^(-alpha/2) with the first bin's
+    frequency as the floor, complex Gaussian phases, zero DC, inverse transform, per-row standardization,
+    then the same tanh squash and ROUTING_MAX_JITTER scale production applies at gain 1.
+    """
+    from .router import np
+
+    alpha = pinkwave.PROFILES.get(profile, 1.0)
+    length = max(REALIZATION_LENGTH, endpoints * pinkwave.PHASE + 1)
+    if np is None:  # no numpy: the wave is flat (matches pinkwave's zero series), the report says "robust"
+        return [[0.5 * amplification * pinkwave.ROUTING_MAX_JITTER] * endpoints for _ in range(paths)]
+    rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
+    freqs = np.fft.rfftfreq(length, d=1.0)
+    floor = freqs[1] if len(freqs) > 1 else 1.0
+    amplitude = np.where(freqs > 0, np.maximum(freqs, floor) ** (-alpha / 2.0), 0.0)
+    spectrum = (rng.standard_normal((paths, len(freqs))) + 1j * rng.standard_normal((paths, len(freqs)))) * amplitude
+    spectrum[:, 0] = 0.0
+    samples = np.fft.irfft(spectrum, n=length, axis=1)
+    samples = (samples - samples.mean(axis=1, keepdims=True)) / np.maximum(samples.std(axis=1, keepdims=True), 1e-12)
+    picked = samples[:, [k * pinkwave.PHASE for k in range(endpoints)]]
+    units = 0.5 * (1.0 + np.tanh(picked / 2.0))
+    scaled = np.minimum(1.0, amplification * pinkwave.ROUTING_MAX_JITTER * units)
+    return scaled.tolist()
+
+
+def _entropy_bits(distribution: Mapping[str, float]) -> float:
+    return max(0.0, round(-sum(p * math.log2(p) for p in distribution.values() if p > 0.0), 4))
 
 
 def simulate_routing(
@@ -91,37 +125,47 @@ def simulate_routing(
     seed: Optional[int] = None,
     profile: str = "pink",
 ) -> RoutingReport:
-    """Re-run Cortex 2 over ``paths`` pink-wave realizations per amplification; the report says how fragile the winner is."""
-    from .router import CORTEX_ENDPOINTS, ProviderError, _endpoint_key, project_seth_routing_entropy, select_milp_endpoint
+    """Re-run Cortex 2 over ``paths`` pink-wave realizations per amplification; the report says how fragile the winner is.
+
+    The capacity rows come from the selector's own ``feasibility_rows`` and are evaluated once (the jitter never
+    touches them); the realizations are generated in one vectorized transform per amplification and each path is
+    the exact argmax the solver would return, so thousands of realizations cost milliseconds. The deterministic
+    winner is taken from the real selector for a like-for-like comparison.
+    """
+    from .router import ProviderError, _utility_score, feasibility_rows, project_seth_routing_entropy, select_milp_endpoint
 
     started = time.perf_counter()
-    names = list(CORTEX_ENDPOINTS)
     excluded_set = set(excluded or ())
-    base = project_seth_routing_entropy(names)
     paths = max(1, int(paths))
     amps = tuple(float(a) for a in amplifications) or (1.0,)
     base_seed = int(seed) if seed is not None else zlib.crc32(task_type.encode("utf-8")) & 0xFFFFFFFF
     with pinkwave.suspended():
-        deterministic = select_milp_endpoint(task_type, estimated_tokens, ledger=ledger, entropy_by_endpoint=base, current_usage=current_usage, excluded=excluded_set)
+        endpoints, _, _, blocked_rows = feasibility_rows(estimated_tokens, ledger, current_usage, excluded_set)
+        names = [endpoint.name for endpoint in endpoints]
+        base = project_seth_routing_entropy(names)
+        feasible = [endpoint for endpoint in endpoints if endpoint.name not in blocked_rows]
+        if not feasible:
+            raise ProviderError("no feasible endpoint to simulate: " + "; ".join(f"{k}: {', '.join(v)}" for k, v in blocked_rows.items()))
+        deterministic = select_milp_endpoint(task_type, estimated_tokens, ledger=ledger, entropy_by_endpoint=base, current_usage=current_usage, excluded=excluded_set).endpoint.name
+        order = {endpoint.name: -index for index, endpoint in enumerate(endpoints)}  # the selector's tie-break: table order
         win_rates: Dict[str, Dict[str, float]] = {}
-        for amp in amps:
+        entropy_bits: Dict[str, float] = {}
+        column = {name: index for index, name in enumerate(names)}
+        for amp_index, amp in enumerate(amps):
             wins = {name: 0 for name in names}
-            for index in range(paths):
-                jitter = _path_jitter(names, base_seed + index * 7919, amp, profile)
-                penalties = {name: min(1.0, base.get(name, 0.0) + jitter[name]) for name in names}
-                try:
-                    decision = select_milp_endpoint(task_type, estimated_tokens, ledger=ledger, entropy_by_endpoint=penalties, current_usage=current_usage, excluded=excluded_set)
-                except ProviderError:
-                    break
-                wins[decision.endpoint.name] += 1
-            win_rates[f"x{amp:g}"] = {name: wins[name] / paths for name in names}
+            for row in jitter_matrix(paths, len(names), amp, profile, base_seed + amp_index * 7919):
+                winner = max(feasible, key=lambda e: (_utility_score(e, task_type, min(1.0, base.get(e.name, 0.0) + row[column[e.name]])), order[e.name]))
+                wins[winner.name] += 1
+            label = f"x{amp:g}"
+            win_rates[label] = {name: wins[name] / paths for name in names}
+            entropy_bits[label] = _entropy_bits(win_rates[label])
     first, last = win_rates[f"x{amps[0]:g}"], win_rates[f"x{max(amps):g}"]
-    blocked = [name for name in names if name in excluded_set or not _endpoint_key(CORTEX_ENDPOINTS[name])]
+    blocked = sorted(blocked_rows)
     outliers = [name for name in names if first.get(name, 0.0) == 0.0 and last.get(name, 0.0) > 0.0 and name not in blocked]
     return RoutingReport(
-        task_type=task_type, estimated_tokens=int(estimated_tokens), deterministic=deterministic.endpoint.name, paths=paths,
-        amplifications=amps, win_rates=win_rates, fragility=round(1.0 - first.get(deterministic.endpoint.name, 0.0), 4),
-        fragility_amplified=round(1.0 - last.get(deterministic.endpoint.name, 0.0), 4), outliers=outliers, blocked=blocked,
+        task_type=task_type, estimated_tokens=int(estimated_tokens), deterministic=deterministic, paths=paths,
+        amplifications=amps, win_rates=win_rates, entropy_bits=entropy_bits, fragility=round(1.0 - first.get(deterministic, 0.0), 4),
+        fragility_amplified=round(1.0 - last.get(deterministic, 0.0), 4), outliers=outliers, blocked=blocked,
         ms=int((time.perf_counter() - started) * 1000),
     )
 

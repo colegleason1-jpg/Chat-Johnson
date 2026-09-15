@@ -10,7 +10,7 @@ sys.path.insert(0, ROOT)
 
 from orchestrator import jobs, pinkwave, proctor, vault  # noqa: E402
 from orchestrator.quota_registry import get_quota_ledger  # noqa: E402
-from orchestrator.router import CORTEX_ENDPOINTS  # noqa: E402
+from orchestrator.router import CORTEX_ENDPOINTS, ProviderError  # noqa: E402
 from orchestrator.society import academy, cycles, leisure, store, templates, tick  # noqa: E402
 
 
@@ -32,19 +32,38 @@ def test_fragility_report_is_reproducible_bounded_and_never_crowns_a_blocked_end
     monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake")
     monkeypatch.setenv("GROQ_API_KEY", "gsk-fake")
     pinkwave.activate(db, pinkwave.ChaosSettings(gain=1.0))  # the proctor suspends the live wave while it simulates
-    report = proctor.simulate_routing("chat", 1_500, paths=32, seed=5)
-    again = proctor.simulate_routing("chat", 1_500, paths=32, seed=5)
-    assert report.win_rates == again.win_rates and report.deterministic == "groq"
-    assert set(report.win_rates) == {"x1", "x2", "x4"} and all(abs(sum(r.values()) - 1.0) < 1e-9 for r in report.win_rates.values())
+    report = proctor.simulate_routing("chat", 1_500, paths=2_048, seed=5)
+    again = proctor.simulate_routing("chat", 1_500, paths=2_048, seed=5)
+    assert report.win_rates == again.win_rates and report.deterministic == "groq" and report.ms < 5_000
+    assert set(report.win_rates) == {"x1", "x2", "x4", "x8"} and all(abs(sum(r.values()) - 1.0) < 1e-9 for r in report.win_rates.values())
     assert report.fragility == 0.0 and 0.0 <= report.fragility_amplified <= 1.0  # the current table is robust at production strength
-    assert set(report.blocked) == {"huggingface", "local"} - {n for n in CORTEX_ENDPOINTS if n not in ("huggingface", "local")} or "huggingface" in report.blocked
-    assert all(r.get("huggingface", 0.0) == 0.0 for r in report.win_rates.values())
-    assert all(name not in report.blocked for name in report.outliers) and "groq" in report.summary()
+    assert report.entropy_bits["x1"] == 0.0 and report.entropy_bits["x8"] >= report.entropy_bits["x1"] and report.max_entropy_bits == 1.0
+    assert "huggingface" in report.blocked and all(r.get("huggingface", 0.0) == 0.0 for r in report.win_rates.values())
+    assert all(name not in report.blocked for name in report.outliers) and "groq" in report.summary() and "bits" in report.summary()
     rows = {r["endpoint"]: r for r in report.rows()}
     assert rows["groq"]["deterministic"] and rows["huggingface"]["blocked"]
-    exhausted = proctor.simulate_routing("chat", 1_500, paths=16, seed=5, current_usage={"groq": {"rpm_used": 30, "tpm_used": 0}})
+    exhausted = proctor.simulate_routing("chat", 1_500, paths=64, seed=5, current_usage={"groq": {"rpm_used": 30, "tpm_used": 0}})
     assert exhausted.deterministic == "google_ai_studio" and all(r.get("groq", 0.0) == 0.0 for r in exhausted.win_rates.values())
     assert pinkwave.current() is not None  # the live wave is restored after the simulation
+    with pytest.raises(ProviderError):
+        proctor.simulate_routing("chat", 1_500, paths=8, excluded=list(CORTEX_ENDPOINTS))
+
+
+def test_amplified_chaos_draws_entropy_out_of_a_near_tie(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-fake")
+    from orchestrator import router
+
+    # Make chat a near-tie: pull groq's speed edge down so the two utilities sit within the production jitter band.
+    groq = router.CORTEX_ENDPOINTS["groq"]
+    original = groq.speed_score
+    object.__setattr__(groq, "speed_score", 0.72)  # chat utilities: groq 0.771 vs gemini 0.762, inside the production jitter band
+    try:
+        report = proctor.simulate_routing("chat", 1_500, paths=1_024, seed=9)
+        assert 0.0 < report.fragility < 1.0 and report.entropy_bits["x1"] > 0.0
+        assert report.entropy_bits["x8"] >= report.entropy_bits["x1"] * 0.5  # amplification keeps the tie contested
+    finally:
+        object.__setattr__(groq, "speed_score", original)
 
 
 def test_cached_fragility_reruns_at_most_once_per_ttl(db, monkeypatch):

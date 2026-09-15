@@ -293,9 +293,10 @@ HTTP status, key fingerprint, and any auto-switch. Probes count toward the vendo
   grow with the wave. Gain and profiles are per project (sidebar → Controlled chaos) and shared with
   the worker; gain 0 is fully deterministic. A bounded signal, never an optimization claim.
 - **Monte Carlo proctor** (`orchestrator/proctor.py`): statistics a single run cannot give, never a
-  decision by itself. *Routing fragility* re-runs Cortex 2 over 64 pink-wave realizations at 1×, 2×,
-  and 4× chaos and reports each endpoint's win rate, the deterministic winner's fragility, and the
-  outliers that only win under amplification; a cached per-minute fragility rides every send into the
+  decision by itself. *Routing fragility* re-runs Cortex 2 over 2,048 pink-wave realizations at 1×, 2×, 4×,
+  and 8× chaos (the selector's own capacity rows, evaluated once, then an exact argmax per path) and
+  reports each endpoint's win rate, the decision entropy in bits, the deterministic winner's
+  fragility, and the outliers that only win under amplification; a cached per-minute fragility rides every send into the
   outcome log. *Budget forecast* simulates the rest of the UTC day as 1/f-bursty demand around today's
   rate per keyed vendor (probability of capping, median and early-tail cap hour); the society tick
   defers its cycles when every keyed vendor is out of headroom or likely to cap within the hour. Both

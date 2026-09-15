@@ -784,6 +784,31 @@ def _build_constraint_array(
     return LinearConstraint(array_lib.asarray(rows), array_lib.asarray(lower), array_lib.asarray(upper))
 
 
+def feasibility_rows(
+    estimated_tokens: int,
+    ledger: Optional[QuotaLedger] = None,
+    current_usage: Optional[Mapping[str, Mapping[str, float]]] = None,
+    excluded: Optional[Iterable[str]] = None,
+) -> Tuple[List[CortexEndpoint], Dict[str, EndpointUsage], Dict[str, bool], Dict[str, List[str]]]:
+    """The capacity rows every selection sees: endpoints, their usage, which are enabled (key, not excluded), and why the rest are blocked.
+
+    Shared by the selector and the Monte Carlo proctor so a simulation can never find an endpoint feasible that production would not.
+    """
+    excluded_set = set(excluded or ())
+    endpoints = list(CORTEX_ENDPOINTS.values())
+    usage = {endpoint.name: _endpoint_usage(endpoint, ledger, current_usage) for endpoint in endpoints}
+    enabled = {endpoint.name: endpoint.name not in excluded_set and bool(_endpoint_key(endpoint)) for endpoint in endpoints}
+    blocked: Dict[str, List[str]] = {}
+    for endpoint in endpoints:
+        if not enabled[endpoint.name]:
+            blocked[endpoint.name] = ["no key configured" if not _endpoint_key(endpoint) else "already tried this request"]
+            continue
+        reasons = _capacity_reasons(endpoint, usage[endpoint.name], estimated_tokens)
+        if reasons:
+            blocked[endpoint.name] = reasons
+    return endpoints, usage, enabled, blocked
+
+
 def select_milp_endpoint(
     task_type: str,
     estimated_tokens: int,
@@ -804,8 +829,7 @@ def select_milp_endpoint(
         raise ValueError("estimated_tokens must be at least one")
     _ensure_cortex_ledger(ledger)
     excluded_set = set(excluded or ())
-    endpoints = list(CORTEX_ENDPOINTS.values())
-    usage = {endpoint.name: _endpoint_usage(endpoint, ledger, current_usage) for endpoint in endpoints}
+    endpoints, usage, enabled, blocked = feasibility_rows(estimated_tokens, ledger, current_usage, excluded_set)
     supplied_entropy = dict(entropy_by_endpoint or {})
     if not supplied_entropy:
         supplied_entropy = project_seth_routing_entropy((endpoint.name for endpoint in endpoints), length=128)
@@ -818,18 +842,6 @@ def select_milp_endpoint(
     if jitter:
         penalties = {name: min(1.0, value + jitter.get(name, 0.0)) for name, value in penalties.items()}
     utilities = {endpoint.name: _utility_score(endpoint, task_type, penalties[endpoint.name]) for endpoint in endpoints}
-    enabled = {
-        endpoint.name: endpoint.name not in excluded_set and bool(_endpoint_key(endpoint)) for endpoint in endpoints
-    }
-    # The same capacity rows the solver sees, evaluated for the fallback and for diagnostics.
-    blocked: Dict[str, List[str]] = {}
-    for endpoint in endpoints:
-        if not enabled[endpoint.name]:
-            blocked[endpoint.name] = ["no key configured" if not _endpoint_key(endpoint) else "already tried this request"]
-            continue
-        reasons = _capacity_reasons(endpoint, usage[endpoint.name], estimated_tokens)
-        if reasons:
-            blocked[endpoint.name] = reasons
     feasible = [endpoint for endpoint in endpoints if endpoint.name not in blocked]
 
     decision_vector: Dict[str, int]
