@@ -1,9 +1,11 @@
 """The release loop: manuscripts, board feedback, final edits, release waves, publish, and go-to-market.
 
 A work is a catalog row whose manuscript is assembled from every finished item for it (story bible,
-chapters, the final edit last). The studio releases in waves: six wave-1 works reach ``final``, the
-wave goes to the board as one release, and the board approves it or returns it with feedback that
-reopens the final edits. Publishing locks each manuscript and opens marketing and sales.
+chapters, the final edit last). Every company releases in waves sized by its own ``wave_size``
+setting: the current wave is the lowest ``release_wave`` that still has unpublished works; once
+that wave's works (up to the size) are ``final`` the wave goes to the board as one release, and the
+board approves it or returns it with feedback that reopens the final edits. Approval publishes the
+wave, opens marketing and sales, and moves the next wave from the backlog into development.
 """
 from __future__ import annotations
 
@@ -20,9 +22,15 @@ GO_TO_MARKET_ITEMS = (
     ("sales", "Outreach drafts", "Three short outreach messages for reviewers, partners, and readers, each with a single ask."),
     ("sales", "Pricing and channel notes", "Recommended price points per channel and the reasoning, with the free path if any."),
 )
+STUDIO_STARTERS = (
+    ("Story bible and outline", "Write the story bible (premise, world, principal characters, tone) and a chapter-by-chapter outline for this work. Mark open questions for the board.", 5),
+    ("Draft chapter one", "Draft chapter one from the outline in the studio's voice; end with a note on what the next chapter needs.", 4),
+)
 FINAL_EDIT_PREFIX = "Final edit with board feedback"
 WAVE_SIZE = 6
 MANUSCRIPT_EXCERPT_CHARS = 6_000
+RELEASED_STAGES = ("published", "marketed")
+READY_STAGES = ("final",) + RELEASED_STAGES
 
 
 def _slug(title: str) -> str:
@@ -50,6 +58,8 @@ def assemble_manuscript(scope: str, catalog_id: int) -> Optional[int]:
     parts = [f"# {cat['title']}\n"]
     if cat.get("logline"):
         parts.append(f"_{cat['logline']}_\n")
+    if cat.get("brief"):
+        parts.append(f"\n> {str(cat['brief']).strip()}\n")
     for item in items:
         body = vault.export_artifact(int(item["artifact_id"]), scope)[1]
         parts.append(f"\n## {item['title']}\n\n{body.strip()}\n")
@@ -111,48 +121,89 @@ def record_board_feedback(scope: str, company_id: int, catalog_id: Optional[int]
     return store.insert("feedback", scope, company_id=int(company_id), catalog_id=catalog_id, source="board", text=text.strip()[:4000], created_at=time.time())
 
 
-# ---- release waves ---------------------------------------------------------------------------
+# ---- release waves (per company) -------------------------------------------------------------
+
+def wave_size_for(scope: str, company_id: int) -> int:
+    company = store.row("companies", int(company_id), scope) or {}
+    return max(1, min(20, int(company.get("wave_size") or WAVE_SIZE)))
+
 
 def wave_works(scope: str, company_id: int, wave: int = 1) -> List[Dict[str, Any]]:
     return store.rows("catalog", scope, "company_id = ? AND release_wave = ?", (int(company_id), int(wave)), order="id ASC", limit=50)
 
 
-def wave_status(scope: str, company_id: int, wave: int = 1, size: int = WAVE_SIZE) -> Dict[str, Any]:
-    """Where the wave stands: how many works are final or published, and the release row if one exists."""
+def current_wave(scope: str, company_id: int) -> int:
+    """The lowest wave with a work still unpublished; the highest wave when everything is out; 1 with an empty catalog."""
+    catalog = store.rows("catalog", scope, "company_id = ?", (int(company_id),), limit=500)
+    pending = [int(c.get("release_wave") or 1) for c in catalog if c["stage"] not in RELEASED_STAGES]
+    if pending:
+        return max(1, min(pending))
+    return max([int(c.get("release_wave") or 1) for c in catalog] or [1])
+
+
+def wave_status(scope: str, company_id: int, wave: Optional[int] = None, size: Optional[int] = None) -> Dict[str, Any]:
+    """Where a wave stands: its works, how many are final or published, how many the gate needs, and its release row if any.
+
+    ``wave`` defaults to the company's current wave and ``size`` to its ``wave_size``; the gate needs
+    the smaller of the size and the number of works in the wave, so a three-product company releases
+    all three together.
+    """
+    wave = int(wave) if wave is not None else current_wave(scope, company_id)
+    size = int(size) if size is not None else wave_size_for(scope, company_id)
     works = wave_works(scope, company_id, wave)
-    ready = [w for w in works if w["stage"] in ("final", "published", "marketed")]
-    release = store.rows("releases", scope, "company_id = ? AND wave = ? AND status != 'returned'", (int(company_id), int(wave)), order="id DESC", limit=1)
-    return {"wave": wave, "works": len(works), "ready": len(ready), "size": size, "gate_met": len(works) >= size and len(ready) >= size, "release": release[0] if release else None}
+    ready = [w for w in works if w["stage"] in READY_STAGES]
+    needed = min(size, len(works))
+    release = store.rows("releases", scope, "company_id = ? AND wave = ? AND status != 'returned'", (int(company_id), wave), order="id DESC", limit=1)
+    return {
+        "wave": wave, "works": len(works), "ready": len(ready), "size": size, "needed": needed,
+        "gate_met": needed > 0 and len(ready) >= needed, "release": release[0] if release else None,
+    }
 
 
-def assemble_wave(scope: str, company_id: int, wave: int = 1, size: int = WAVE_SIZE) -> Optional[int]:
-    """Send a whole wave to the board when every one of its works is final: one release row in ``board_review``."""
+def assemble_wave(scope: str, company_id: int, wave: Optional[int] = None, size: Optional[int] = None) -> Optional[int]:
+    """Send a whole wave to the board when its works are final: one release row in ``board_review``."""
     status = wave_status(scope, company_id, wave, size)
     if not status["gate_met"]:
         return None
     if status["release"] and status["release"]["status"] == "board_review":
         return int(status["release"]["id"])
-    for work in wave_works(scope, company_id, wave)[:size]:
+    chosen = wave_works(scope, company_id, int(status["wave"]))[: int(status["needed"])]
+    for work in chosen:
         assemble_manuscript(scope, int(work["id"]))
-    works = [int(w["id"]) for w in wave_works(scope, company_id, wave)[:size]]
-    return store.insert("releases", scope, company_id=int(company_id), wave=int(wave), status="board_review", works=works, created_at=time.time())
+    return store.insert("releases", scope, company_id=int(company_id), wave=int(status["wave"]), status="board_review", works=[int(w["id"]) for w in chosen], created_at=time.time())
+
+
+def open_next_wave(scope: str, company_id: int, released_wave: int) -> int:
+    """After a release, the next wave's backlog works enter development (studio works get their starter items); returns how many."""
+    company = store.row("companies", int(company_id), scope) or {}
+    moved = 0
+    for work in wave_works(scope, company_id, int(released_wave) + 1):
+        if work["stage"] != "backlog":
+            continue
+        store.update("catalog", int(work["id"]), scope, stage="development")
+        moved += 1
+        if company.get("kind") == "studio":
+            for title, brief, importance in STUDIO_STARTERS:
+                store.add_work_item(scope, int(company_id), f"{title} · {work['title']}", brief, importance=importance, catalog_id=int(work["id"]))
+    return moved
 
 
 def approve_release(scope: str, release_id: int, notes: str = "") -> List[int]:
-    """The board approves the wave: every work is published (manuscript locked, go-to-market items queued)."""
+    """The board approves the wave: every work is published (manuscript locked, go-to-market items queued) and the next wave opens."""
     release = store.row("releases", release_id, scope)
     if not release or release["status"] != "board_review":
         return []
     published: List[int] = []
     for catalog_id in store.load_json(release.get("works"), []):
         cat = store.row("catalog", int(catalog_id), scope)
-        if cat and cat["stage"] not in ("published", "marketed"):
+        if cat and cat["stage"] not in RELEASED_STAGES:
             artifact = publish_work(scope, int(catalog_id))
             if artifact:
                 published.append(int(artifact))
     if notes.strip():
         record_board_feedback(scope, int(release["company_id"]), None, notes)
     store.update("releases", int(release_id), status="released", notes=notes.strip()[:2000], reviewed_at=time.time(), released_at=time.time())
+    open_next_wave(scope, int(release["company_id"]), int(release.get("wave") or 1))
     return published
 
 
@@ -165,7 +216,7 @@ def return_release(scope: str, release_id: int, feedback_text: str) -> int:
     company_id = int(release["company_id"])
     for catalog_id in store.load_json(release.get("works"), []):
         cat = store.row("catalog", int(catalog_id), scope)
-        if not cat or cat["stage"] in ("published", "marketed"):
+        if not cat or cat["stage"] in RELEASED_STAGES:
             continue
         record_board_feedback(scope, company_id, int(catalog_id), feedback_text)
         store.update("catalog", int(catalog_id), stage="board_feedback")

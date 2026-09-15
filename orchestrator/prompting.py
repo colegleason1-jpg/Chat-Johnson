@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from .capabilities import capability_card
+from .pinkwave import for_scope
 from .router import prompt_context_chars
 from .skills import skills_block
 from .vault import alternating_turns, context_parts
@@ -24,16 +25,23 @@ def build_prompt_messages(
     thread_id: Optional[int] = None,
     max_tokens: int = 2048,
     extra_system: str = "",
+    recall_share: Optional[float] = None,
 ) -> List[Dict[str, str]]:
     """System prompt (persona, capability card, compressed memory) followed by the live window as real turns.
 
     Earlier turns go in as user/assistant messages rather than a text dump, so the model treats
     them as conversation instead of imitating a transcript format. ``thread_id`` pins the memory
     to one chat; background jobs must pass it because the active thread can change under them.
+    Long-distance memory (keyword-ranked lines from the project's other chats) takes
+    ``recall_share`` of the budget; when None the scope's pink-wave setting decides, 0 disables.
     """
     # Sized so the request fits every keyed endpoint's TPM ceiling at the current output budget.
     context_chars = prompt_context_chars(int(max_tokens))
-    parts = context_parts(project_scope, max_characters=context_chars, thread_id=thread_id, workspace=workspace)
+    share = for_scope(project_scope).recall_share() if recall_share is None else float(recall_share)
+    parts = context_parts(
+        project_scope, max_characters=context_chars, thread_id=thread_id, workspace=workspace,
+        recall_query=user_prompt, recall_share=share,
+    )
     request = user_prompt.strip()
     if injected_context.strip():
         request = "USER-CONSENTED FILE INJECTIONS:\n" + injected_context + "\n\nCURRENT REQUEST:\n" + request  # budgeted per file

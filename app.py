@@ -51,6 +51,7 @@ from orchestrator.discovery import vendor_for
 from orchestrator.envsafe import self_hosted
 from orchestrator.errors import plain_error
 from orchestrator.executor import Orchestrator
+from orchestrator import pinkwave
 from orchestrator import mission_runner  # noqa: F401  (registers the mission job handler)
 from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner, secrets_deliverable
 from orchestrator import society
@@ -653,7 +654,7 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
                 settings.max_test_rounds = 0
             with st.status("Ingesting, planning, patching, and verifying… free-tier windows are waited for, not tripped.", expanded=True) as status:
                 try:
-                    report = Orchestrator(settings=settings, ledger=ledger).run(repo_goal, repo_path=repo_path)
+                    report = Orchestrator(settings=settings, ledger=ledger).run(repo_goal, repo_path=repo_path, project_scope=project_scope)
                     failed_steps = int(report.get("failed_steps", 0))
                     if failed_steps:
                         status.update(label=f"Pipeline finished with {failed_steps} failed step(s); see the step table", state="error")
@@ -704,7 +705,7 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
             source_path = str(last["fetched"]["path"]) if last.get("fetched") else str(st.session_state.get("repo_path", ""))
             with st.status("Re-running with the strict file format…", expanded=True) as status:
                 try:
-                    report = Orchestrator(settings=settings, ledger=ledger).run(strict_goal, repo_path=source_path)
+                    report = Orchestrator(settings=settings, ledger=ledger).run(strict_goal, repo_path=source_path, project_scope=project_scope)
                     status.update(label="Pipeline completed", state="complete")
                     st.session_state.repo_last_report = {**last, "report": report}
                     st.rerun()
@@ -1130,6 +1131,7 @@ def run_generation(
             + f". Digest locked as artifact {migration['digest_artifact_id']} ({migration['method']})."
         )
     user_message_id = append_message(project_scope, "user", clean_prompt, mode=mode, workspace=workspace, task_type=task_type)
+    pinkwave.activate(project_scope)  # this send walks the scope's wave: routing jitter, Heavy schedule, recall share
     messages = build_prompt_messages(project_scope, clean_prompt, injected_context, workspace=workspace, extra_system=extra_system)
     max_tokens = int(st.session_state.get("max_tokens", 2048))
     with st.chat_message("user"):
@@ -1917,32 +1919,33 @@ def company_facts(project_scope: str, company: Dict[str, Any]) -> List[str]:
 
 
 def render_release_wave(project_scope: str, company_id: int, company: Dict[str, Any]) -> None:
-    """The studio releases wave 1 as one review: six finals go to the board together, approved or returned with feedback."""
-    if company.get("kind") != "studio":
-        return
-    status = society.wave_status(project_scope, company_id, 1)
+    """Every company releases in waves sized by its own setting: the current wave's finals go to the board together, approved or returned with feedback."""
+    status = society.wave_status(project_scope, company_id)
+    wave, needed = int(status["wave"]), int(status["needed"])
     release = status["release"]
-    st.markdown(f"**Release wave 1** · {status['ready']} of {status['size']} works final")
+    st.markdown(f"**Release wave {wave}** · {status['ready']} of {needed} works final (wave size {status['size']}, {status['works']} works in this wave)")
     if release and release["status"] == "board_review":
-        st.info("Wave 1 is with the board. Read the manuscripts under Locked artifacts (company/…/works/), then decide.")
+        st.info(f"Wave {wave} is with the board. Read the manuscripts under Locked artifacts (company/…/works/), then decide.")
         note = st.text_area("Board feedback on the wave", key=f"wave_note_{company_id}", height=80)
         ok, back = st.columns(2)
-        if ok.button("Approve and publish all six", key=f"wave_approve_{company_id}", type="primary", use_container_width=True):
+        if ok.button(f"Approve and publish all {needed}", key=f"wave_approve_{company_id}", type="primary", use_container_width=True):
             published = society.approve_release(project_scope, int(release["id"]), note)
-            st.success(f"Wave 1 released: {len(published)} work(s) published; marketing and sales opened.")
+            st.success(f"Wave {wave} released: {len(published)} work(s) published; marketing and sales opened; the next wave entered development.")
             st.rerun()
         if back.button("Return the wave with feedback", key=f"wave_return_{company_id}", use_container_width=True, disabled=not note.strip()):
             reopened = society.return_release(project_scope, int(release["id"]), note)
             st.warning(f"Wave returned: {reopened} final-edit item(s) opened with your feedback.")
             st.rerun()
     elif release and release["status"] == "released":
-        st.caption(f"Wave 1 released on {time.strftime('%Y-%m-%d', time.gmtime(float(release['released_at'] or 0)))}.")
+        st.caption(f"Wave {wave} released on {time.strftime('%Y-%m-%d', time.gmtime(float(release['released_at'] or 0)))}.")
     elif status["gate_met"]:
-        if st.button("Send wave 1 to the board for review", key=f"wave_assemble_{company_id}", type="primary"):
-            society.assemble_wave(project_scope, company_id, 1)
+        if st.button(f"Send wave {wave} to the board for review", key=f"wave_assemble_{company_id}", type="primary"):
+            society.assemble_wave(project_scope, company_id)
             st.rerun()
+    elif needed == 0:
+        st.caption("No works are assigned to this wave; set each work's wave in the catalog editor above.")
     else:
-        st.caption("The wave goes to the board as one review once all six wave-1 works are final (each work's manuscript is assembled from its finished items).")
+        st.caption(f"The wave goes to the board as one review once {needed} works of wave {wave} are final (each work's manuscript is assembled from its finished items). Change the wave size under Settings.")
 
 
 def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
@@ -1995,13 +1998,16 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
         for item in society_store.work_items_for(project_scope, company_id, ("assigned", "running"), limit=500):
             if item.get("seat_id"):
                 load[int(item["seat_id"])] = load.get(int(item["seat_id"]), 0) + 1
-        st.dataframe(
+        edited_seats = st.data_editor(
             [
                 {
+                    "id": int(s["id"]),
                     "department": depts.get(int(s["department_id"] or 0), {}).get("name", ""),
                     "team": teams.get(int(s["team_id"] or 0), {}).get("name", ""),
                     "seat": s["title"], "reports to": by_id.get(int(s["reports_to"] or 0), {}).get("title", "board"),
                     "roles": "; ".join(society_store.load_json(s.get("roles"), [])),
+                    "kpis": society_store.format_kpis(s.get("kpis")),
+                    "importance": int(s.get("importance") or 3),
                     "agent": agents.get(int(s["agent_id"] or 0), {}).get("name", "open seat"),
                     "tier": agents.get(int(s["agent_id"] or 0), {}).get("tier", ""),
                     "balance": agents.get(int(s["agent_id"] or 0), {}).get("balance"),  # None for an open seat keeps the column numeric
@@ -2009,9 +2015,55 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
                 }
                 for s in seats
             ],
-            hide_index=True, use_container_width=True,
+            hide_index=True, use_container_width=True, num_rows="fixed", key=f"seats_editor_{company_id}",
+            column_config={
+                "id": st.column_config.NumberColumn(disabled=True, width="small"),
+                "department": st.column_config.TextColumn(disabled=True), "team": st.column_config.TextColumn(disabled=True),
+                "reports to": st.column_config.TextColumn(disabled=True), "agent": st.column_config.TextColumn(disabled=True),
+                "tier": st.column_config.TextColumn(disabled=True), "balance": st.column_config.NumberColumn(disabled=True),
+                "load": st.column_config.NumberColumn(disabled=True, width="small"), "status": st.column_config.TextColumn(disabled=True),
+                "importance": st.column_config.NumberColumn(min_value=1, max_value=5, step=1, width="small"),
+                "roles": st.column_config.TextColumn(help="Semicolon-separated; 3 to 8 short roles."),
+                "kpis": st.column_config.TextColumn(help="name=target pairs: deliverables=1; review_pass_rate=0.6; reviews=2; reports=1"),
+            },
         )
-        st.caption(f"{len(seats)} seats · {len([s for s in seats if s['status'] == 'filled'])} filled · departments marked inactive open when wave 1 is published.")
+        if st.button("Save seat titles, roles, and KPIs", key=f"save_seats_{company_id}"):
+            changed = 0
+            for row in edited_seats:
+                seat = by_id.get(int(row["id"]))
+                if not seat:
+                    continue
+                roles = society_store.parse_roles(row.get("roles")) or society_store.load_json(seat.get("roles"), [])
+                kpis = society_store.parse_kpis(row.get("kpis")) or society_store.load_json(seat.get("kpis"), {})
+                title = str(row.get("seat") or seat["title"]).strip()[:120] or seat["title"]
+                importance = max(1, min(5, int(row.get("importance") or seat.get("importance") or 3)))
+                if (title, roles, kpis, importance) != (seat["title"], society_store.load_json(seat.get("roles"), []), society_store.load_json(seat.get("kpis"), {}), int(seat.get("importance") or 3)):
+                    society_store.update("seats", int(seat["id"]), project_scope, title=title, roles=roles, kpis=kpis, importance=importance)
+                    changed += 1
+            st.success(f"{changed} seat(s) updated; the new roles reach each seat's next brief.")
+            st.rerun()
+        st.caption(f"{len(seats)} seats · {len([s for s in seats if s['status'] == 'filled'])} filled · departments marked inactive open when the first wave is published. Every role is yours to edit as the project demands.")
+        seated = [s for s in seats if s.get("agent_id") and int(s["agent_id"]) in agents]
+        if seated:
+            pick_seat = st.selectbox("Edit an agent's persona", seated, format_func=lambda s: f"{s['title']} · {agents[int(s['agent_id'])]['name']}", key=f"persona_pick_{company_id}")
+            agent = agents[int(pick_seat["agent_id"])]
+            persona = st.text_area("Persona (who this agent is; the seat's roles and KPIs are added automatically)", value=str(agent.get("persona") or ""), key=f"persona_text_{agent['id']}", height=90)
+            if st.button("Save persona", key=f"save_persona_{agent['id']}") and persona.strip():
+                society_store.update("agents", int(agent["id"]), project_scope, persona=persona.strip()[:2000])
+                st.success("Persona saved.")
+                st.rerun()
+        with st.expander("Add a seat", expanded=False):
+            with st.form(f"add_seat_{company_id}", clear_on_submit=True):
+                seat_title = st.text_input("Seat title")
+                dept_pick = st.selectbox("Department", list(depts), format_func=lambda d: depts[d]["name"], key=f"add_seat_dept_{company_id}") if depts else None
+                boss = st.selectbox("Reports to", [None, *by_id], format_func=lambda i: "board" if i is None else by_id[i]["title"], key=f"add_seat_boss_{company_id}")
+                seat_roles = st.text_input("Roles (semicolon separated)", value="")
+                seat_kpis = st.text_input("KPIs (name=target; …)", value="deliverables=1")
+                seat_importance = st.slider("Importance", 1, 5, 3)
+                if st.form_submit_button("Add seat (a graduate fills it when one is free)") and seat_title.strip():
+                    society_store.add_seat(project_scope, company_id, seat_title, dept_pick, boss, seat_roles, seat_kpis, seat_importance)
+                    society_store.fill_open_seats(project_scope, company_id)
+                    st.rerun()
         threaded = [s for s in seats if s.get("thread_id")]
         if threaded:
             pick = st.selectbox("Open a seat's working thread", threaded, format_func=lambda s: s["title"], key="seat_thread_pick")
@@ -2024,12 +2076,13 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
         edited = st.data_editor(
             [{"id": c["id"], "key": c["key"], "title": c["title"], "field": c["field"], "logline": c["logline"], "stage": c["stage"], "wave": c["release_wave"]} for c in catalog],
             hide_index=True, use_container_width=True, num_rows="fixed", key=f"catalog_editor_{company_id}",
-            column_config={"id": st.column_config.NumberColumn(disabled=True, width="small"), "key": st.column_config.TextColumn(disabled=True), "stage": st.column_config.TextColumn(disabled=True), "wave": st.column_config.NumberColumn(disabled=True, width="small")},
+            column_config={"id": st.column_config.NumberColumn(disabled=True, width="small"), "key": st.column_config.TextColumn(disabled=True), "stage": st.column_config.TextColumn(disabled=True), "wave": st.column_config.NumberColumn(min_value=1, max_value=20, step=1, width="small", help="Which release wave this work belongs to.")},
         )
-        if st.button("Save catalog titles and loglines", key=f"save_catalog_{company_id}"):
+        if st.button("Save catalog titles, loglines, and waves", key=f"save_catalog_{company_id}"):
             for row in edited:
-                society_store.update("catalog", int(row["id"]), title=str(row["title"])[:200], logline=str(row["logline"])[:1000], field=str(row["field"])[:40])
-            st.success("Catalog saved.")
+                society.set_product_brief(project_scope, int(row["id"]), title=str(row["title"]), logline=str(row["logline"]))
+                society_store.update("catalog", int(row["id"]), project_scope, field=str(row["field"])[:40], release_wave=max(1, min(20, int(row.get("wave") or 1))))
+            st.success("Catalog saved; open work items carry the new titles and loglines.")
         st.markdown("**Backlog and work in flight**")
         items = society_store.work_items_for(project_scope, company_id, limit=300)
         by_id = {int(s["id"]): s for s in society_store.seats_for(project_scope, company_id)}
@@ -2085,7 +2138,8 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
                         society.record_board_feedback(project_scope, company_id, item.get("catalog_id"), note or "returned")
                         st.rerun()
         render_release_wave(project_scope, company_id, company)
-        finals = [c for c in catalog if c["stage"] == "final" and (company.get("kind") != "studio" or int(c.get("release_wave") or 0) != 1)]
+        active_wave = society.current_wave(project_scope, company_id)
+        finals = [c for c in catalog if c["stage"] == "final" and int(c.get("release_wave") or 1) != active_wave]
         if finals:
             st.markdown("**Ready to publish**")
             for cat in finals:
@@ -2150,15 +2204,29 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
             one = st.text_input("1-year plan", value=str(company.get("one_year", "")))
             hours = st.number_input("Cycle interval (hours)", min_value=1, max_value=168, value=max(1, int(company.get("interval_s", 21600)) // 3600))
             share = st.slider("Treasury share (% of today's tokens)", 5, 60, int(float(company.get("daily_share", 0.35)) * 100))
+            wave_size = st.number_input("Works per release wave", min_value=1, max_value=20, value=max(1, min(20, int(company.get("wave_size") or 6))), help="How many works of the current wave must be final before the wave goes to the board as one release.")
             if st.form_submit_button("Save V/TO and settings"):
-                society_store.update("companies", company_id, vision=vision[:2000], core_values=[v.strip() for v in values.split(",") if v.strip()], core_focus=focus[:500], ten_year=ten[:500], three_year=three[:500], one_year=one[:500], interval_s=int(hours) * 3600, daily_share=share / 100)
+                society_store.update("companies", company_id, vision=vision[:2000], core_values=[v.strip() for v in values.split(",") if v.strip()], core_focus=focus[:500], ten_year=ten[:500], three_year=three[:500], one_year=one[:500], interval_s=int(hours) * 3600, daily_share=share / 100, wave_size=int(wave_size))
                 st.success("Saved.")
+        st.markdown("**Products and briefs (this project only)**")
+        st.caption("Each work or product carries a brief into every open item about it. Edits apply to this project scope; other projects keep their own briefs.")
+        for cat in society_store.catalog_for(project_scope, company_id):
+            with st.expander(f"{cat['title']} · wave {cat.get('release_wave') or 1} · {cat['stage']}", expanded=False):
+                with st.form(f"brief_{cat['id']}"):
+                    b_title = st.text_input("Title", value=str(cat["title"]))
+                    b_logline = st.text_input("Logline (one line)", value=str(cat.get("logline") or ""))
+                    b_brief = st.text_area("Brief (buyer or reader, promise, proof points, what is not claimed, price idea)", value=str(cat.get("brief") or ""), height=140)
+                    if st.form_submit_button("Save brief"):
+                        rewritten = society.set_product_brief(project_scope, int(cat["id"]), title=b_title, logline=b_logline, brief=b_brief)
+                        st.success(f"Saved; {rewritten} open item(s) carry the new brief.")
+                        st.rerun()
         if company.get("kind") == "software":
             with st.form(f"add_product_{company_id}", clear_on_submit=True):
                 p_title = st.text_input("Product title")
                 p_logline = st.text_input("One line on what it does")
+                p_brief = st.text_area("Brief", height=100)
                 if st.form_submit_button("Add product (seat, catalog row, backlog)") and p_title.strip():
-                    society.add_product(project_scope, company_id, deliverable_slug(p_title), p_title.strip(), p_logline.strip())
+                    society.add_product(project_scope, company_id, deliverable_slug(p_title), p_title.strip(), p_logline.strip(), p_brief.strip())
                     st.rerun()
         missing = [key for key in ("avs_studio", "software_co") if not society_store.company_by_key(project_scope, key)]
         for key in missing:
@@ -2470,6 +2538,25 @@ with st.sidebar:
                 st.rerun()
             st.warning("Scope ids use letters, digits, dots, dashes, or underscores (up to 64 characters).")
 
+    with st.expander("Controlled chaos (pink-wave signal)", expanded=False):
+        chaos_settings = pinkwave.settings_for(st.session_state.project_scope)
+        st.caption(
+            "The validated 1/f signal walks one step per use and nudges, within fixed bounds, how routing breaks near-ties, "
+            "the Heavy Mode temperature schedule, how much long-distance memory each prompt recalls, and how much a vision "
+            "digest carries across chats. Hard limits, keys, and project scope never move with it. Gain 0 is fully deterministic."
+        )
+        with st.form("chaos_form"):
+            gain = st.slider("Gain (%)", 0, 100, int(round(chaos_settings.gain * 100)), key="chaos_gain")
+            profiles = {}
+            cols = st.columns(len(pinkwave.FEATURES))
+            for col, feature in zip(cols, pinkwave.FEATURES):
+                options = list(pinkwave.PROFILES)
+                profiles[feature] = col.selectbox(feature, options, index=options.index(chaos_settings.profiles.get(feature, "pink")), key=f"chaos_{feature}")
+            if st.form_submit_button("Save chaos settings"):
+                pinkwave.save_settings(st.session_state.project_scope, gain / 100, profiles)
+                st.success("Saved for this project; the worker reads the same settings.")
+        preview = pinkwave.Chaos(st.session_state.project_scope, chaos_settings).preview()
+        st.caption(" · ".join(f"{f}: {v['profile']} step {v['step']} → {v['unit']:.2f}" for f, v in preview.items()))
     st.subheader("Thread health agent")
     st.checkbox(
         "Auto-migrate heavy threads",
@@ -2602,7 +2689,8 @@ with st.sidebar:
     st.caption(
         f"Active messages {active_count} · archived {archive_count} · summaries {len(summary_rows)} across "
         + ", ".join(f"{label} {per_workspace[key]} chat(s)" for label, key in WORKSPACE_TABS)
-        + ". Raw history is texturized and archived; only Delete chat removes anything."
+        + ". Raw history is texturized and archived; only Delete chat removes anything. Every prompt also recalls keyword-matched "
+        "lines from the project's other chats (long-distance memory), sized by the controlled-chaos setting."
     )
     st.divider()
     with st.expander("Roadmap & stubs (not yet built)", expanded=False):

@@ -46,6 +46,7 @@ except ModuleNotFoundError as exc:  # Keep pure routing/math helpers importable 
 from . import discovery
 from . import providers as _providers
 from .config import PROVIDERS, Settings, get_settings, provider_model, resolve_secret
+from . import pinkwave
 from .quota import QuotaLedger, seconds_to_utc_midnight
 from .quota_registry import credential_fingerprint, get_quota_ledger
 
@@ -807,6 +808,12 @@ def select_milp_endpoint(
     if not supplied_entropy:
         supplied_entropy = project_seth_routing_entropy((endpoint.name for endpoint in endpoints), length=128)
     penalties = {endpoint.name: float(supplied_entropy.get(endpoint.name, 0.0)) for endpoint in endpoints}
+    # Controlled chaos: the scope's pink wave adds a bounded jitter so near-ties break differently over time;
+    # the capacity rows below are untouched, so it can never select a blocked endpoint.
+    chaos = pinkwave.current()
+    jitter = chaos.routing_jitter([endpoint.name for endpoint in endpoints]) if chaos is not None else {}
+    if jitter:
+        penalties = {name: min(1.0, value + jitter.get(name, 0.0)) for name, value in penalties.items()}
     utilities = {endpoint.name: _utility_score(endpoint, task_type, penalties[endpoint.name]) for endpoint in endpoints}
     enabled = {
         endpoint.name: endpoint.name not in excluded_set and bool(_endpoint_key(endpoint)) for endpoint in endpoints
@@ -852,9 +859,11 @@ def select_milp_endpoint(
             if keyed and all(any("daily cap" in reason for reason in reasons) for reasons in keyed):
                 raise ProviderError(f"daily cap reached for every keyed vendor -> {detail}")
             raise ProviderError(f"Cortex 2 found no BYOK endpoint with headroom -> {detail}")
-        chosen = max(feasible, key=lambda endpoint: (utilities[endpoint.name], -endpoints.index(endpoint)))
+        # Equal utilities: the wave breaks the tie (lowest jitter first) instead of table order.
+        chosen = max(feasible, key=lambda endpoint: (utilities[endpoint.name], -jitter.get(endpoint.name, 0.0), -endpoints.index(endpoint)))
 
     decision_vector = {endpoint.name: int(endpoint.name == chosen.name) for endpoint in endpoints}
+    chaos_note = f"; chaos={chaos.profile('routing')} jitter={jitter.get(chosen.name, 0.0):.4f}" if jitter else ""
     return MILPDecision(
         endpoint=chosen,
         decision_vector=decision_vector,
@@ -863,7 +872,7 @@ def select_milp_endpoint(
         solver=solver_name,
         reason=(
             f"selected {chosen.name}; utility={utilities[chosen.name]:.4f}; "
-            f"entropy_penalty={penalties[chosen.name]:.4f}; binary={decision_vector}"
+            f"entropy_penalty={penalties[chosen.name]:.4f}; binary={decision_vector}{chaos_note}"
         ),
     )
 
@@ -1705,12 +1714,13 @@ def _last_user_turn(messages: Sequence[Mapping[str, str]]) -> str:
 
 
 def _heavy_pipeline(
-    one_pass: Callable[[str, List[dict], int], Tuple[str, RouteDecision]],
+    one_pass: Callable[..., Tuple[str, RouteDecision]],
     task_type: str,
     messages: List[dict],
     max_tokens: int,
     paid_slot: Optional[PaidReasoningSlot] = None,
-    final_pass: Optional[Callable[[str, List[dict], int], Tuple[Any, RouteDecision]]] = None,
+    final_pass: Optional[Callable[..., Tuple[Any, RouteDecision]]] = None,
+    temperatures: Optional[Tuple[float, float, float]] = None,
 ) -> Tuple[Any, RouteDecision]:
     """Bounded plan/critique/synthesis without exposing private chain-of-thought.
 
@@ -1718,8 +1728,16 @@ def _heavy_pipeline(
     critique pass; the draft and synthesis always run on free endpoints.
     ``final_pass`` may return an unexhausted stream instead of text so the UI
     can show the synthesis as it arrives; the fallbacks still return text.
+    ``temperatures`` is the pink-wave schedule (draft, critique, synthesis);
+    when None every pass keeps the caller's temperature (three-argument passes).
     """
-    draft, draft_decision = one_pass(task_type, messages, max(256, max_tokens // 2))
+
+    def run_pass(fn: Callable[..., Any], stage: int, selected_type: str, selected_messages: List[dict], tokens: int) -> Any:
+        if temperatures is None:
+            return fn(selected_type, selected_messages, tokens)
+        return fn(selected_type, selected_messages, tokens, float(temperatures[stage]))
+
+    draft, draft_decision = run_pass(one_pass, 0, task_type, messages, max(256, max_tokens // 2))
     # Only the operator's request travels with the draft: the system prompt, memory, and history
     # already shaped the draft, and resending them tripled the cost of every Heavy send.
     request = _last_user_turn(messages)
@@ -1738,7 +1756,7 @@ def _heavy_pipeline(
         if paid_slot is not None and paid_slot.armed:
             critique, critique_decision = paid_slot_generate(paid_slot, critique_messages, max(256, max_tokens // 3))
         else:
-            critique, critique_decision = one_pass("reasoning", critique_messages, max(256, max_tokens // 3))
+            critique, critique_decision = run_pass(one_pass, 1, "reasoning", critique_messages, max(256, max_tokens // 3))
     except ProviderError:
         return draft, RouteDecision(
             draft_decision.provider,
@@ -1764,7 +1782,7 @@ def _heavy_pipeline(
         },
     ]
     try:
-        final, final_decision = (final_pass or one_pass)(task_type, synthesis_messages, max_tokens)
+        final, final_decision = run_pass(final_pass or one_pass, 2, task_type, synthesis_messages, max_tokens)
     except ProviderError:
         return draft, RouteDecision(
             critique_decision.provider,
@@ -1775,11 +1793,18 @@ def _heavy_pipeline(
             critique_decision.decision_vector,
         )
     final_decision.task_type = task_type
+    schedule = f" temperatures={temperatures[0]}/{temperatures[1]}/{temperatures[2]};" if temperatures else ""
     final_decision.reason = (
-        f"bounded heavy mode: draft -> review({critique_decision.provider}) -> synthesis; "
+        f"bounded heavy mode: draft -> review({critique_decision.provider}) -> synthesis;{schedule} "
         f"final={final_decision.reason}"
     )
     return final, final_decision
+
+
+def _heavy_schedule(temperature: float) -> Optional[Tuple[float, float, float]]:
+    """The active scope's pink-wave temperature schedule, or None when no wave is active or its gain is 0."""
+    chaos = pinkwave.current()
+    return chaos.heavy_schedule(float(temperature)) if chaos is not None else None
 
 
 def heavy_stream(
@@ -1800,18 +1825,24 @@ def heavy_stream(
         raise ProviderError("no Cortex endpoint is keyed; Heavy Mode streaming needs one")
     draft: Dict[str, Any] = {}
 
-    def one_pass(selected_type: str, selected_messages: List[dict], tokens: int) -> Tuple[str, RouteDecision]:
-        text, decision = cortex_generate(selected_type, selected_messages, ledger=ledger, max_tokens=tokens, temperature=temperature, system_prompt=system_prompt)
+    def one_pass(selected_type: str, selected_messages: List[dict], tokens: int, pass_temperature: Optional[float] = None) -> Tuple[str, RouteDecision]:
+        text, decision = cortex_generate(
+            selected_type, selected_messages, ledger=ledger, max_tokens=tokens,
+            temperature=temperature if pass_temperature is None else pass_temperature, system_prompt=system_prompt,
+        )
         draft.setdefault("text", text)  # the first pass is the draft
         draft.setdefault("decision", decision)
         return text, decision
 
-    def final_pass(selected_type: str, selected_messages: List[dict], tokens: int) -> Tuple[HeavyStream, RouteDecision]:
-        stream = CortexStream(selected_type, selected_messages, ledger, max_tokens=tokens, temperature=temperature, system_prompt=system_prompt)
+    def final_pass(selected_type: str, selected_messages: List[dict], tokens: int, pass_temperature: Optional[float] = None) -> Tuple[HeavyStream, RouteDecision]:
+        stream = CortexStream(
+            selected_type, selected_messages, ledger, max_tokens=tokens,
+            temperature=temperature if pass_temperature is None else pass_temperature, system_prompt=system_prompt,
+        )
         wrapped = HeavyStream(stream, str(draft.get("text", "")), draft.get("decision"), task_type)
         return wrapped, wrapped.decision
 
-    return _heavy_pipeline(one_pass, task_type, messages, max_tokens, paid_slot=paid_slot, final_pass=final_pass)
+    return _heavy_pipeline(one_pass, task_type, messages, max_tokens, paid_slot=paid_slot, final_pass=final_pass, temperatures=_heavy_schedule(temperature))
 
 
 class HeavyStream:
@@ -1860,18 +1891,19 @@ def generate_heavy(
 ) -> Tuple[str, RouteDecision]:
     """Run the legacy-provider bounded Heavy Mode pipeline."""
     return _heavy_pipeline(
-        lambda selected_type, selected_messages, tokens: generate(
+        lambda selected_type, selected_messages, tokens, pass_temperature=None: generate(
             selected_type,
             selected_messages,
             ledger,
             max_tokens=tokens,
-            temperature=temperature,
+            temperature=temperature if pass_temperature is None else pass_temperature,
             settings=settings,
         ),
         task_type,
         messages,
         max_tokens,
         paid_slot=paid_slot,
+        temperatures=_heavy_schedule(temperature),
     )
 
 
@@ -1886,18 +1918,19 @@ def generate_cortex_heavy(
 ) -> Tuple[str, RouteDecision]:
     """Run bounded Heavy Mode through the strict Cortex endpoint matrix."""
     return _heavy_pipeline(
-        lambda selected_type, selected_messages, tokens: cortex_generate(
+        lambda selected_type, selected_messages, tokens, pass_temperature=None: cortex_generate(
             selected_type,
             selected_messages,
             ledger=ledger,
             max_tokens=tokens,
-            temperature=temperature,
+            temperature=temperature if pass_temperature is None else pass_temperature,
             system_prompt=system_prompt,
         ),
         task_type,
         messages,
         max_tokens,
         paid_slot=paid_slot,
+        temperatures=_heavy_schedule(temperature),
     )
 
 

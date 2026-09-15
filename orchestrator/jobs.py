@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, Tuple
 
-from . import jobsecrets, vault
+from . import jobsecrets, pinkwave, vault
 from .config import bind_session_keys
 from .quota import QuotaLedger
 from .quota_registry import get_quota_ledger, get_request_lock
@@ -189,6 +189,7 @@ def _run_in_context(row: Any) -> None:
         payload = {}
     secrets = _take_secrets(job_id)
     bind_session_keys(secrets)
+    pinkwave.activate(str(row["project_scope"]))  # the worker walks the same scoped wave as the app
     ctx = JobContext(
         job_id=job_id, project_scope=str(row["project_scope"]), thread_id=row["thread_id"], kind=kind,
         payload=payload, secrets=secrets, ledger=get_quota_ledger(), request_lock=get_request_lock(),

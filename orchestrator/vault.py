@@ -177,6 +177,17 @@ CREATE TABLE IF NOT EXISTS quota_usage (
     updated_at REAL NOT NULL,
     PRIMARY KEY (key, day)
 );
+CREATE TABLE IF NOT EXISTS settings (
+    project_scope TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (project_scope, key)
+);
+CREATE TABLE IF NOT EXISTS counters (
+    key TEXT PRIMARY KEY,
+    value INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -234,6 +245,8 @@ def initialize_database() -> None:
             _ensure_column(connection, "seats", column, ddl)
         _ensure_column(connection, "agents", "thread_id", "INTEGER")
         _ensure_column(connection, "agents", "focus", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "companies", "wave_size", "INTEGER NOT NULL DEFAULT 6")
+        _ensure_column(connection, "catalog", "brief", "TEXT NOT NULL DEFAULT ''")
         # Backfill: every scope that has thread-less rows gets one "Main thread".
         scopes = {
             row[0]
@@ -600,6 +613,40 @@ def enforce_window(project_scope: str, thread_id: Optional[int] = None, workspac
         return summary_id
 
 
+def setting_get(project_scope: str, key: str, default: str = "") -> str:
+    """A per-scope setting (a JSON or plain string) shared by the app and the worker."""
+    with _open_database() as connection:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE project_scope = ? AND key = ?", (project_scope.strip() or "default", key)
+        ).fetchone()
+    return str(row["value"]) if row is not None else default
+
+
+def setting_set(project_scope: str, key: str, value: str) -> None:
+    with _open_database() as connection:
+        connection.execute(
+            "INSERT INTO settings (project_scope, key, value, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(project_scope, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (project_scope.strip() or "default", key, str(value)[:20_000], time.time()),
+        )
+
+
+def bump_counter(key: str) -> int:
+    """Atomically advance a named counter and return its new value (the pink-wave step, per scope and feature)."""
+    with _open_database() as connection:
+        row = connection.execute(
+            "INSERT INTO counters (key, value) VALUES (?, 1) ON CONFLICT(key) DO UPDATE SET value = value + 1 RETURNING value",
+            (key,),
+        ).fetchone()
+    return int(row[0])
+
+
+def peek_counter(key: str) -> int:
+    with _open_database() as connection:
+        row = connection.execute("SELECT value FROM counters WHERE key = ?", (key,)).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
 def _thread_filter(
     connection: sqlite3.Connection, scope: str, thread_id: Optional[int], workspace: Optional[str] = None
 ) -> Tuple[str, Tuple[Any, ...]]:
@@ -679,21 +726,115 @@ def recent_messages(
         )
 
 
+RECALL_PREFIX = "[LONG-DISTANCE MEMORY recalled from earlier chats in this project; reference only]"
+RECALL_LINE_MAX = 300
+RECALL_MIN_HITS = 2  # a line must share at least two keywords with the request (one when the request has one)
+
+
+def _recall_candidates(connection: sqlite3.Connection, scope: str, exclude_thread: Optional[int]) -> List[Tuple[str, str, float]]:
+    """(source label, text, created_at) from other chats' summaries, digests, missions, this chat's older summaries, artifacts."""
+    out: List[Tuple[str, str, float]] = []
+    titles = {int(r["id"]): (str(r["title"]), str(r["workspace"])) for r in connection.execute(
+        "SELECT id, title, workspace FROM threads WHERE project_scope = ?", (scope,)
+    ).fetchall()}
+    for row in connection.execute(
+        "SELECT thread_id, content, created_at FROM summaries WHERE project_scope = ? ORDER BY created_at DESC, id DESC LIMIT 300", (scope,)
+    ).fetchall():
+        thread_id = int(row["thread_id"] or 0)
+        if exclude_thread is not None and thread_id == exclude_thread:
+            continue
+        title, workspace = titles.get(thread_id, ("earlier chat", ""))
+        out.append((f'chat "{title}"' + (f" ({workspace})" if workspace else ""), str(row["content"]), float(row["created_at"])))
+    if exclude_thread is not None:
+        older = connection.execute(
+            "SELECT content, created_at FROM summaries WHERE project_scope = ? AND thread_id = ? ORDER BY created_at DESC, id DESC LIMIT 50 OFFSET 5",
+            (scope, exclude_thread),
+        ).fetchall()
+        out.extend(("this chat, older summary", str(r["content"]), float(r["created_at"])) for r in older)
+    for row in connection.execute(
+        "SELECT id, title, mission FROM threads WHERE project_scope = ? AND mission != '' AND id != ?", (scope, int(exclude_thread or -1))
+    ).fetchall():
+        out.append((f'mission of chat "{row["title"]}"', str(row["mission"]), 0.0))
+    for row in connection.execute(
+        "SELECT name, code_body, structural_summary, created_at FROM artifact_store WHERE project_scope = ? ORDER BY created_at DESC, id DESC LIMIT 60",
+        (scope,),
+    ).fetchall():
+        name = str(row["name"])
+        if name.endswith("-digest.md"):
+            out.append((f"digest {name}", str(row["code_body"])[:6_000], float(row["created_at"])))
+        elif row["structural_summary"]:
+            out.append((f"artifact {name}", str(row["structural_summary"]), float(row["created_at"])))
+    return out
+
+
+def recall_memory(project_scope: str, query: str, thread_id: Optional[int] = None, max_characters: int = 2_000) -> str:
+    """Long-distance memory: lines from other chats' summaries, digests, missions, and artifacts of this scope that share keywords with ``query``.
+
+    Ranked by keyword overlap (then recency), bounded by ``max_characters``, never across scopes.
+    Empty when the request has no keywords or nothing in the project matches.
+    """
+    from .keyword_search import keywords  # local import: keyword_search has no vault dependency
+
+    words = list(dict.fromkeys(keywords(query)))[:24]
+    if not words or max_characters < 80:
+        return ""
+    scope = project_scope.strip() or "default"
+    needed = 1 if len(words) == 1 else RECALL_MIN_HITS
+    with _open_database() as connection:
+        candidates = _recall_candidates(connection, scope, int(thread_id) if thread_id is not None else None)
+    scored: List[Tuple[int, float, str]] = []
+    seen: set = set()
+    for label, text, created in candidates:
+        for line in str(text).splitlines():
+            stripped = line.strip().lstrip("-*# ").strip()
+            if len(stripped) < 12 or stripped.startswith("[") and stripped.endswith("]"):
+                continue
+            lowered = stripped.lower()
+            hits = sum(1 for word in words if word in lowered)
+            if hits < needed:
+                continue
+            key = _normalized(stripped)
+            if key in seen:
+                continue
+            seen.add(key)
+            scored.append((hits, created, f"- ({label}) {stripped[:RECALL_LINE_MAX]}"))
+    if not scored:
+        return ""
+    scored.sort(key=lambda item: (-item[0], -item[1]))
+    lines = [RECALL_PREFIX]
+    used = len(RECALL_PREFIX) + 1
+    for _, _, line in scored:
+        if used + len(line) + 1 > max_characters:
+            continue
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def context_parts(
-    project_scope: str, max_characters: int = 24_000, thread_id: Optional[int] = None, workspace: Optional[str] = None
+    project_scope: str,
+    max_characters: int = 24_000,
+    thread_id: Optional[int] = None,
+    workspace: Optional[str] = None,
+    recall_query: str = "",
+    recall_share: float = 0.0,
 ) -> Dict[str, Any]:
     """Prompt memory for one thread, split for role-based prompting.
 
-    ``memory`` holds the inherited digest, texturized summaries, and system notes (for the
-    system prompt); ``turns`` holds the live window as user/assistant turns in order.
-    Budgets: digest <= 1/4, summaries <= 1/4, the live window gets the rest and fills
-    newest-first; a single oversized newest turn is truncated rather than dropped.
+    ``memory`` holds the inherited digest, texturized summaries, long-distance recall, and system
+    notes (for the system prompt); ``turns`` holds the live window as user/assistant turns in order.
+    Budgets: digest <= 1/4, summaries <= 1/4, recall <= ``recall_share`` (at most 1/4) when a
+    ``recall_query`` is given, the live window gets the rest and fills newest-first; a single
+    oversized newest turn is truncated rather than dropped.
     """
     scope = project_scope.strip() or "default"
     thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope, workspace)
     resolved_thread = int(thread["id"]) if thread is not None else None
     rows = recent_messages(scope, MESSAGE_WINDOW, thread_id=resolved_thread)
     summaries = recent_summaries(scope, 5, thread_id=resolved_thread)
+    recall = ""
+    if recall_query.strip() and recall_share > 0.0:
+        recall = recall_memory(scope, recall_query, resolved_thread, int(max_characters * max(0.0, min(0.25, float(recall_share)))))
     digest = ""
     if thread is not None and thread["digest_artifact_id"]:
         parent_digest = artifact_by_id(int(thread["digest_artifact_id"]))
@@ -715,6 +856,9 @@ def context_parts(
         memory_lines.append(line)
         summary_used += len(line) + 1
     used += summary_used
+    if recall:
+        memory_lines.append(recall)
+        used += len(recall) + 1
     remaining = max_characters - used
     window: List[Tuple[str, str]] = []
     for row in reversed(rows):
@@ -738,6 +882,7 @@ def context_parts(
     return {
         "memory": "\n".join(memory_lines),
         "turns": turns,
+        "recall": recall,
         "empty": not rows and not summaries and not digest,
     }
 
@@ -1518,13 +1663,18 @@ def thread_health(project_scope: str, thread_id: Optional[int] = None, workspace
 
 
 def build_vision_digest(
-    project_scope: str, thread_id: Optional[int] = None, max_characters: int = DIGEST_MAX_CHARACTERS, workspace: Optional[str] = None
+    project_scope: str,
+    thread_id: Optional[int] = None,
+    max_characters: int = DIGEST_MAX_CHARACTERS,
+    workspace: Optional[str] = None,
+    recall_characters: Optional[int] = None,
 ) -> str:
     """Deterministic compression of a thread into the material a fresh thread needs.
 
-    Sections: vision (how the thread started), decisions and constraints, key
-    facts (files, numbers), open items, artifacts locked in the scope, and the
-    stacked summaries. Zero provider quota; a model may refine it afterwards.
+    Sections: vision (how the thread started), decisions and constraints, key facts (files,
+    numbers), open items, artifacts locked in the scope, the stacked summaries, and long-distance
+    memory recalled from the project's other chats (``recall_characters``: the scope's pink-wave
+    setting when None, 0 disables). Zero provider quota; a model may refine it afterwards.
     """
     scope = project_scope.strip() or "default"
     thread = thread_by_id(thread_id) if thread_id is not None else active_thread(scope, workspace)
@@ -1585,6 +1735,13 @@ def build_vision_digest(
         parts.append("## Texturized summaries\n" + "\n\n".join(
             f"[{s['message_count']} msgs] {s['content'][:700]}" for s in summaries[-4:]
         ))
+    if recall_characters is None:
+        from .pinkwave import for_scope  # local import: pinkwave imports this module lazily
+
+        recall_characters = for_scope(scope).digest_recall_chars()
+    recalled = recall_memory(scope, " ".join([first_user[:400], *decisions[:3]]), resolved, int(recall_characters)) if recall_characters else ""
+    if recalled:
+        parts.append("## Long-distance memory (other chats in this project)\n" + "\n".join(recalled.splitlines()[1:]))
     digest = "\n\n".join(parts)
     return digest[:max_characters]
 

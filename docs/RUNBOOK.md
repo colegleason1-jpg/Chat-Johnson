@@ -88,12 +88,20 @@
   it 24/7). Pause cancels the queued successor. The tick backs off a failing cycle: each consecutive
   failure doubles the wait, up to sixteen intervals.
 
-- Release waves: the studio's six wave-1 works go to the board together once every one is `final`
-  (Company → Backlog & catalog → *Send wave 1 to the board for review*). Each work's manuscript is
+- Release waves are per company: *Works per release wave* (Settings) sets how many works of the
+  current wave must be `final` before the wave goes to the board as one release (Company → Backlog &
+  catalog → *Send wave N to the board for review*); the current wave is the lowest wave with an
+  unpublished work, and each work's wave is editable in the catalog. Each work's manuscript is
   assembled from its finished items (story bible, chapters, final edit last) under
-  `company/avs_studio/works/`; Approve publishes all six and opens marketing and sales, Return
-  records the feedback and opens a final-edit item per work that carries the manuscript. Software
-  products still publish one at a time.
+  `company/<key>/works/`; Approve publishes the wave, opens marketing and sales, and moves the next
+  wave from the backlog into development (studio works get their starter items); Return records the
+  feedback and opens a final-edit item per work that carries the manuscript. A work that is final
+  outside the current wave can still be published on its own.
+- Product briefs are per project: Settings → *Products and briefs* edits a work's title, logline, and
+  brief for this scope only, and every open item of that work is rewritten with the new header.
+- Roles: the Org chart is an editor. Seat titles, roles, KPIs, and importance save from the table,
+  each seated agent's persona has its own editor, and *Add a seat* creates an open seat that the next
+  free graduate fills. Changes reach a seat's next brief; nothing running is interrupted.
 
 ## Academy cycles and personnel
 - `academy_cycle` jobs are bounded to 24 calls and the academy's treasury share (the remainder the
@@ -112,6 +120,17 @@
   leisure inquiries per tick. Leisure fetches go to public APIs (Wikipedia, gutendex, arXiv, Open
   Library, Hacker News); a blocked source is logged as an error on the inquiry and costs the agent
   its leisure fee only. Stop the tick before a redeploy if you want a clean cycle log.
+
+## Controlled chaos (pink-wave signal)
+- Sidebar → *Controlled chaos*: gain 0–100 % and a frequency profile per feature (routing, heavy,
+  memory, migration). Settings are stored per project scope in the vault (`settings` table) and the
+  worker reads them for background jobs; the step counters (`counters` table) advance once per use.
+- What it moves, and the bounds: routing entropy penalty +≤ 0.15 × gain (near-ties only; RPM, TPM,
+  daily caps, and keys are constraints and never move); Heavy draft temperature + ≤ 0.4 × gain, the
+  critique at 0.0; long-distance recall 10 % of the context budget + ≤ 15 % × gain; the digest's
+  cross-chat section 600 + ≤ 600 × gain characters. Gain 0 restores deterministic behaviour.
+- Diagnosis: the routing log's reason string carries `chaos=<profile> jitter=<value>` and Heavy
+  sends carry `temperatures=draft/critique/synthesis`.
 
 ## Quota caps
 - Per-vendor daily token ceilings default to the `DAILY_CAPS` table; set `CHAT_JOHNSON_DAILY_<VENDOR>`

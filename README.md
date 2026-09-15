@@ -50,7 +50,9 @@ approved reconstruction plan.
 | `orchestrator/mcp_client.py` | JSON-RPC 2.0 stdio MCP client (`mcp_servers.yaml`, `CHAT_JOHNSON_MCP_SERVERS`); servers start from a minimal environment |
 | `orchestrator/jobsecrets.py` | Encrypted per-job hand-off of session secrets between the app and the worker (`CHAT_JOHNSON_JOB_KEY`) |
 | `orchestrator/envsafe.py` | Minimal environment for child processes; the self-hosted switch |
-| `orchestrator/memory.py` | Task memory persisted to disk |
+| `orchestrator/memory.py` | Task memory persisted to disk (one file per project scope) |
+| `orchestrator/pinkwave.py` | Controlled chaos: the 1/f signal walked per use at three frequency profiles; bounded nudges for routing, Heavy Mode, recall, digests |
+| `orchestrator/society/` | Two companies on Traction/EOS (cycles, EOS scorecard, release waves, manuscripts) and the agent society (academy, tick, leisure) |
 | `research/project_seth_phase3.py` | Project Seth Phase 3 distribution and bias-sweep engine (research only) |
 | `docs/` | Bible, recovery audit, implementation plan, strategic outline |
 
@@ -182,7 +184,9 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | Background Git-Streamer | Roadmap · not implemented |
 | Live SDK Document Scraper | Roadmap · not implemented |
 | Self-Correcting Execution Sandbox for chat output | Roadmap · exists only inside the repository pipeline |
-| Cross-thread semantic search | Roadmap · artifact search is text matching |
+| Cross-thread semantic search | Partial · long-distance memory: keyword-ranked lines from the project's other chats (summaries, digests, missions, artifact summaries) in every prompt and every vision digest; no embedding index |
+| Controlled chaos: the validated 1/f signal applied across routing, Heavy Mode, memory recall, and migration | Implemented · bounded nudges only, per-project gain and frequency profiles, gain 0 is deterministic |
+| Society: per-project product briefs, per-company release waves, every seat's title/roles/KPIs and every persona editable | Implemented |
 | Capability card in every prompt (what the app can and cannot do) and memory as real chat turns | Implemented |
 | Repository Work hub connector: fetch a GitHub repository through the API (public, or private with the armed token) into a temporary sandbox, run the pipeline, download the patch, push the change as a branch plus pull request; four tabs (Work, Deploy Kit, GitHub, Directions) | Implemented · tests of the fetched repository run only when ticked |
 | Deploy Kit (Repository Work): CI/CD workflow, Dockerfile, Helm chart, Terraform skeleton, serverless template, observability, rollback script, runbook; offline validation; zip download; lock as artifacts | Implemented · generation only, nothing is pushed or applied |
@@ -221,6 +225,12 @@ trips (or you press *Migrate now*), the agent:
 
 The result is a fresh thread that carries the original vision in a re-optimized, token-light form.
 Switch **Auto-migrate heavy threads** off in the sidebar to keep migrations manual.
+
+**Long-distance memory.** Every prompt also recalls lines from the project's *other* chats: their
+texturized summaries, vision digests, pinned missions, this chat's own older summaries, and artifact
+summaries, ranked by keyword overlap with the request and bounded to a share of the context budget
+(a tenth, up to a quarter when the controlled-chaos gain lifts it). A vision digest carries the same
+recall into the successor thread. Recall never crosses a project scope, and it costs no provider quota.
 
 ## Setup
 
@@ -264,6 +274,13 @@ HTTP status, key fingerprint, and any auto-switch. Probes count toward the vendo
   latency (noise gate), seeded by the endpoint name so it is reproducible, and the penalty is the
   entropy gained over the undriven baseline. An endpoint with no observations gets no penalty. This
   is a routing signal, not a physical claim.
+- **Controlled chaos** (`orchestrator/pinkwave.py`): the same 1/f generator, walked one step per
+  use at a chosen frequency profile (white α 0.5, pink α 1.0, brown α 1.5), adds a jitter of at most
+  0.15 to the entropy penalty (0.045 utility), so near-ties between endpoints break differently over
+  time while the capacity rows stay untouched; Heavy Mode gets a temperature schedule (warmer draft,
+  cold critique, base synthesis); the long-distance recall share and the digest's cross-chat section
+  grow with the wave. Gain and profiles are per project (sidebar → Controlled chaos) and shared with
+  the worker; gain 0 is fully deterministic. A bounded signal, never an optimization claim.
 - **Legacy providers** (NVIDIA NIM, OpenRouter, Cerebras, Mistral) are a fallback only: they serve a
   request when no Cortex key (Gemini, Groq, Hugging Face) is set or when every Cortex endpoint fails
   it. Their retries, sibling-model attempts, and rediscovery calls are metered like everything else.

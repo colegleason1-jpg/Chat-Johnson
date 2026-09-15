@@ -15,7 +15,7 @@ Consult this map instead of sweeping the tree. Read only the files named for the
 | `orchestrator/preview.py` | nh3 allowlist sanitizer + preview document + markup extraction | sanitize_markup, looks_like_markup, extract_preview_source, safe_preview_document |
 | `orchestrator/github_auth.py` | signed, time-limited OAuth state |  |
 | `orchestrator/connectors.py` | local SQLite connector + roadmap stubs (not enable-able) | ConnectorHealth, Connector, LocalSQLiteConnector, connector_status |
-| `orchestrator/executor.py` | repository pipeline: decompose → sandbox → patches → AST/pytest → diff | Orchestrator |
+| `orchestrator/executor.py` | repository pipeline: decompose → sandbox → patches → AST/pytest → diff | memory_path_for, Orchestrator |
 | `orchestrator/sandbox.py` | git worktree / copy-mode sandbox, copy-mode difflib diff, AST guardrail | SandboxError, sandbox_source, create_worktree, commit_sandbox, diff_vs_base, cleanup_worktree, prune_staging, validate_python_files |
 | `orchestrator/patches.py` | FILE-block / unified-diff parsing and safe application, changed_files | parse_file_blocks, looks_like_snippet, reject_snippets, parse_diff_blocks, diff_paths, apply_file_blocks, apply_unified_diffs, is_git_sandbox, changed_files |
 | `orchestrator/decomposer.py` | LLM JSON step planner for the repository pipeline | decompose |

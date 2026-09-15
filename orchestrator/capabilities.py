@@ -25,10 +25,10 @@ IMPLEMENTED: Tuple[Tuple[str, str], ...] = (
     ("Mission nodes", "steps are nodes: executor model/solver/webqa/connector/sub_mission, config, inputs, output "
                       "(chat/artifact/both), on_failure; connectors deploy_kit.generate, github.fetch/push/revert, "
                       "repository.run, vault.export_thread/save_artifact, webqa.check, mcp.call"),
-    ("Memory", "SQLite vault, private scope per visitor: per-workspace chats, 200-message windows, summaries, "
-               "vision digests, locked artifacts, transcript export"),
-    ("Heavy Mode", "draft, review, synthesis passes; an optional paid slot serves only the review pass, armed per session"),
-    ("Live preview canvas", "sanitized HTML/CSS mockups"),
+    ("Memory", "SQLite vault, private per visitor: per-workspace chats, 200-message windows, summaries, digests, "
+               "locked artifacts, exports, keyword recall from the project's other chats"),
+    ("Heavy Mode", "draft, review, synthesis passes; an optional paid slot serves only the review pass, per session"),
+    ("Preview canvas", "sanitized HTML/CSS mockups"),
 )
 
 BOUNDARIES: Tuple[str, ...] = (

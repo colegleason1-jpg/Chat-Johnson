@@ -13,11 +13,42 @@ from typing import Dict, Optional, Sequence, Tuple
 from . import store
 
 DAY = 86_400.0
-DEFAULT_PRODUCTS: Tuple[Tuple[str, str, str], ...] = (
-    ("supply_chain_optimizer", "Supply Chain Optimizer", "Routes stock between warehouses to cut shortages: runs nightly, exports a CSV plan, needs no new hardware (product name to confirm with the board)."),
-    ("chatbot_book_system", "Chat Bot Book System", "A chat bot that reads, indexes, and converses about a reader's own books; books stay on the reader's device and only selected passages reach the model."),
-    ("api", "The API", "Programmatic access to the operator's software: routing, chat-over-documents, and the studio's tooling as endpoints with keys, quotas, and usage reports."),
+DEFAULT_PRODUCTS: Tuple[Tuple[str, str, str, str], ...] = (
+    ("supply_chain_optimizer", "Supply Chain Optimizer",
+     "Routes stock between warehouses to cut shortages: runs nightly, exports a CSV plan, needs no new hardware (product name to confirm with the board).",
+     "Buyer: an operations lead at a company with three to thirty warehouses and spreadsheet planning. Promise: fewer stock-outs without new hardware. "
+     "Proof points: a nightly plan from the existing inventory export, a CSV the team already knows how to read, a dry-run mode before any transfer is booked. "
+     "Not claimed: demand forecasting beyond the history it is given. Price idea: per warehouse per month with a free single-warehouse tier."),
+    ("chatbot_book_system", "Chat Bot Book System",
+     "A chat bot that reads, indexes, and converses about a reader's own books; books stay on the reader's device and only selected passages reach the model.",
+     "Buyer: readers and study groups who own their books as files. Promise: ask the book a question and get an answer with the page. "
+     "Proof points: local index, passages sent only when the reader asks, works with the reader's own model key. Not claimed: it never invents a citation; "
+     "every answer shows the passage it used. Price idea: free for one shelf, a one-time price per shelf beyond."),
+    ("api", "The API",
+     "Programmatic access to the operator's software: routing, chat-over-documents, and the studio's tooling as endpoints with keys, quotas, and usage reports.",
+     "Buyer: developers who want the studio's routing and chat-over-documents inside their own product. Promise: one key, per-vendor quotas handled, usage visible. "
+     "Proof points: the same router the studio runs on, usage reports per key, free-tier pacing built in. Not claimed: uptime beyond the vendors it routes to. "
+     "Price idea: pay for routed requests above a free daily allowance."),
 )
+PRODUCT_HEADER_END = "\n---\n"  # separates the product header of a work item's brief from the item's own brief
+
+
+def product_header(title: str, logline: str, brief: str = "") -> str:
+    """The product context every work item of a product carries; rewritten when the board edits the product."""
+    header = f"Product: {title}. {logline}".strip()
+    if brief.strip():
+        header += "\nProduct brief: " + brief.strip()
+    return header + PRODUCT_HEADER_END
+
+
+def item_brief(header: str, brief: str) -> str:
+    return header + brief
+
+
+def split_item_brief(text: str) -> Tuple[str, str]:
+    """(product header, the item's own brief); the whole text is the item's brief when it carries no header."""
+    head, sep, rest = str(text or "").partition(PRODUCT_HEADER_END)
+    return (head + sep, rest) if sep else ("", str(text or ""))
 
 
 @dataclass(frozen=True)
@@ -84,7 +115,7 @@ def software_seats(products: Sequence[Tuple[str, str, str]]) -> Tuple[SeatSpec, 
     product_seats = tuple(
         SeatSpec(f"pm_{key}", f"Product Manager · {title}", "product", "ea_ceo",
                  ("own the product's positioning", "keep its backlog", "coordinate docs, support, and release"), {"deliverables": 1}, 4)
-        for key, title, _ in products
+        for key, title, *_ in products
     )
     return EXEC_SEATS + product_seats + (
         SeatSpec("technical_writer", "Technical Writer", "docs", "ea_ceo", ("docs outlines", "reference pages", "quickstarts"), {"deliverables": 1, "review_pass_rate": 0.6}),
@@ -158,12 +189,17 @@ def _seed_org(scope: str, company_id: int, company_name: str, departments, seats
     return seat_ids
 
 
-def seed_company(scope: str, key: str, products: Optional[Sequence[Tuple[str, str, str]]] = None, founders: bool = True) -> int:
-    """Create a company from its template (idempotent per scope and key); returns the company id."""
+def seed_company(scope: str, key: str, products: Optional[Sequence[Sequence[str]]] = None, founders: bool = True, wave_size: int = 6) -> int:
+    """Create a company from its template (idempotent per scope and key); returns the company id.
+
+    ``products`` rows are ``(key, title, logline[, brief])``; ``wave_size`` is how many studio works form the
+    first release wave (the company setting the board can change later).
+    """
     existing = store.company_by_key(scope, key)
     if existing:
         return int(existing["id"])
     now = time.time()
+    wave_size = max(1, min(20, int(wave_size)))
     if key == "avs_studio":
         company_id = store.insert(
             "companies", scope, key=key, name="AVS Studio", kind="studio",
@@ -173,11 +209,11 @@ def seed_company(scope: str, key: str, products: Optional[Sequence[Tuple[str, st
             ten_year="A living catalog of released works across literature and entertainment with an audience that follows the studio.",
             three_year="Every wave of the 17-project backlog released and marketed; departments for marketing and sales established.",
             one_year="The six wave-1 works published after board review; the rest of the backlog outlined.",
-            interval_s=6 * 3600, daily_share=0.35, created_at=now,
+            interval_s=6 * 3600, daily_share=0.35, created_at=now, wave_size=wave_size,
         )
         seat_ids = _seed_org(scope, company_id, "AVS Studio", AVS_DEPARTMENTS, AVS_SEATS, founders)
         for number in range(1, 18):
-            wave = 1 if number <= 6 else 2
+            wave = 1 if number <= wave_size else 2
             field = "literature" if number <= 6 or number % 2 else "entertainment"
             catalog_id = store.insert(
                 "catalog", scope, company_id=company_id, key=f"ip-{number:02d}", title=f"IP Project {number:02d} (title to be set by the board)",
@@ -198,7 +234,7 @@ def seed_company(scope: str, key: str, products: Optional[Sequence[Tuple[str, st
             store.insert("timeline", scope, company_id=company_id, milestone=milestone, due_at=now + days * DAY)
         return company_id
     if key == "software_co":
-        chosen = tuple(products or DEFAULT_PRODUCTS)
+        chosen = tuple((tuple(p) + ("",))[:4] for p in (products or DEFAULT_PRODUCTS))
         company_id = store.insert(
             "companies", scope, key=key, name="AVS Software", kind="software",
             vision="Market and sell the operator's software with honest positioning, clear docs, and support that answers before it is asked.",
@@ -206,13 +242,12 @@ def seed_company(scope: str, key: str, products: Optional[Sequence[Tuple[str, st
             core_focus="Selling the operator's software products.",
             ten_year="A product line customers recommend.", three_year="Every product documented, priced, and sold through repeatable channels.",
             one_year="Positioning, docs, pricing, and landing pages live for every product; first outreach running.",
-            interval_s=6 * 3600, daily_share=0.25, created_at=now,
+            interval_s=6 * 3600, daily_share=0.25, created_at=now, wave_size=max(1, len(chosen)),
         )
         seat_ids = _seed_org(scope, company_id, "AVS Software", SOFTWARE_DEPARTMENTS, software_seats(chosen), founders)
-        for pkey, title, logline in chosen:
-            catalog_id = store.insert("catalog", scope, company_id=company_id, key=pkey, title=title, field="software", logline=logline, stage="development", release_wave=1)
-            for item_title, brief in PRODUCT_BACKLOG:
-                store.add_work_item(scope, company_id, f"{item_title} · {title}", f"Product: {title}. {logline}\n{brief}", importance=4 if item_title in ("Positioning one-pager", "Landing page copy") else 3, catalog_id=catalog_id)
+        for pkey, title, logline, brief in chosen:
+            catalog_id = store.insert("catalog", scope, company_id=company_id, key=pkey, title=title, field="software", logline=logline, brief=brief, stage="development", release_wave=1)
+            _seed_backlog(scope, company_id, catalog_id, title, logline, brief)
         for title in SOFTWARE_ROCKS:
             store.insert("rocks", scope, company_id=company_id, quarter=time.strftime("%Y-Q") + str((time.gmtime().tm_mon - 1) // 3 + 1), title=title, owner_seat_id=seat_ids["ceo"], due_at=now + 90 * DAY)
         for milestone, days in SOFTWARE_TIMELINE:
@@ -221,9 +256,36 @@ def seed_company(scope: str, key: str, products: Optional[Sequence[Tuple[str, st
     raise KeyError(f"unknown company template {key!r}")
 
 
-def add_product(scope: str, company_id: int, key: str, title: str, logline: str) -> int:
+def _seed_backlog(scope: str, company_id: int, catalog_id: int, title: str, logline: str, brief: str) -> None:
+    header = product_header(title, logline, brief)
+    for item_title, item_text in PRODUCT_BACKLOG:
+        store.add_work_item(scope, company_id, f"{item_title} · {title}", item_brief(header, item_text),
+                            importance=4 if item_title in ("Positioning one-pager", "Landing page copy") else 3, catalog_id=catalog_id)
+
+
+def set_product_brief(scope: str, catalog_id: int, title: Optional[str] = None, logline: Optional[str] = None, brief: Optional[str] = None) -> int:
+    """Edit a product (or work) per project: the catalog row changes and every open item of it gets the new header; returns items rewritten."""
+    cat = store.row("catalog", int(catalog_id), scope)
+    if not cat:
+        return 0
+    new_title = str(title if title is not None else cat["title"]).strip()[:200] or str(cat["title"])
+    new_logline = str(logline if logline is not None else cat["logline"]).strip()[:1000]
+    new_brief = str(brief if brief is not None else cat.get("brief") or "").strip()[:4000]
+    store.update("catalog", int(catalog_id), scope, title=new_title, logline=new_logline, brief=new_brief)
+    header = product_header(new_title, new_logline, new_brief)
+    rewritten = 0
+    for item in store.rows("work_items", scope, "catalog_id = ? AND status IN ('backlog', 'rated', 'assigned')", (int(catalog_id),), limit=500):
+        old_header, own = split_item_brief(str(item["brief"]))
+        if not old_header:
+            continue
+        store.update("work_items", int(item["id"]), scope, brief=item_brief(header, own)[:4000], updated_at=time.time())
+        rewritten += 1
+    return rewritten
+
+
+def add_product(scope: str, company_id: int, key: str, title: str, logline: str, brief: str = "") -> int:
     """Add a product to the software company: a catalog row, a product manager seat, and its backlog."""
-    catalog_id = store.insert("catalog", scope, company_id=company_id, key=key, title=title, field="software", logline=logline, stage="development", release_wave=1)
+    catalog_id = store.insert("catalog", scope, company_id=company_id, key=key, title=title, field="software", logline=logline, brief=brief.strip()[:4000], stage="development", release_wave=1)
     ea = store.seat_by_key(scope, company_id, "ea_ceo")
     product_dept = next((d for d in store.departments_for(scope, company_id) if d["key"] == "product"), None)
     seat_id = store.insert(
@@ -234,8 +296,7 @@ def add_product(scope: str, company_id: int, key: str, title: str, logline: str)
     company = store.row("companies", company_id) or {"name": "AVS Software"}
     agent_id = store.add_agent(scope, f"Product Manager · {title} (founding)", _persona(f"Product Manager · {title}", ("own the product", "keep its backlog", "coordinate"), str(company["name"])), tier="philosopher", allowance=2_000)
     store.seat_agent(scope, seat_id, agent_id)
-    for item_title, brief in PRODUCT_BACKLOG:
-        store.add_work_item(scope, company_id, f"{item_title} · {title}", f"Product: {title}. {logline}\n{brief}", importance=4 if item_title in ("Positioning one-pager", "Landing page copy") else 3, catalog_id=catalog_id)
+    _seed_backlog(scope, company_id, catalog_id, title, logline, brief)
     return catalog_id
 
 

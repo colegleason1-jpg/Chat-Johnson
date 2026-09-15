@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from typing import Dict, List, Optional
@@ -30,6 +31,15 @@ from .router import pipeline_generate
 from .test_loop import repair_loop
 
 
+def memory_path_for(base_path: str, project_scope: str = "") -> str:
+    """The task-memory file for a scope: the base path alone for the CLI, a scope-hashed sibling for the studio."""
+    scope = (project_scope or "").strip()
+    if not scope:
+        return base_path
+    root, ext = os.path.splitext(base_path)
+    return f"{root}-{hashlib.sha256(scope.encode('utf-8')).hexdigest()[:12]}{ext or '.json'}"
+
+
 class Orchestrator:
     def __init__(self, settings: Optional[Settings] = None, ledger: Optional[QuotaLedger] = None):
         self.settings = settings or get_settings()
@@ -40,10 +50,10 @@ class Orchestrator:
 
     # ---------- pipeline ----------
 
-    def run(self, goal: str, repo_path: Optional[str] = None) -> Dict:
-        """Execute a goal end-to-end. Returns a report dict."""
+    def run(self, goal: str, repo_path: Optional[str] = None, project_scope: str = "") -> Dict:
+        """Execute a goal end-to-end. Returns a report dict. ``project_scope`` keeps task memory private per visitor."""
         s = self.settings
-        memory = TaskMemory(os.path.join(s.memory_path), goal=goal)
+        memory = TaskMemory(memory_path_for(s.memory_path, project_scope), goal=goal)
         repo_path = os.path.abspath(repo_path) if repo_path else None
 
         # 1) repo context (only when a repo is attached)

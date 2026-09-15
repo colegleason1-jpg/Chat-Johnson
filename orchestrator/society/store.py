@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS companies (
     kind TEXT NOT NULL DEFAULT 'studio', vision TEXT NOT NULL DEFAULT '', core_values TEXT NOT NULL DEFAULT '[]',
     core_focus TEXT NOT NULL DEFAULT '', ten_year TEXT NOT NULL DEFAULT '', three_year TEXT NOT NULL DEFAULT '',
     one_year TEXT NOT NULL DEFAULT '', interval_s INTEGER NOT NULL DEFAULT 21600, daily_share REAL NOT NULL DEFAULT 0.35,
-    status TEXT NOT NULL DEFAULT 'active', created_at REAL NOT NULL, UNIQUE (project_scope, key)
+    status TEXT NOT NULL DEFAULT 'active', created_at REAL NOT NULL, wave_size INTEGER NOT NULL DEFAULT 6, UNIQUE (project_scope, key)
 );
 CREATE TABLE IF NOT EXISTS departments (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_scope TEXT NOT NULL, company_id INTEGER NOT NULL, key TEXT NOT NULL,
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS timeline (
 CREATE TABLE IF NOT EXISTS catalog (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_scope TEXT NOT NULL, company_id INTEGER NOT NULL, key TEXT NOT NULL,
     title TEXT NOT NULL, field TEXT NOT NULL DEFAULT 'literature', logline TEXT NOT NULL DEFAULT '',
-    stage TEXT NOT NULL DEFAULT 'backlog', release_wave INTEGER NOT NULL DEFAULT 2, artifact_id INTEGER
+    stage TEXT NOT NULL DEFAULT 'backlog', release_wave INTEGER NOT NULL DEFAULT 2, artifact_id INTEGER, brief TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS work_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_scope TEXT NOT NULL, company_id INTEGER NOT NULL, cycle_id INTEGER,
@@ -363,6 +363,76 @@ def fill_open_seats(project_scope: str, company_id: Optional[int] = None, active
                       reason=("woken from exploration: " + str(agent.get("interest") or "")[:120]) if woken else "graduate filled an open seat", approved_by="ceo")
         hired.append({"seat": seat, "agent": agent, "woken": woken})
     return hired
+
+
+# ---- roles edited by the board ----------------------------------------------------------
+
+def parse_roles(text: Any) -> List[str]:
+    """'a; b, c' or a JSON list -> ['a', 'b', 'c'] (3-8 short roles, deduplicated)."""
+    if isinstance(text, (list, tuple)):
+        items = [str(t) for t in text]
+    else:
+        raw = str(text or "")
+        parsed = load_json(raw, None) if raw.strip().startswith("[") else None
+        items = [str(t) for t in parsed] if isinstance(parsed, list) else raw.replace(",", ";").split(";")
+    out: List[str] = []
+    for item in items:
+        clean = item.strip()[:120]
+        if clean and clean.lower() not in {o.lower() for o in out}:
+            out.append(clean)
+    return out[:8]
+
+
+def parse_kpis(text: Any) -> Dict[str, float]:
+    """'deliverables=1; review_pass_rate=0.6' or a JSON object -> {'deliverables': 1.0, ...}; unknown text is dropped."""
+    if isinstance(text, dict):
+        pairs = list(text.items())
+    else:
+        raw = str(text or "")
+        parsed = load_json(raw, None) if raw.strip().startswith("{") else None
+        if isinstance(parsed, dict):
+            pairs = list(parsed.items())
+        else:
+            pairs = []
+            for chunk in raw.replace(",", ";").split(";"):
+                key, sep, value = chunk.partition("=")
+                if not sep:
+                    key, sep, value = chunk.partition(":")
+                if sep:
+                    pairs.append((key, value))
+    out: Dict[str, float] = {}
+    for key, value in pairs:
+        name = str(key).strip().lower().replace(" ", "_")[:40]
+        try:
+            number = float(str(value).strip())
+        except ValueError:
+            continue
+        if name and number >= 0:
+            out[name] = number
+    return out
+
+
+def format_kpis(kpis: Any) -> str:
+    return "; ".join(f"{k}={v:g}" for k, v in dict(load_json(kpis, {}) if isinstance(kpis, str) else (kpis or {})).items())
+
+
+def add_seat(project_scope: str, company_id: int, title: str, department_id: Optional[int], reports_to: Optional[int],
+             roles: Any, kpis: Any = None, importance: int = 3, key: str = "") -> int:
+    """A new open seat the board asked for; graduates fill it on the next ``fill_open_seats``."""
+    clean_title = str(title).strip()[:120]
+    if not clean_title:
+        raise ValueError("a seat needs a title")
+    seat_key = (key or "".join(ch if ch.isalnum() else "_" for ch in clean_title.lower()).strip("_"))[:60] or "seat"
+    taken = {s["key"] for s in seats_for(project_scope, company_id)}
+    candidate, n = seat_key, 2
+    while candidate in taken:
+        candidate, n = f"{seat_key}_{n}", n + 1
+    return insert(
+        "seats", project_scope, company_id=int(company_id), department_id=int(department_id) if department_id else None,
+        key=candidate, title=clean_title, roles=parse_roles(roles) or ["do the work the board describes"],
+        kpis=parse_kpis(kpis) or {"deliverables": 1}, importance=max(1, min(5, int(importance))), status="open",
+        reports_to=int(reports_to) if reports_to else None,
+    )
 
 
 def unseat_agent(project_scope: str, seat_id: int, note: str = "", fired: bool = False) -> None:
