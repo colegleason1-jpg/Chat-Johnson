@@ -402,3 +402,10 @@ pytest -q
 ```
 
 CI runs the same lint, compile, and test steps on every push and pull request.
+
+## License
+
+Proprietary. Copyright (c) 2026 Cole Gleason, all rights reserved. Using, running, copying, modifying,
+distributing, or training on this repository or any part of it requires the copyright holder's prior
+written permission; no license is granted by publishing it. See [LICENSE](LICENSE) for the terms and
+how to ask. Third-party packages keep their own licenses.

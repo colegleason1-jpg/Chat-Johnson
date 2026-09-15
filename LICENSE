@@ -1,0 +1,27 @@
+Chat Johnson Master Studio
+Copyright (c) 2026 Cole Gleason. All rights reserved.
+
+This repository and everything in it (source code, documentation, prompts, designs, data files,
+and the ideas they describe) are proprietary. No license is granted.
+
+Without the prior written permission of the copyright holder you may not:
+
+- use, run, or deploy this software or any part of it;
+- copy, modify, translate, or create derivative works from it;
+- distribute, sublicense, sell, rent, or otherwise make it available to anyone;
+- train, fine-tune, or evaluate machine-learning systems on its contents.
+
+Viewing the repository on GitHub is permitted only to the extent GitHub's terms of service require
+it for a public repository; that permission covers viewing, nothing more.
+
+To ask for permission, contact the copyright holder: Cole Gleason (colegleason1@gmail.com). Any
+permission granted applies only to the person, purpose, and period named in the written grant and
+can be withdrawn at any time.
+
+Third-party packages listed in requirements.txt and requirements-dynamics.txt remain under their own
+licenses; nothing here changes those terms.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
