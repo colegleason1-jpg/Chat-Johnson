@@ -136,6 +136,14 @@
   and runner-up disagreements between sends made at gain > 0 and at gain 0. Run a week at each
   setting before changing the bounds; `docs/MONTE_CARLO_PROCTOR.md` lists the next candidates.
 
+## Monte Carlo proctor
+- Routing expander → *Run routing fragility report*: win rates per endpoint at x1/x2/x4 chaos for a
+  task type, the deterministic winner's fragility, outliers. A blocked or unkeyed endpoint never wins.
+- The budget forecast table renders on every open of the expander: per keyed vendor, tokens used and
+  left, today's rate, the probability of capping, the median and early-tail cap hour (UTC). The society
+  tick logs `deferred: …` in its cycle row when the forecast made it skip company and academy cycles;
+  leisure still runs on its own budget. Tune with `proctor.DEFER_PROBABILITY` and `DEFER_HORIZON_HOURS`.
+
 ## Long-distance memory index
 - `recall_index` is an FTS5 table rebuilt automatically once for an older vault; `vault.rebuild_recall_index(scope)`
   rebuilds it by hand after a restore. Lines decay with a 30-day half-life; migration marks the old

@@ -39,7 +39,7 @@ def test_route_log_keeps_the_counterfactual_and_takes_a_verdict(db):
     stats = {r["route"]: r for r in vault.route_stats(db)}
     assert stats["groq/gpt-oss-120b"]["up"] == 1 and stats["google_ai_studio/gemini"]["locked"] == 1
     csv = vault.routes_csv(db)
-    assert csv.splitlines()[0].endswith(",runner_up,chaos_gain,chaos_profile,jitter,outcome") and ",google_ai_studio,0.25,pink,0.0123,up" in csv
+    assert ",runner_up,chaos_gain,chaos_profile,jitter,outcome" in csv.splitlines()[0] and ",google_ai_studio,0.25,pink,0.0123,up" in csv
     comparison = {r["setting"]: r for r in vault.chaos_comparison(db)}
     assert comparison["chaos on"]["sends"] == 1 and comparison["chaos on"]["good_rate"] == 1.0 and comparison["chaos on"]["runner_up_differs"] == 1
     assert comparison["chaos off"]["sends"] == 2 and comparison["chaos off"]["failed"] == 1 and comparison["chaos off"]["truncated"] == 1 and comparison["chaos off"]["locked"] == 1

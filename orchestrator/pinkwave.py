@@ -188,6 +188,16 @@ def current() -> Optional[Chaos]:
     return _ACTIVE.get()
 
 
+class suspended:
+    """``with pinkwave.suspended():`` runs a block with no active wave (the proctor simulates its own realizations)."""
+
+    def __enter__(self) -> None:
+        self._token = _ACTIVE.set(None)
+
+    def __exit__(self, *exc: object) -> None:
+        _ACTIVE.reset(self._token)
+
+
 def for_scope(project_scope: str) -> Chaos:
     """The active wave when it belongs to this scope, else a fresh one for the scope."""
     active = _ACTIVE.get()

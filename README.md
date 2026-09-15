@@ -52,6 +52,7 @@ approved reconstruction plan.
 | `orchestrator/envsafe.py` | Minimal environment for child processes; the self-hosted switch |
 | `orchestrator/memory.py` | Task memory persisted to disk (one file per project scope) |
 | `orchestrator/pinkwave.py` | Controlled chaos: the 1/f signal walked per use at three frequency profiles; bounded nudges for routing, Heavy Mode, recall, digests |
+| `orchestrator/proctor.py` | Monte Carlo proctor: routing fragility over pink-wave realizations, bursty budget forecast, the tick's deferral rule |
 | `orchestrator/society/` | Two companies on Traction/EOS (cycles, EOS scorecard, release waves, manuscripts) and the agent society (academy, tick, leisure) |
 | `research/project_seth_phase3.py` | Project Seth Phase 3 distribution and bias-sweep engine (research only) |
 | `docs/` | Bible, recovery audit, implementation plan, strategic outline |
@@ -291,6 +292,14 @@ HTTP status, key fingerprint, and any auto-switch. Probes count toward the vendo
   cold critique, base synthesis); the long-distance recall share and the digest's cross-chat section
   grow with the wave. Gain and profiles are per project (sidebar → Controlled chaos) and shared with
   the worker; gain 0 is fully deterministic. A bounded signal, never an optimization claim.
+- **Monte Carlo proctor** (`orchestrator/proctor.py`): statistics a single run cannot give, never a
+  decision by itself. *Routing fragility* re-runs Cortex 2 over 64 pink-wave realizations at 1×, 2×,
+  and 4× chaos and reports each endpoint's win rate, the deterministic winner's fragility, and the
+  outliers that only win under amplification; a cached per-minute fragility rides every send into the
+  outcome log. *Budget forecast* simulates the rest of the UTC day as 1/f-bursty demand around today's
+  rate per keyed vendor (probability of capping, median and early-tail cap hour); the society tick
+  defers its cycles when every keyed vendor is out of headroom or likely to cap within the hour. Both
+  are CPU only, on demand under the routing expander. `docs/MONTE_CARLO_PROCTOR.md` ranks the rest.
 - **Legacy providers** (NVIDIA NIM, OpenRouter, Cerebras, Mistral) are a fallback only: they serve a
   request when no Cortex key (Gemini, Groq, Hugging Face) is set or when every Cortex endpoint fails
   it. Their retries, sibling-model attempts, and rediscovery calls are metered like everything else.

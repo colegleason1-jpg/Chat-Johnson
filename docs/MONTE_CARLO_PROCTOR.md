@@ -1,8 +1,10 @@
 # The Monte Carlo proctor · analysis before optimization
 
-Status: analysis, September 2026. Nothing in this document is built yet except where a section says
-so. It exists because the operator asked for the pink-wave math to be pushed further, and for the
-out-of-the-box uses to be analyzed before anything is optimized.
+Status: analysis, September 2026, with uses 1 and 2 built the same day (`orchestrator/proctor.py`:
+`simulate_routing`, `cached_fragility`, `forecast_budget`, `forecast_vendors`, `should_defer`; the
+society tick defers cycles on the forecast; the routing expander shows both reports; the outcome log
+carries a per-send `fragility`). It exists because the operator asked for the pink-wave math to be
+pushed further, and for the out-of-the-box uses to be analyzed before anything is optimized.
 
 ## What exists today, stated plainly
 
@@ -36,8 +38,8 @@ spread of outcomes*, and *which rare cases deserve a look*.
 
 | # | Use case | What the proctor computes | Cost | Value | Verdict |
 |---|---|---|---|---|---|
-| 1 | **Routing fragility** | For each request, N = 64 realizations of the penalty with the jitter amplified 1× to 4×; per endpoint, its win rate. Fragility = 1 − win rate of the deterministic winner. Outlier = an endpoint that wins under amplification but never at production gain. | CPU only, ~2 ms | Tells you *when* the wave can matter at all. Today's endpoint table is not fragile (gaps 0.15 to 0.5), so this will mostly report "robust", which is itself a result. Becomes decisive once telemetry penalties or a local model bring endpoints close. | **Build first.** Cheap, uses the math fully, feeds the outcome log a `fragility` column. |
-| 2 | **Budget forecast with bursty demand** | Model the day's token demand as 1/f-correlated (bursts cluster, as real usage does), N = 256 paths from the persisted counters, per vendor: P50 and P90 of the hour the daily cap is hit. | CPU only | Real operational value on free tiers: the society tick can schedule cycles into forecast headroom and the sidebar can warn "Gemini likely capped by 18:00 UTC". Outliers = paths that cap early; those are the bursts to smooth. | **Build second.** The first place the math changes a real decision (when a cycle runs). |
+| 1 | **Routing fragility** | For each request, N = 64 realizations of the penalty with the jitter amplified 1× to 4×; per endpoint, its win rate. Fragility = 1 − win rate of the deterministic winner. Outlier = an endpoint that wins under amplification but never at production gain. | CPU only, ~2 ms | Tells you *when* the wave can matter at all. Today's endpoint table is not fragile (gaps 0.15 to 0.5), so this will mostly report "robust", which is itself a result. Becomes decisive once telemetry penalties or a local model bring endpoints close. | **Built.** `simulate_routing`; `cached_fragility` (24 paths, once a minute per task type) fills the outcome log's `fragility` column and the chaos table's `mean_fragility`. |
+| 2 | **Budget forecast with bursty demand** | Model the day's token demand as 1/f-correlated (bursts cluster, as real usage does), N = 256 paths from the persisted counters, per vendor: P50 and P10 (early tail) of the hour the daily cap is hit. | CPU only | Real operational value on free tiers: the society tick can schedule cycles into forecast headroom and the sidebar can warn "Gemini likely capped by 18:00 UTC". Outliers = paths that cap early; those are the bursts to smooth. | **Built.** `forecast_budget`, `forecast_vendors`, `should_defer`; the tick skips company and academy cycles (and logs why) when every keyed vendor is out of headroom or likely to cap within the hour. |
 | 3 | **Timeline forecast for waves** | Per work, simulate cycle outcomes (advance / stall / return) with rates taken from the cycle log, N = 512 paths; per milestone, the probability of landing by its due date; outliers = works whose P90 misses the wave. | CPU only | Turns "timeline drift" from a static due-date check into a probability the board can act on. Needs a few weeks of cycle history to be meaningful. | Build when the studio has run for two weeks. |
 | 4 | **Heavy Mode candidate spread** | K = 3 drafts at temperatures spread by the wave; pick by critique agreement; outliers = drafts the critique rates far above the rest. | **3× draft tokens** | Genuine quality upside, but it spends the one resource this project protects. Only defensible in an explicit "explore" send, never by default. | Optional toggle, off by default; measure with thumbs before keeping. |
 | 5 | **Memory serendipity** | One extra recalled line per prompt drawn from low-rank but novel matches, chosen by the wave; the outcome log says whether prompts with a serendipity line score better. | Free | Cheap experiment with a clean measurement. Small expected effect. | Build after 1 and 2, as a flagged experiment. |
@@ -59,7 +61,7 @@ Every candidate ships with its measurement or does not ship:
    failures, truncations, and latency between the feature on and off over at least a week of use.
 3. The bounds stay: a proctor result may *narrow* a choice or *warn*; it never widens a hard limit.
 
-## Proposed shape of the proctor (not built)
+## Shape of the proctor (1 and 2 built; 3 proposed)
 
 ```
 orchestrator/proctor.py

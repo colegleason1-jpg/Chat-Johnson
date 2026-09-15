@@ -51,7 +51,8 @@ from orchestrator.discovery import vendor_for
 from orchestrator.envsafe import self_hosted
 from orchestrator.errors import plain_error
 from orchestrator.executor import Orchestrator
-from orchestrator import pinkwave
+from orchestrator import pinkwave, proctor
+from orchestrator.society import economy as society_economy
 from orchestrator import mission_runner  # noqa: F401  (registers the mission job handler)
 from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner, secrets_deliverable
 from orchestrator import society
@@ -1095,7 +1096,7 @@ def thread_mission(thread: sqlite3.Row) -> str:
 
 def log_route(
     workspace: Optional[str], task_type: str, route: str, mode: str, started: float, reason: str, finish: str = "",
-    decision: Optional[RouteDecision] = None, message_id: Optional[int] = None,
+    decision: Optional[RouteDecision] = None, message_id: Optional[int] = None, fragility: Optional[float] = None,
 ) -> None:
     """Trace of every send (what was asked, where it went, how long, how it ended, why): session table plus the vault.
 
@@ -1121,7 +1122,7 @@ def log_route(
         record_route(
             str(st.session_state.get("project_scope", "chat-johnson")), workspace or "", task_type, route, mode, elapsed_ms, finish, reason,
             runner_up=getattr(decision, "runner_up", "") if decision is not None else "",
-            chaos=getattr(decision, "chaos", None) if decision is not None else None, message_id=message_id,
+            chaos=getattr(decision, "chaos", None) if decision is not None else None, message_id=message_id, fragility=fragility,
         )
     except Exception:  # telemetry must never break a send
         pass
@@ -1257,7 +1258,8 @@ def run_generation(
         workspace=workspace,
         task_type=task_type,
     )
-    log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish, decision=decision, message_id=assistant_id)
+    fragility = proctor.cached_fragility(task_type, sum(len(str(m.get("content", ""))) for m in messages) // 4 + max_tokens, ledger) if cortex_available() else None
+    log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish, decision=decision, message_id=assistant_id, fragility=fragility)
     with st.chat_message("assistant"):
         applied = [skill.name for skill in select_skills(clean_prompt)]
         st.caption(f"{decision.provider}/{decision.model} · {task_type} · {mode}" + (f" · skills: {', '.join(applied)}" if applied else ""))
@@ -2430,6 +2432,31 @@ def render_routing_log() -> None:
         )
     else:
         st.caption("Once sends exist, this compares chaos on against chaos off on outcomes: thumbs, locked artifacts, failures, latency.")
+    st.markdown("#### Monte Carlo proctor")
+    st.caption(
+        "Statistics a single run cannot give. Fragility: how often the deterministic endpoint loses across pink-wave realizations "
+        "at production strength and amplified; an outlier is an endpoint that only wins when the chaos is amplified. Budget forecast: "
+        "the rest of the UTC day simulated as bursty 1/f demand around today's rate; the society tick waits when every keyed vendor is likely to cap within the hour."
+    )
+    if cortex_available():
+        left, right = st.columns([0.6, 0.4])
+        sim_task = left.selectbox("Task type to simulate", list(TASK_TYPES), key="proctor_task")
+        if right.button("Run routing fragility report", key="proctor_run", use_container_width=True):
+            try:
+                report = proctor.simulate_routing(str(sim_task), int(st.session_state.get("max_tokens", 2048)) + 1_500, ledger=get_quota_ledger())
+                st.session_state["proctor_report"] = report
+            except Exception as exc:
+                st.warning(plain_error(exc))
+        report = st.session_state.get("proctor_report")
+        if report is not None:
+            st.caption(report.summary() + f" · {report.ms} ms")
+            st.dataframe(report.rows(), hide_index=True, use_container_width=True)
+        forecasts = proctor.forecast_vendors(get_quota_ledger(), society_economy.keyed_vendors())
+        if forecasts:
+            st.dataframe([f.row() for f in forecasts], hide_index=True, use_container_width=True)
+            st.caption("p10 is the early tail (one path in ten caps by then); early cappers are paths that cap two hours before the median: the bursts to smooth.")
+    else:
+        st.caption("Add a Cortex key (Gemini, Groq, or Hugging Face) to simulate routing and forecast the day's budget.")
     if recent_routes(scope, limit=1):
         st.download_button(
             "⬇ Routing log (.csv, up to 5000 rows)", data=routes_csv(scope), file_name=f"routing-log-{scope}.csv", mime="text/csv",

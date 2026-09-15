@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .. import vault
+from .. import proctor, vault
 from ..jobs import ACTIVE_STATUSES, JobCancelled, JobContext, enqueue, register_handler
 from . import academy, cycles, economy, leisure, store
 
@@ -62,13 +62,17 @@ def society_tick(ctx: JobContext) -> Dict[str, Any]:
     academy_interval = float(payload.get("academy_interval_s") or DEFAULT_ACADEMY_INTERVAL_S)
     now = time.time()
     queued: List[str] = []
-    # Companies whose interval has passed and that have no cycle queued or running.
+    call_tokens = int(payload.get("call_tokens") or cycles.DEFAULT_CALL_TOKENS)
+    deferred = budget_deferral(ctx.ledger, call_tokens)
+    # Companies whose interval has passed and that have no cycle queued or running, unless the budget forecast says wait.
     for company in store.companies_for(scope):
         cid = int(company["id"])
+        if deferred:
+            break
         if _due(scope, "company", cid, float(company["interval_s"]), now) and not _company_job_active(scope, cid):
-            cycles.run_now(scope, cid, ctx.secrets, mode=mode, call_tokens=int(payload.get("call_tokens") or cycles.DEFAULT_CALL_TOKENS), chain=False)
+            cycles.run_now(scope, cid, ctx.secrets, mode=mode, call_tokens=call_tokens, chain=False)
             queued.append(company["name"])
-    if store.agents_for(scope) and _due(scope, "academy", None, academy_interval, now) and not _academy_job_active(scope):
+    if not deferred and store.agents_for(scope) and _due(scope, "academy", None, academy_interval, now) and not _academy_job_active(scope):
         academy.run_now(scope, ctx.secrets, mode=mode, call_tokens=min(int(payload.get("call_tokens") or 900), 900), chain=False)
         queued.append("academy")
     # Leisure runs inline: a few agents explore per tick, only while the leisure share can afford a call.
@@ -91,9 +95,19 @@ def society_tick(ctx: JobContext) -> Dict[str, Any]:
     store.finish_cycle(cycle_id, status, budget.tokens, budget.calls, [{"step": "leisure", "explored": explored, "queued": queued}])
     next_run_after = now + max(60.0, interval)
     next_job = enqueue(scope, KIND_TICK, {k: v for k, v in payload.items() if k != "chained_from"} | {"chained_from": ctx.job_id}, ctx.secrets, run_after=next_run_after)
-    store.insert("cycles", scope, kind="tick", company_id=None, job_id=ctx.job_id, started_at=now, finished_at=time.time(), tokens_planned=0, tokens_used=budget.tokens, calls=budget.calls, log=[{"queued": queued, "explored": len(explored)}], next_run_after=next_run_after, status="done")
-    ctx.progress(step=1, total=1, text=f"Tick: queued {', '.join(queued) or 'nothing'}; {len(explored)} agent(s) explored")
-    return {"queued": queued, "explored": explored, "next_job": next_job, "next_run_after": next_run_after, "calls": budget.calls, "tokens": budget.tokens}
+    store.insert("cycles", scope, kind="tick", company_id=None, job_id=ctx.job_id, started_at=now, finished_at=time.time(), tokens_planned=0, tokens_used=budget.tokens, calls=budget.calls, log=[{"queued": queued, "explored": len(explored), "deferred": deferred}], next_run_after=next_run_after, status="done")
+    ctx.progress(step=1, total=1, text=f"Tick: queued {', '.join(queued) or 'nothing'}; {len(explored)} agent(s) explored" + (f"; {deferred}" if deferred else ""))
+    return {"queued": queued, "explored": explored, "next_job": next_job, "next_run_after": next_run_after, "calls": budget.calls, "tokens": budget.tokens, "deferred": deferred}
+
+
+def budget_deferral(ledger: Any, call_tokens: int, calls_per_cycle: int = 8) -> str:
+    """The forecast's reason to wait (empty to proceed): every keyed vendor is out of headroom or likely to cap within the hour."""
+    try:
+        reports = proctor.forecast_vendors(ledger, economy.keyed_vendors())
+        defer, note = proctor.should_defer(reports, int(call_tokens) * int(calls_per_cycle))
+    except Exception:  # the forecast never blocks the scheduler
+        return ""
+    return note if defer else ""
 
 
 def start_tick(scope: str, secrets: Dict[str, str], mode: str = "normal", interval_s: float = DEFAULT_INTERVAL_S, academy_interval_s: float = DEFAULT_ACADEMY_INTERVAL_S, leisure_cap: int = leisure.MAX_PER_TICK, custom_sources: Optional[List[Dict[str, Any]]] = None, call_tokens: int = cycles.DEFAULT_CALL_TOKENS) -> int:

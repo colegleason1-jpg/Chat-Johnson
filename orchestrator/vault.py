@@ -132,7 +132,8 @@ CREATE TABLE IF NOT EXISTS route_log (
     chaos_profile TEXT NOT NULL DEFAULT '',
     jitter REAL NOT NULL DEFAULT 0,
     outcome TEXT NOT NULL DEFAULT '',
-    message_id INTEGER
+    message_id INTEGER,
+    fragility REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_route_log_scope_time
@@ -255,7 +256,7 @@ def initialize_database() -> None:
         _ensure_column(connection, "catalog", "brief", "TEXT NOT NULL DEFAULT ''")
         for column, ddl in (
             ("runner_up", "TEXT NOT NULL DEFAULT ''"), ("chaos_gain", "REAL NOT NULL DEFAULT 0"), ("chaos_profile", "TEXT NOT NULL DEFAULT ''"),
-            ("jitter", "REAL NOT NULL DEFAULT 0"), ("outcome", "TEXT NOT NULL DEFAULT ''"), ("message_id", "INTEGER"),
+            ("jitter", "REAL NOT NULL DEFAULT 0"), ("outcome", "TEXT NOT NULL DEFAULT ''"), ("message_id", "INTEGER"), ("fragility", "REAL"),
         ):
             _ensure_column(connection, "route_log", column, ddl)
         _ensure_recall_index(connection)
@@ -1302,7 +1303,7 @@ ROUTE_OUTCOMES = ("up", "down", "locked")
 
 def record_route(
     project_scope: str, workspace: str, task_type: str, route: str, mode: str, ms: int, finish: str = "", reason: str = "",
-    runner_up: str = "", chaos: Optional[Mapping[str, Any]] = None, message_id: Optional[int] = None,
+    runner_up: str = "", chaos: Optional[Mapping[str, Any]] = None, message_id: Optional[int] = None, fragility: Optional[float] = None,
 ) -> int:
     """One row per send: where it went, how long it took, how it ended, why the solver chose it, what it would have chosen
     otherwise (``runner_up``), and the pink-wave state (``chaos``: gain, profile, jitter); ``message_id`` lets an outcome
@@ -1313,13 +1314,13 @@ def record_route(
         cursor = connection.execute(
             """
             INSERT INTO route_log (timestamp, project_scope, workspace, task_type, route, mode, ms, finish, reason,
-                                   runner_up, chaos_gain, chaos_profile, jitter, message_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   runner_up, chaos_gain, chaos_profile, jitter, message_id, fragility)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (time.time(), scope, (workspace or "")[:40], (task_type or "")[:40], (route or "")[:120], (mode or "normal")[:40],
              max(0, int(ms)), (finish or "")[:40], redact_secrets(reason or "")[:300], str(runner_up or "")[:120],
              float(chaos.get("gain", 0.0) or 0.0), str(chaos.get("profile", "") or "")[:20], float(chaos.get("jitter", 0.0) or 0.0),
-             int(message_id) if message_id is not None else None),
+             int(message_id) if message_id is not None else None, float(fragility) if fragility is not None else None),
         )
         connection.commit()
         return int(cursor.lastrowid)
@@ -1345,8 +1346,10 @@ def chaos_comparison(project_scope: str, hours: float = 168.0) -> List[Dict[str,
     for row in rows:
         keys = row.keys()
         gain = float(row["chaos_gain"]) if "chaos_gain" in keys and row["chaos_gain"] is not None else 0.0
-        bucket = buckets.setdefault("chaos on" if gain > 0 else "chaos off", {"sends": 0, "failed": 0, "truncated": 0, "ms": [], "up": 0, "down": 0, "locked": 0, "runner_up_differs": 0})
+        bucket = buckets.setdefault("chaos on" if gain > 0 else "chaos off", {"sends": 0, "failed": 0, "truncated": 0, "ms": [], "up": 0, "down": 0, "locked": 0, "runner_up_differs": 0, "fragility": []})
         bucket["sends"] += 1
+        if "fragility" in keys and row["fragility"] is not None:
+            bucket["fragility"].append(float(row["fragility"]))
         bucket["failed"] += int(str(row["route"]) == "failed")
         bucket["truncated"] += int(str(row["finish"]) == "length")
         bucket["ms"].append(int(row["ms"]))
@@ -1367,6 +1370,7 @@ def chaos_comparison(project_scope: str, hours: float = 168.0) -> List[Dict[str,
             "up": bucket["up"], "down": bucket["down"], "locked": bucket["locked"],
             "good_rate": round((bucket["up"] + bucket["locked"]) / sends, 3), "down_rate": round(bucket["down"] / sends, 3),
             "runner_up_differs": bucket["runner_up_differs"],
+            "mean_fragility": round(sum(bucket["fragility"]) / len(bucket["fragility"]), 3) if bucket["fragility"] else None,
         })
     return out
 
@@ -1426,13 +1430,13 @@ def route_stats(project_scope: str, hours: float = 24.0) -> List[Dict[str, Any]]
 
 
 def routes_csv(project_scope: str, limit: int = 5000) -> str:
-    header = "id,timestamp_utc,workspace,task_type,route,mode,ms,finish,reason,runner_up,chaos_gain,chaos_profile,jitter,outcome"
+    header = "id,timestamp_utc,workspace,task_type,route,mode,ms,finish,reason,runner_up,chaos_gain,chaos_profile,jitter,outcome,fragility"
     lines = [header]
     for row in reversed(recent_routes(project_scope, limit=limit)):
         keys = row.keys()
         reason = str(row["reason"]).replace('"', "'").replace("\n", " ")
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(row["timestamp"])))
-        extra = ",".join(str(row[k] if k in keys and row[k] is not None else "") for k in ("runner_up", "chaos_gain", "chaos_profile", "jitter", "outcome"))
+        extra = ",".join(str(row[k] if k in keys and row[k] is not None else "") for k in ("runner_up", "chaos_gain", "chaos_profile", "jitter", "outcome", "fragility"))
         lines.append(f"{row['id']},{stamp},{row['workspace']},{row['task_type']},{row['route']},{row['mode']},{row['ms']},{row['finish']},\"{reason}\",{extra}")
     return "\n".join(lines) + "\n"
 
