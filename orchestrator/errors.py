@@ -15,6 +15,9 @@ from .vault import redact_secrets
 _STATUS_RE = re.compile(r"HTTP (\d{3})")
 _WAIT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*s(?:ec|econds)?\b", re.I)
 _VENDOR_RE = re.compile(r"^(google_ai_studio|groq|huggingface|gemini|nvidia|openrouter|cerebras|mistral|paid slot)\b", re.I)
+# generate_mode wraps a Cortex failure with the legacy fallback's failure; the Cortex part is the cause.
+_CORTEX_PART_RE = re.compile(r"strict Cortex routing failed \((.*)\); legacy provider fallback failed", re.S)
+_CEILING_RE = re.compile(r"needs ~(\d+) tokens but the ceiling is (\d+) TPM")
 
 
 def _status_of(exc: BaseException) -> Optional[int]:
@@ -27,18 +30,35 @@ def _status_of(exc: BaseException) -> Optional[int]:
 
 def plain_error(exc: BaseException) -> str:
     """One sentence saying what went wrong and what to do; never the raw vendor body."""
-    text = str(exc)
+    return _explain(str(exc), _status_of(exc))
+
+
+def _explain(text: str, status: Optional[int]) -> str:
+    inner = _CORTEX_PART_RE.search(text)
+    if inner:
+        # The legacy pool reads environment keys only, so its "no provider has a key" is not the
+        # operator's problem when session keys are set; explain what stopped the Cortex route.
+        part = inner.group(1)
+        match = _STATUS_RE.search(part)
+        return _explain(part, int(match.group(1)) if match else None)
     lower = text.lower()
     vendor_match = _VENDOR_RE.search(text)
     vendor = vendor_match.group(1) if vendor_match else "the provider"
-    status = _status_of(exc)
     if "no byok key configured" in lower or "no provider keys" in lower or "no legacy provider available" in lower:
         return "No API key is set for this request: paste a free-tier key in the sidebar (API keys) and try again."
     if "daily cap" in lower:
         wait = re.search(r"resets in about (\d+) h", text)
         when = f" in about {wait.group(1)} h" if wait else " at midnight UTC"
         return f"The daily token cap is reached for every keyed vendor; it resets{when}. Add another vendor's key or raise CHAT_JOHNSON_DAILY_<VENDOR> on your own host."
-    if "no headroom" in lower or "headroom" in lower and "found no" in lower:
+    ceilings = _CEILING_RE.findall(text)
+    if ceilings and "requests used" not in lower and "would exceed" not in lower:
+        needed = max(int(need) for need, _ in ceilings)
+        widest = max(int(ceiling) for _, ceiling in ceilings)
+        return (
+            f"This request is too large for every keyed vendor's per-minute window (~{needed} tokens with the output budget; "
+            f"the widest keyed window is {widest} TPM): lower the output token budget in the sidebar, or start a fresh chat."
+        )
+    if "no headroom" in lower or "headroom" in lower and "found no" in lower or "requests used in the last minute" in lower:
         wait = _WAIT_RE.search(text)
         when = f" about {int(float(wait.group(1)))} s" if wait else " a minute"
         return f"Every keyed provider is inside its free-tier window; wait{when} and send again (the app paces missions automatically)."

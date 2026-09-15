@@ -151,7 +151,7 @@ CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
         base_url="https://generativelanguage.googleapis.com/v1beta",
         kind="gemini",
         model="gemini-3.6-flash",
-        rpm_limit=2,
+        rpm_limit=5,  # half of the published Flash free-tier 10 RPM; a 429 still backs off. CHAT_JOHNSON_RPM_GEMINI overrides.
         tpm_limit=32_000,
         speed_score=0.48,
         context_score=1.00,
@@ -522,6 +522,20 @@ def _vendor(endpoint: "CortexEndpoint") -> str:
     return discovery.vendor_for(endpoint.name)
 
 
+def effective_rpm(endpoint: "CortexEndpoint") -> int:
+    """The endpoint's requests-per-minute ceiling: ``CHAT_JOHNSON_RPM_<VENDOR>`` (session or environment) over the table."""
+    override = resolve_secret(f"CHAT_JOHNSON_RPM_{_vendor(endpoint).upper()}")
+    return int(override) if override.isdigit() and int(override) > 0 else int(endpoint.rpm_limit)
+
+
+def effective_tpm(endpoint: "CortexEndpoint") -> Optional[int]:
+    """The endpoint's tokens-per-minute ceiling: ``CHAT_JOHNSON_TPM_<VENDOR>`` over the table; 0 means uncapped (None)."""
+    override = resolve_secret(f"CHAT_JOHNSON_TPM_{_vendor(endpoint).upper()}")
+    if override.isdigit():
+        return int(override) or None
+    return endpoint.tpm_limit
+
+
 def _ensure_cortex_ledger(ledger: Optional[QuotaLedger]) -> None:
     """Register each Cortex endpoint's vendor bucket, tightening to the stricter policy.
 
@@ -532,10 +546,11 @@ def _ensure_cortex_ledger(ledger: Optional[QuotaLedger]) -> None:
     if ledger is None:
         return
     for endpoint in CORTEX_ENDPOINTS.values():
+        tpm = effective_tpm(endpoint)
         ledger.tighten(
             _vendor(endpoint),
-            endpoint.rpm_limit,
-            endpoint.tpm_limit if endpoint.tpm_limit is not None else 10**9,
+            effective_rpm(endpoint),
+            tpm if tpm is not None else 10**9,
         )
 
 
@@ -623,10 +638,11 @@ def prompt_context_chars(max_tokens: int) -> int:
     for endpoint in CORTEX_ENDPOINTS.values():
         if not _endpoint_key(endpoint):
             continue
-        if endpoint.tpm_limit is None:
+        tpm = effective_tpm(endpoint)
+        if tpm is None:
             uncapped = True  # an uncapped keyed endpoint takes the whole default window
             continue
-        room = 4 * (int(endpoint.tpm_limit) - int(max_tokens) - CONTEXT_RESERVE_TOKENS)
+        room = 4 * (int(tpm) - int(max_tokens) - CONTEXT_RESERVE_TOKENS)
         widest = room if widest is None else max(widest, room)
     cap = DEFAULT_CONTEXT_CHARS if uncapped or widest is None else widest
     return max(MIN_CONTEXT_CHARS, min(DEFAULT_CONTEXT_CHARS, cap))
@@ -654,13 +670,58 @@ def repository_context_chars(max_tokens: int) -> int:
 
 
 def cortex_wait_seconds(ledger: Optional[QuotaLedger], messages: Sequence[Mapping[str, str]], max_tokens: int) -> float:
-    """Seconds until some keyed Cortex endpoint has RPM/TPM headroom for this request; 0 when one has it now."""
+    """Seconds until some keyed Cortex endpoint has RPM/TPM headroom for this request; 0 when one has it now.
+
+    An endpoint that can never take the request (its whole per-minute ceiling is smaller than the
+    request, or its daily cap is reached) is left out: its "no wait" used to hide the real wait of
+    the endpoint that could take it, so the chat sent at once and failed instead of pausing.
+    """
     if ledger is None:
         return 0.0
     _ensure_cortex_ledger(ledger)
     estimated = _estimate_tokens(messages) + int(max_tokens)
-    waits = [ledger.wait_seconds(_vendor(endpoint), estimated) for endpoint in CORTEX_ENDPOINTS.values() if _endpoint_key(endpoint)]
+    waits = []
+    for endpoint in CORTEX_ENDPOINTS.values():
+        if not _endpoint_key(endpoint):
+            continue
+        usage = _endpoint_usage(endpoint, ledger, None)
+        ceiling = usage.tpm_ceiling(endpoint)
+        if ceiling is not None and estimated > ceiling:
+            continue
+        if usage.daily_limit > 0 and usage.daily_used + estimated > usage.daily_limit:
+            continue
+        waits.append(ledger.wait_seconds(_vendor(endpoint), estimated))
     return float(min(waits)) if waits else 0.0
+
+
+HEADROOM_MARKERS = ("headroom", "requests used in the last minute", "would exceed")
+CHAT_MAX_WAIT_SECONDS = 65.0  # one free-tier window; longer waits surface as the plain error instead
+
+
+def headroom_wait_seconds(exc: BaseException, ledger: Optional[QuotaLedger], messages: Sequence[Mapping[str, str]], max_tokens: int, max_wait: float = CHAT_MAX_WAIT_SECONDS) -> float:
+    """Seconds to pause before retrying a failure that was only a full free-tier window; 0 for any other failure or a wait past ``max_wait``."""
+    text = str(exc).lower()
+    if not any(marker in text for marker in HEADROOM_MARKERS):
+        return 0.0
+    wait = cortex_wait_seconds(ledger, messages, max_tokens)
+    return float(wait) if 0.0 < wait <= max_wait else 0.0
+
+
+def _pacer(ledger: Optional[QuotaLedger]) -> Optional[Callable[[List[dict], int], None]]:
+    """Before each Heavy pass: wait for a free-tier window (up to one) instead of failing the pass.
+
+    Gemini allows a handful of requests per minute, so the second and third passes of one Heavy
+    send often landed inside the window opened by the first and were silently replaced by the draft.
+    """
+    if ledger is None:
+        return None
+
+    def pace(selected_messages: List[dict], tokens: int) -> None:
+        wait = cortex_wait_seconds(ledger, selected_messages, tokens)
+        if 0.0 < wait <= CHAT_MAX_WAIT_SECONDS:
+            time.sleep(wait + 0.5)
+
+    return pace
 
 
 @dataclass(frozen=True)
@@ -675,10 +736,12 @@ class EndpointUsage:
     tpm_limit: float = 0.0
 
     def rpm_ceiling(self, endpoint: CortexEndpoint) -> float:
-        return min(float(endpoint.rpm_limit), self.rpm_limit) if self.rpm_limit > 0 else float(endpoint.rpm_limit)
+        table = float(effective_rpm(endpoint))
+        return min(table, self.rpm_limit) if self.rpm_limit > 0 else table
 
     def tpm_ceiling(self, endpoint: CortexEndpoint) -> Optional[float]:
-        table = float(endpoint.tpm_limit) if endpoint.tpm_limit is not None else None
+        tpm = effective_tpm(endpoint)
+        table = float(tpm) if tpm is not None else None
         if self.tpm_limit > 0 and self.tpm_limit < 10**9:
             return min(table, self.tpm_limit) if table is not None else self.tpm_limit
         return table
@@ -1849,6 +1912,7 @@ def _heavy_pipeline(
     paid_slot: Optional[PaidReasoningSlot] = None,
     final_pass: Optional[Callable[..., Tuple[Any, RouteDecision]]] = None,
     temperatures: Optional[Tuple[float, float, float]] = None,
+    pace: Optional[Callable[[List[dict], int], None]] = None,
 ) -> Tuple[Any, RouteDecision]:
     """Bounded plan/critique/synthesis without exposing private chain-of-thought.
 
@@ -1858,9 +1922,13 @@ def _heavy_pipeline(
     can show the synthesis as it arrives; the fallbacks still return text.
     ``temperatures`` is the pink-wave schedule (draft, critique, synthesis);
     when None every pass keeps the caller's temperature (three-argument passes).
+    ``pace`` runs before every free-endpoint pass with that pass's messages and
+    token budget, so a pass waits for a free-tier window instead of failing.
     """
 
     def run_pass(fn: Callable[..., Any], stage: int, selected_type: str, selected_messages: List[dict], tokens: int) -> Any:
+        if pace is not None:
+            pace(selected_messages, tokens)
         if temperatures is None:
             return fn(selected_type, selected_messages, tokens)
         return fn(selected_type, selected_messages, tokens, float(temperatures[stage]))
@@ -1959,7 +2027,10 @@ def heavy_stream(
         wrapped = HeavyStream(stream, str(draft.get("text", "")), draft.get("decision"), task_type)
         return wrapped, wrapped.decision
 
-    return _heavy_pipeline(one_pass, task_type, messages, max_tokens, paid_slot=paid_slot, final_pass=final_pass, temperatures=_heavy_schedule(temperature))
+    return _heavy_pipeline(
+        one_pass, task_type, messages, max_tokens, paid_slot=paid_slot, final_pass=final_pass,
+        temperatures=_heavy_schedule(temperature), pace=_pacer(ledger),
+    )
 
 
 class HeavyStream:
@@ -2048,6 +2119,7 @@ def generate_cortex_heavy(
         max_tokens,
         paid_slot=paid_slot,
         temperatures=_heavy_schedule(temperature),
+        pace=_pacer(ledger),
     )
 
 
@@ -2112,7 +2184,7 @@ def pipeline_generate(
     """One paced call for the repository pipeline: wait for a free-tier window, then route like the chat does.
 
     The pipeline used the legacy one-pass route, which skipped every provider the moment a window
-    was full (Gemini: 2 requests per minute) instead of waiting, so multi-step runs failed from
+    was full (Gemini: a few requests per minute) instead of waiting, so multi-step runs failed from
     step two onward. This waits up to ``max_wait`` seconds, then uses Cortex routing with the
     legacy providers as fallback.
     """

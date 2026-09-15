@@ -101,11 +101,11 @@ def test_utility_uses_learned_values_and_the_learner_moves_a_close_call_but_neve
     assert decision.endpoint.name == "google_ai_studio" and decision.learned["quality"] > 0.5 and "learner speed=" in decision.reason
     assert decision.explored is False and decision.runner_up == "groq"
     # Hard limits win over the best learned score: with gemini's window exhausted the request goes to groq.
-    usage = {"google_ai_studio": {"rpm_used": 2, "tpm_used": 0}}
+    usage = {"google_ai_studio": {"rpm_used": 5, "tpm_used": 0}}
     forced = select_milp_endpoint("chat", 500, entropy_by_endpoint=ZERO, current_usage=usage)
     assert forced.endpoint.name == "groq"
     with pytest.raises(router.ProviderError):
-        select_milp_endpoint("chat", 500, entropy_by_endpoint=ZERO, current_usage={"google_ai_studio": {"rpm_used": 2, "tpm_used": 0}, "groq": {"rpm_used": 30, "tpm_used": 0}})
+        select_milp_endpoint("chat", 500, entropy_by_endpoint=ZERO, current_usage={"google_ai_studio": {"rpm_used": 5, "tpm_used": 0}, "groq": {"rpm_used": 30, "tpm_used": 0}})
     _ = gemini
 
 

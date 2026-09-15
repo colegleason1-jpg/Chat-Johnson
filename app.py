@@ -75,6 +75,7 @@ from orchestrator.router import (
     cortex_wait_seconds,
     endpoint_model,
     generate_mode,
+    headroom_wait_seconds,
     heavy_stream,
     local_endpoint,
     register_local_endpoint,
@@ -163,16 +164,18 @@ from orchestrator import vaultsync  # noqa: E402
 
 
 def _secrets_to_env() -> None:
-    """Streamlit Cloud keeps secrets in st.secrets; the vault sync and the demo flag read the environment."""
-    for name in (vaultsync.ENV_URL, vaultsync.ENV_KEY, vaultsync.ENV_BUCKET, vaultsync.ENV_OBJECT, vaultsync.ENV_INTERVAL, "CHAT_JOHNSON_DEMO"):
+    """Streamlit Cloud keeps secrets in st.secrets; every CHAT_JOHNSON_* setting (vault sync, demo flag,
+    vendor RPM/TPM/daily overrides) is read from the environment, so those names are copied over once."""
+    try:
+        names = [str(name) for name in st.secrets.keys() if str(name).startswith("CHAT_JOHNSON_")]  # raises when no secrets file exists at all
+    except Exception:
+        return
+    for name in names:
         if os.environ.get(name):
             continue
-        try:
-            value = st.secrets.get(name, "")  # raises when no secrets file exists at all
-        except Exception:
-            return
-        if value:
-            os.environ[name] = str(value)
+        value = st.secrets.get(name, "")
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            os.environ[name] = str(value).strip()
 
 
 _secrets_to_env()
@@ -1241,44 +1244,42 @@ def run_generation(
         live_box.empty()
         if not lock_held:
             st.caption("The background job did not release the provider in time; sending anyway (the ledger still meters every attempt).")
-        if mode == "normal" and cortex_available():
-            # Normal mode streams token-by-token from the MILP-selected endpoint.
-            try:
-                stream = CortexStream(task_type, messages, ledger, max_tokens=max_tokens, temperature=0.35)
+        def attempt_generation() -> Tuple[str, RouteDecision]:
+            if mode == "normal" and cortex_available():
+                # Normal mode streams token-by-token from the MILP-selected endpoint.
+                try:
+                    stream = CortexStream(task_type, messages, ledger, max_tokens=max_tokens, temperature=0.35)
+                    with live_box.container():
+                        with st.chat_message("assistant"):
+                            st.caption(f"{stream.decision.provider}/{stream.decision.model} · {task_type} · streaming")
+                            st.write_stream(hold_fences(stream))  # prose live, each code block whole
+                    return stream.text, stream.decision
+                except ProviderError:
+                    # Strict endpoint failed mid-flight; use the blocking path with fallback.
+                    live_box.empty()
+                    return generate_mode(mode, task_type, messages, ledger, max_tokens=max_tokens, temperature=0.35)
+            if mode == "heavy" and cortex_available():
+                # Draft and review block; the synthesis streams like a Normal Chat answer.
                 with live_box.container():
-                    with st.chat_message("assistant"):
-                        st.caption(f"{stream.decision.provider}/{stream.decision.model} · {task_type} · streaming")
-                        st.write_stream(hold_fences(stream))  # prose live, each code block whole
-                answer, decision = stream.text, stream.decision
-            except ProviderError:
-                # Strict endpoint failed mid-flight; use the blocking path with fallback.
-                live_box.empty()
-                answer, decision = generate_mode(mode, task_type, messages, ledger, max_tokens=max_tokens, temperature=0.35)
-        elif mode == "heavy" and cortex_available():
-            # Draft and review block; the synthesis streams like a Normal Chat answer.
-            with live_box.container():
-                st.info("Heavy Mode: draft and review passes running; the synthesis streams here when they finish…")
-            stream: Any = None
-            try:
-                stream, decision = heavy_stream(task_type, messages, ledger, max_tokens=max_tokens, temperature=0.2, paid_slot=session_paid_slot())
-                if isinstance(stream, str):
-                    answer = stream
-                else:
+                    st.info("Heavy Mode: draft and review passes running; the synthesis streams here when they finish…")
+                try:
+                    stream, heavy_decision = heavy_stream(task_type, messages, ledger, max_tokens=max_tokens, temperature=0.2, paid_slot=session_paid_slot())
+                    if isinstance(stream, str):
+                        return stream, heavy_decision
                     live_box.empty()
                     with live_box.container():
                         with st.chat_message("assistant"):
                             st.caption(f"{stream.decision.provider}/{stream.decision.model} · {task_type} · heavy · synthesis streaming")
                             st.write_stream(hold_fences(stream))
-                    answer, decision = stream.text, stream.decision
-            except ProviderError:
-                live_box.empty()
-                with live_box.container():
-                    st.info("Streaming synthesis unavailable; finishing Heavy Mode on the blocking path…")
-                answer, decision = generate_mode(mode, task_type, messages, ledger, max_tokens=max_tokens, temperature=0.2, paid_slot=session_paid_slot())
-        else:
+                    return stream.text, stream.decision
+                except ProviderError:
+                    live_box.empty()
+                    with live_box.container():
+                        st.info("Streaming synthesis unavailable; finishing Heavy Mode on the blocking path…")
+                    return generate_mode(mode, task_type, messages, ledger, max_tokens=max_tokens, temperature=0.2, paid_slot=session_paid_slot())
             with live_box.container():
                 st.info("Heavy Mode: draft → review → synthesis in progress…" if mode == "heavy" else "Generating…")
-            answer, decision = generate_mode(
+            return generate_mode(
                 mode,
                 task_type,
                 messages,
@@ -1287,6 +1288,20 @@ def run_generation(
                 temperature=0.2 if mode == "heavy" else 0.35,
                 paid_slot=session_paid_slot() if mode == "heavy" else None,
             )
+
+        try:
+            answer, decision = attempt_generation()
+        except ProviderError as exc:
+            # A route refused only for a full free-tier window is a pause, not an error: wait once and send again.
+            retry_wait = headroom_wait_seconds(exc, ledger, messages, max_tokens, CHAT_MAX_WAIT_SECONDS)
+            if not retry_wait:
+                raise
+            live_box.empty()
+            with live_box.container():
+                st.info(f"Free-tier window is full; sending in {int(retry_wait) + 1} s…")
+            time.sleep(retry_wait + 0.5)
+            live_box.empty()
+            answer, decision = attempt_generation()
     except Exception as exc:
         live_box.empty()
         # Shown in plain words; the raw vendor body stays in the session's provider events only.

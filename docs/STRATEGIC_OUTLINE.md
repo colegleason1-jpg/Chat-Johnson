@@ -17,7 +17,7 @@ The repo is not an empty shell. The last Freebuff commit (`910cd6f`, 2026-09-13 
 | Cortex 3: rFFT 1/f noise, low-frequency clamp, standardization, alpha fit, Shannon entropy | `router.py` `generate_one_over_f_noise`, `fit_one_over_f_alpha`, `shannon_entropy` | Done |
 | Cortex 3: Euler-Maruyama step `x + [A(x-x^3)+C]dt + sigma(1+|x|)eta sqrt(dt)` | `router.py` `advance_stochastic_project_seth_step`, `simulate_project_seth_trajectory` | Done, exact stencil |
 | Cortex 2: `scipy.optimize.milp` with sum(x)=1, RPM and TPM rows, no-key exclusion rows, entropy-weighted utility | `router.py` `select_milp_endpoint`, `_build_constraint_array` | Done, with deterministic fallback when SciPy is absent |
-| Free-tier ceilings 2 RPM / 32k TPM (Gemini), 30 RPM / 8k TPM (Groq, tightened 2026-09-13 to its free plan), 60 RPM (Hugging Face) | `router.py` `CORTEX_ENDPOINTS` | Done; policy ceilings, not vendor guarantees |
+| Free-tier ceilings 5 RPM / 32k TPM (Gemini, raised from 2 on 2026-09-15), 30 RPM / 8k TPM (Groq, tightened 2026-09-13 to its free plan), 60 RPM (Hugging Face); `CHAT_JOHNSON_RPM_<VENDOR>` / `CHAT_JOHNSON_TPM_<VENDOR>` override | `router.py` `CORTEX_ENDPOINTS`, `effective_rpm`, `effective_tpm` | Done; policy ceilings, not vendor guarantees |
 | Cortex 1: provider payload formatting, system prompt append, SSE stream | `router.py` `build_cortex_request`, `cortex_stream`, `cortex_generate` | Done |
 | Heavy Mode multi-pass (draft → critique → synthesis) | `router.py` `_heavy_pipeline`, `generate_mode` | Done, bounded |
 | Tree sanitization of `App.py`, `Router.py`, `Sandbox.py` | `app.py` `_sanitize_duplicate_modules` | Done, runs at import |

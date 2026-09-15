@@ -738,7 +738,7 @@ def test_one_gemini_key_is_metered_in_one_bucket(all_keys, monkeypatch):
     ledger = QuotaLedger({"gemini": (15, 1_000_000)})  # what the legacy registry pre-registers
     router._ensure_cortex_ledger(ledger)
     usage = ledger.usage("gemini")
-    assert (usage["rpm_limit"], usage["tpm_limit"]) == (2, 32_000)  # tightened to the strict Cortex policy
+    assert (usage["rpm_limit"], usage["tpm_limit"]) == (5, 32_000)  # tightened to the strict Cortex policy
     monkeypatch.setattr(router.requests, "post", lambda *a, **k: FakeResponse(lines=sse({"candidates": [{"content": {"parts": [{"text": "hi"}]}}]})))
     zero = {name: 0.0 for name in CORTEX_ENDPOINTS}
     monkeypatch.setattr(router, "project_seth_routing_entropy", lambda *a, **k: zero)
@@ -873,8 +873,8 @@ def test_cortex_wait_seconds_reports_the_soonest_free_window(monkeypatch):
     ledger = QuotaLedger({})
     messages = [{"role": "user", "content": "x"}]
     assert router.cortex_wait_seconds(ledger, messages, 16) == 0.0
-    ledger.record_attempt("gemini")
-    ledger.record_attempt("gemini")  # Gemini's Cortex ceiling is 2 RPM
+    for _ in range(router.effective_rpm(router.CORTEX_ENDPOINTS["google_ai_studio"])):  # fill Gemini's Cortex ceiling
+        ledger.record_attempt("gemini")
     assert 0 < router.cortex_wait_seconds(ledger, messages, 16) <= 60.0
     monkeypatch.setenv("GROQ_API_KEY", "k")
     assert router.cortex_wait_seconds(ledger, messages, 16) == 0.0

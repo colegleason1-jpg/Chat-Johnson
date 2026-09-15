@@ -49,7 +49,7 @@ non-linear processors inside the stochastic branch:
    fits the alpha exponent, and returns Shannon entropy `H(x) = -sum(P log2 P)` of the trajectory to
    penalize routing channel weights.
 3. Cortex 2 (deterministic controller): `scipy.optimize.milp` with a `LinearConstraint` array encoding
-   Google AI Studio 2 RPM / 32,000 TPM, Groq 30 RPM / 15,000 TPM (implemented as 8,000 TPM since 2026-09-13, Groq's current free plan for gpt-oss-120b), Hugging Face 60 RPM; utility
+   Google AI Studio 5 RPM / 32,000 TPM (2 RPM until 2026-09-15; `CHAT_JOHNSON_RPM_<VENDOR>` / `CHAT_JOHNSON_TPM_<VENDOR>` override any ceiling), Groq 30 RPM / 15,000 TPM (implemented as 8,000 TPM since 2026-09-13, Groq's current free plan for gpt-oss-120b), Hugging Face 60 RPM; utility
    (speed vs context depth) weighted by Cortex 3 entropy; binary 0/1 decision vector.
 4. Cortex 1 (LLM core): execution wrapper taking the MILP endpoint, formatting the multi-provider HTTP
    payload, appending the system prompt, and returning the generation stream.

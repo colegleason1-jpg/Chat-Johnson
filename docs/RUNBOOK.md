@@ -215,6 +215,16 @@
   keeps the system prompt, the memory, and the earlier turns, and the critique gets a clipped excerpt.
   The pink-wave recall share governs long-distance memory from OTHER chats; it never touched the live
   window, which is where this loss happened.
+- "No API key is set" although the keys test green: the route was rejected for a full free-tier
+  window, not for a missing key. The Cortex route failed (Gemini's requests-per-minute ceiling was
+  used up, and Groq's 8,000 TPM ceiling cannot take a large request at all), the legacy fallback
+  reads environment keys only, and its "no provider has a key" was the text shown. Fixed: the
+  plain sentence now explains the Cortex reason; the pre-send wait ignores an endpoint that can never
+  take the request (its "no wait" was hiding Gemini's real wait); a failure that was only a full
+  window is retried once after that wait; each Heavy pass waits for a window instead of silently
+  returning the draft; Gemini's table ceiling is 5 RPM (was 2). Set your key's real tier with
+  `CHAT_JOHNSON_RPM_<VENDOR>` / `CHAT_JOHNSON_TPM_<VENDOR>` in Streamlit secrets or the environment.
+  "Technical detail" under the error always shows the full routing reason.
 - Auditing chats from outside the app: sidebar → Vault snapshots → "Send all chats to Supabase for
   audit" upserts one row per chat into the `chat_exports` table (scope, thread id, workspace, title,
   message count, the download's JSON as `payload`); read it with SQL. Table name override:
