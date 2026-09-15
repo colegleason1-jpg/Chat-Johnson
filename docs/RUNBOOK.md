@@ -154,6 +154,13 @@
   history), and the chat reserve is held back from every vendor before the solve, never traded
   away. The panel's per-vendor table shows capacity, reserved, planned, and headroom; a goal bounded
   by one vendor's supply says so instead of asking for a bigger pooled budget.
+- Goal points fitted from evidence: each activity's typed points are a prior; last week's successes
+  per thousand tokens (chat verdicts against the answers' token counts, finished work items per
+  company-cycle token, passed evaluations per academy-cycle token, dream-bank entries per leisure
+  token) reweight the fitted activities' prior total by yield, blended at n / (n + 10). Too few
+  observations (12 verdicts, 3 cycles), no tokens, or no successes keep the typed number and the
+  panel's table says why; one fitted activity alone cannot be reweighted. The checkbox "Use goal
+  points fitted…" turns the fit off without hiding the evidence. Missions stay typed.
 - Feasibility verdicts (same engine, whole-or-nothing nodes): the Company tab's release wave shows
   whether the current wave can reach its gate with the company's tokens today (each unfinished work
   priced by the calls left from its stage to `final`), naming the shortfall or the vendor that binds

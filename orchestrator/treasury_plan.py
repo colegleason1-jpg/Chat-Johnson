@@ -115,6 +115,7 @@ class DayPlan:
     stress: float = 1.0
     stress_rows: List[Dict[str, Any]] = field(default_factory=list)
     resources: List[Dict[str, Any]] = field(default_factory=list)   # per vendor: capacity, planned use, headroom
+    value_rows: List[Dict[str, Any]] = field(default_factory=list)  # per activity: typed prior, evidence, fitted points, provenance
     tail: Dict[str, float] = field(default_factory=dict)
     engine: str = ""
     input_hash: str = ""
@@ -147,17 +148,126 @@ def config_for(scope: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         data = {}
     return {"goal_fraction": float(data.get("goal_fraction", DEFAULT_GOAL_FRACTION)), "values": {**DEFAULT_VALUE_POINTS, **dict(data.get("values") or {})},
-            "min_scale": {**DEFAULT_MIN_SCALE, **dict(data.get("min_scale") or {})}, "chat_reserve_fraction": float(data.get("chat_reserve_fraction", CHAT_RESERVE_FRACTION))}
+            "min_scale": {**DEFAULT_MIN_SCALE, **dict(data.get("min_scale") or {})}, "chat_reserve_fraction": float(data.get("chat_reserve_fraction", CHAT_RESERVE_FRACTION)),
+            "use_fitted": bool(data.get("use_fitted", True))}
 
 
-def save_config(scope: str, goal_fraction: float, chat_reserve_fraction: float, values: Optional[Mapping[str, float]] = None) -> Dict[str, Any]:
+def save_config(scope: str, goal_fraction: float, chat_reserve_fraction: float, values: Optional[Mapping[str, float]] = None, use_fitted: Optional[bool] = None) -> Dict[str, Any]:
     current = config_for(scope)
     current["goal_fraction"] = max(0.05, min(1.0, float(goal_fraction)))
     current["chat_reserve_fraction"] = max(0.0, min(0.6, float(chat_reserve_fraction)))
     if values:
         current["values"] = {**current["values"], **{k: max(0.0, float(v)) for k, v in values.items()}}
+    if use_fitted is not None:
+        current["use_fitted"] = bool(use_fitted)
     vault.setting_set(scope, SETTING_CONFIG, json.dumps(current, sort_keys=True))
     return current
+
+
+# ----------------------------------------------------------------------------- goal points fitted from evidence
+
+FIT_WINDOW_HOURS = 168.0
+FIT_PRIOR_WEIGHT = 10.0          # observations needed to weigh the evidence as much as the typed prior (n / (n + 10), as the learner does)
+FIT_MIN_OBSERVATIONS = {"chat": 12, "company": 3, "academy": 3, "leisure": 3}
+GOOD_OUTCOMES = ("up", "locked")
+VERDICT_OUTCOMES = ("up", "locked", "down")
+FALLBACK_ANSWER_TOKENS = 400     # when a verdict's message has no stored token count
+
+
+def _evidence(scope: str, now: float) -> Dict[str, Dict[str, float]]:
+    """Per activity: successes, tokens spent on them, and observations over the window; the raw material of a fit, nothing typed."""
+    from .society import store
+
+    since = now - FIT_WINDOW_HOURS * 3600.0
+    out: Dict[str, Dict[str, float]] = {}
+    # Chat: the operator's verdicts on answers (thumbs, locks) against the tokens those answers cost.
+    verdicts = [r for r in vault.recent_routes(scope, limit=5000, hours=FIT_WINDOW_HOURS) if str(r["outcome"] or "") in VERDICT_OUTCOMES]
+    ids = [int(r["message_id"]) for r in verdicts if r["message_id"] is not None]
+    sizes: Dict[int, int] = {}
+    if ids:
+        with vault._open_database() as connection:
+            marks = ",".join("?" * len(ids))
+            for table in ("message_history", "message_archive"):
+                try:
+                    for row in connection.execute(f"SELECT id, token_count FROM {table} WHERE id IN ({marks})", ids).fetchall():
+                        sizes[int(row["id"])] = int(row["token_count"])
+                except Exception:
+                    continue
+    chat_tokens = sum(sizes.get(int(r["message_id"]), FALLBACK_ANSWER_TOKENS) if r["message_id"] is not None else FALLBACK_ANSWER_TOKENS for r in verdicts)
+    out["chat"] = {"good": float(sum(1 for r in verdicts if str(r["outcome"]) in GOOD_OUTCOMES)), "tokens": float(chat_tokens), "observations": float(len(verdicts))}
+    # Society: finished cycles per kind against what they delivered.
+    cycles = [c for c in store.rows("cycles", scope, "finished_at IS NOT NULL AND finished_at >= ?", (since,), limit=2000) if str(c.get("status")) in ("done", "budget")]
+    by_kind: Dict[str, List[Dict[str, Any]]] = {}
+    for cycle in cycles:
+        by_kind.setdefault(str(cycle.get("kind")), []).append(cycle)
+    done_items = store.rows("work_items", scope, "status = 'done' AND updated_at >= ?", (since,), limit=5000)
+    passed = store.rows("evaluations", scope, "passed = 1 AND timestamp >= ?", (since,), limit=5000)
+    dreams = store.rows("dream_bank", scope, "timestamp >= ?", (since,), limit=5000)
+    for kind, good in (("company", len(done_items)), ("academy", len(passed)), ("leisure", len(dreams))):
+        rows = by_kind.get(kind, [])
+        out[kind] = {"good": float(good), "tokens": float(sum(int(c.get("tokens_used") or 0) for c in rows)), "observations": float(len(rows))}
+    return out
+
+
+def fit_values(scope: str, now: Optional[float] = None, priors: Optional[Mapping[str, float]] = None) -> List[Dict[str, Any]]:
+    """Goal points per activity fitted from the last week's evidence, blended with the typed prior by how much evidence there is.
+
+    Each activity's yield is successes per thousand tokens (verdicts for the chat, finished work items, passed evaluations,
+    dream-bank entries for the society). Yields are turned into points by sharing the fitted activities' prior total in
+    proportion to yield, so the scale of the goal never moves; then blended with the prior at weight n / (n + 10). An
+    activity with too few observations, no tokens, or no successes keeps its typed prior and says why, as the engine's
+    calibration does: a number nobody measured is shown as asserted, never as fitted.
+    """
+    stamp = float(now if now is not None else time.time())
+    priors = dict(priors or config_for(scope)["values"])
+    evidence = _evidence(scope, stamp)
+    rows: List[Dict[str, Any]] = []
+    fitted: Dict[str, float] = {}
+    for key in ("chat", "company", "academy", "leisure", "missions"):
+        prior = float(priors.get(key, 0.0))
+        row = {"activity": key, "prior": prior, "observations": 0, "successes": 0, "tokens": 0, "yield_per_1k": None, "fitted": prior, "weight": 0.0, "quality": "not measured"}
+        ev = evidence.get(key)
+        if ev is not None:
+            row.update({"observations": int(ev["observations"]), "successes": int(ev["good"]), "tokens": int(ev["tokens"])})
+            minimum = FIT_MIN_OBSERVATIONS.get(key, 3)
+            if ev["observations"] < minimum:
+                row["quality"] = f"too few observations ({int(ev['observations'])} of {minimum})"
+            elif ev["tokens"] <= 0:
+                row["quality"] = "no tokens recorded"
+            elif ev["good"] <= 0:
+                row["quality"] = "no successes"
+            else:
+                row["yield_per_1k"] = round(ev["good"] / ev["tokens"] * 1000.0, 4)
+                fitted[key] = ev["good"] / ev["tokens"] * 1000.0
+                row["quality"] = "fitted"
+        rows.append(row)
+    if len(fitted) >= 2:
+        prior_total = sum(float(priors.get(k, 0.0)) for k in fitted)
+        yield_total = sum(fitted.values())
+        for row in rows:
+            key = row["activity"]
+            if key in fitted and yield_total > 0:
+                share = prior_total * fitted[key] / yield_total
+                weight = row["observations"] / (row["observations"] + FIT_PRIOR_WEIGHT)
+                row["weight"] = round(weight, 3)
+                row["fitted"] = round(weight * share + (1.0 - weight) * row["prior"], 3)
+    else:
+        for row in rows:
+            if row["quality"] == "fitted":
+                row["quality"] = "fitted (needs a second measured activity to reweight)"
+    return rows
+
+
+def effective_values(scope: str, now: Optional[float] = None) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
+    """The goal points the plan uses: fitted where the evidence supports it and the setting allows, typed otherwise."""
+    config = config_for(scope)
+    rows = fit_values(scope, now, config["values"])
+    values = dict(config["values"])
+    if config["use_fitted"]:
+        for row in rows:
+            if row["quality"] == "fitted" and row["weight"] > 0:
+                values[row["activity"]] = float(row["fitted"])
+    return values, rows
 
 
 def _hours_left(now: float) -> float:
@@ -207,7 +317,8 @@ def build_activities(scope: str, ledger: Any, now: Optional[float] = None) -> Tu
 
     stamp = float(now if now is not None else time.time())
     config = config_for(scope)
-    values, mins = config["values"], config["min_scale"]
+    values, _ = effective_values(scope, stamp)
+    mins = config["min_scale"]
     capacities = vendor_capacities(ledger)
     vendors = list(capacities)
     budget = int(sum(capacities.values()))
@@ -342,15 +453,20 @@ def plan_day(scope: str, ledger: Any, goal_points: Optional[float] = None, now: 
     if not activities:
         plan = DayPlan(scope, time.strftime("%Y-%m-%d", time.gmtime(stamp)), budget, goal, "fallback", notes=["nothing to plan: no company, academy, or queued mission"], created_at=stamp)
         return _store(scope, plan, store_result)
-    if not available():
-        return _store(scope, fallback_plan(scope, activities, budget, goal, "engine not installed (requirements-supply.txt, Python 3.12+): fixed treasury shares apply", stamp), store_result)
     started = time.perf_counter()
-    try:
-        plan = _solve(scope, activities, budget, goal, stamp, with_stress, capacities)
-    except Exception as exc:  # the society never stops because a planner failed
-        plan = fallback_plan(scope, activities, budget, goal, f"planner error, fixed shares apply: {str(exc)[:160]}", stamp)
-        plan.status = "error"
+    if not available():
+        plan = fallback_plan(scope, activities, budget, goal, "engine not installed (requirements-supply.txt, Python 3.12+): fixed treasury shares apply", stamp)
+    else:
+        try:
+            plan = _solve(scope, activities, budget, goal, stamp, with_stress, capacities)
+        except Exception as exc:  # the society never stops because a planner failed
+            plan = fallback_plan(scope, activities, budget, goal, f"planner error, fixed shares apply: {str(exc)[:160]}", stamp)
+            plan.status = "error"
     plan.ms = int((time.perf_counter() - started) * 1000)
+    try:
+        plan.value_rows = effective_values(scope, stamp)[1]  # provenance travels with every plan, engine or not
+    except Exception as exc:
+        plan.notes.append(f"goal-point fit unavailable: {str(exc)[:120]}")
     if with_tail and plan.status in ("optimal", "short", "ceiling"):
         try:
             plan.tail = tail_risk(scope, plan)

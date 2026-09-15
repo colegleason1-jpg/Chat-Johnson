@@ -81,7 +81,7 @@ the chat reserve), missions (150k, 15 pts, min 0.2); baseline 90 points; budget 
 
 ## 5. Placements, in order of value
 
-### 5.1 Daily treasury: plan of the day (fits; build first)
+### 5.1 Daily treasury: plan of the day (built 2026-09-15 as Batch Q: `treasury_plan.plan_day`; goal points fitted from evidence in Batch S: `fit_values`)
 
 Today `economy.py` splits the day by fixed ratio and `tick.budget_deferral` defers every
 cycle on a bursty forecast. Neither answers "which activities, at what size, so the chat never
@@ -91,7 +91,7 @@ the chat reserve is pinned at full funding, and an infeasible day comes back wit
 shortfall so the tick drops the cheapest activity instead of all of them. The sweep's
 saturation point becomes the recommended daily share. Every plan carries the audit hash.
 
-### 5.2 Tail risk of the plan (fits; build with 5.1)
+### 5.2 Tail risk of the plan (built with Batch Q: `treasury_plan.tail_risk`)
 
 Given the plan, how much of the day's value survives correlated vendor failure. Shock size per
 vendor from the learner's failure and 429 rates; correlation from `dynamics.cached_coupling`,
@@ -107,7 +107,7 @@ Launch can finish today at any budget; the diagnosis gives the board and Task Fi
 in tokens instead of a stalled queue. Task Finder's "Cost preview" line becomes a feasibility
 verdict before Launch.
 
-### 5.4 Vendor stress from evidence (fits; small)
+### 5.4 Vendor stress from evidence (built with Batch Q: `treasury_plan.vendor_stress`)
 
 `calibrate_elasticity` fits `failure_rate = f0 · (1 + e · max((load − anchor)/anchor, 0))`
 per vendor from hourly `route_log` bins (load fraction as the price, failures and 429s as the

@@ -2386,12 +2386,14 @@ def render_plan_of_the_day(project_scope: str, ledger: QuotaLedger) -> None:
         c1, c2 = st.columns(2)
         goal_fraction = c1.slider("Goal: share of the day's full value to ask for", 10, 100, int(config["goal_fraction"] * 100), 5, key="plan_goal_fraction")
         reserve = c2.slider("Chat reserve (% of today's tokens)", 0, 60, int(config["chat_reserve_fraction"] * 100), 5, key="plan_chat_reserve")
+        use_fitted = st.checkbox("Use goal points fitted from last week's evidence where the evidence supports it", value=config["use_fitted"], key="plan_use_fitted",
+                                 help="Verdicts for the chat, finished work items, passed evaluations, and dream-bank entries per thousand tokens; blended with the typed points by how much evidence there is. Too little evidence keeps the typed number and says so.")
         b1, b2 = st.columns(2)
         if b1.button("Save plan settings", key="plan_save", use_container_width=True):
-            treasury_plan.save_config(project_scope, goal_fraction / 100, reserve / 100)
+            treasury_plan.save_config(project_scope, goal_fraction / 100, reserve / 100, use_fitted=use_fitted)
             st.success("Plan settings saved; the next tick plans with them.")
         if b2.button("Plan now", key="plan_now", use_container_width=True):
-            treasury_plan.save_config(project_scope, goal_fraction / 100, reserve / 100)
+            treasury_plan.save_config(project_scope, goal_fraction / 100, reserve / 100, use_fitted=use_fitted)
             with st.spinner("Planning the day…"):
                 treasury_plan.plan_day(project_scope, ledger)
         plan = treasury_plan.latest(project_scope)
@@ -2411,6 +2413,10 @@ def render_plan_of_the_day(project_scope: str, ledger: QuotaLedger) -> None:
         if plan.get("resources"):
             st.caption("Per-vendor supply today (tokens): capacity, held for the chat, planned by the activities, headroom left.")
             st.dataframe(plan["resources"], use_container_width=True, hide_index=True)
+        if plan.get("value_rows"):
+            fitted = sum(1 for r in plan["value_rows"] if str(r.get("quality")) == "fitted")
+            st.caption(f"Goal points: typed prior against last week's evidence (successes per thousand tokens); {fitted} of {len(plan['value_rows'])} fitted, the rest stay as typed and say why.")
+            st.dataframe(plan["value_rows"], use_container_width=True, hide_index=True)
         if plan.get("saturation_budget"):
             st.caption(f"Recommended daily share: {float(plan.get('recommended_share', 0)):.0%} of today's tokens ({int(plan['saturation_budget']):,}) buys everything worth buying; more buys nothing.")
         if plan.get("stress", 1.0) < 1.0:
