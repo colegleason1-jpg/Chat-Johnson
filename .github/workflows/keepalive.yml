@@ -1,6 +1,7 @@
 name: keepalive
 # Keeps the Streamlit Community Cloud copy awake so its in-process worker keeps ticking while session keys
 # are held in memory. Set the DEPLOY_URL repository variable; without it the job exits quietly.
+# GitHub schedules a workflow only from the default branch, so this file must live on main.
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -17,6 +18,8 @@ jobs:
           DEPLOY_URL: ${{ vars.DEPLOY_URL }}
         run: |
           if [ -z "$DEPLOY_URL" ]; then echo "::notice::DEPLOY_URL is not set; nothing to ping."; exit 0; fi
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "${DEPLOY_URL%/}/?health=1")
+          # Follow Cloud's redirects so the request reaches the app itself; the code printed is the final answer.
+          code=$(curl -s -L --max-redirs 5 -o /tmp/health.json -w "%{http_code}" --max-time 90 "${DEPLOY_URL%/}/?health=1")
           echo "health=$code"
-          case "$code" in 2*|3*) exit 0;; *) echo "::warning::health returned HTTP $code"; exit 0;; esac
+          head -c 300 /tmp/health.json; echo
+          case "$code" in 2*) exit 0;; *) echo "::warning::health returned HTTP $code"; exit 0;; esac
