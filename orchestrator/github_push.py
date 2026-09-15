@@ -35,7 +35,8 @@ class PushRecord:
     pr_url: str
     files: List[str]
     previous: Dict[str, Optional[str]] = field(default_factory=dict)  # path -> blob sha at base, None when new
-    kind: str = "push"  # push | revert
+    kind: str = "push"  # push | revert | init
+    modes: Dict[str, str] = field(default_factory=dict)  # path -> git mode at base (existing files keep it on push and revert)
 
 
 def parse_owner_repo(value: str) -> Tuple[str, str]:
@@ -103,6 +104,17 @@ class GitHubWriter:
         data = self._request("GET", self._repo(f"/git/commits/{commit_sha}"))
         return str(data["tree"]["sha"])
 
+    def base_tree_index(self, base_sha: str) -> Dict[str, Tuple[str, str]]:
+        """path -> (blob sha, mode) for every blob in the commit's tree (one recursive call instead of one per file)."""
+        tree_sha = self.commit_tree(base_sha)
+        data = self._request("GET", self._repo(f"/git/trees/{tree_sha}?recursive=1"))
+        entries = data.get("tree", []) if isinstance(data, dict) else []
+        return {str(e["path"]): (str(e["sha"]), str(e.get("mode") or "100644")) for e in entries if isinstance(e, dict) and e.get("type") == "blob"}
+
+    def pull_request_merged(self, number: int) -> bool:
+        data = self._request("GET", self._repo(f"/pulls/{int(number)}"))
+        return bool(isinstance(data, dict) and data.get("merged"))
+
     def blob_sha_at(self, path: str, ref: str) -> Optional[str]:
         data = self._request("GET", self._repo(f"/contents/{quote(path)}?ref={quote(ref, safe='')}"))
         return str(data["sha"]) if isinstance(data, dict) and data.get("sha") else None
@@ -144,15 +156,18 @@ class GitHubWriter:
         if branch == base:
             raise GitHubPushError("refusing to push to the base branch; use a feature branch")
         base_sha = self.branch_sha(base)
-        previous = {path: self.blob_sha_at(path, base) for path, _ in files}
-        entries = [{"path": path, "mode": "100755" if path.endswith(".sh") else "100644", "type": "blob", "sha": self.create_blob(body)} for path, body in files]
+        index = self.base_tree_index(base_sha)
+        previous = {path: (index[path][0] if path in index else None) for path, _ in files}
+        # An existing file keeps the mode the base carries (an executable stays executable); a new one is 100755 only for .sh.
+        modes = {path: (index[path][1] if path in index else ("100755" if path.endswith(".sh") else "100644")) for path, _ in files}
+        entries = [{"path": path, "mode": modes[path], "type": "blob", "sha": self.create_blob(body)} for path, body in files]
         tree = self.create_tree(self.commit_tree(base_sha), entries)
         commit = self.create_commit(message, tree, base_sha)
         self.create_branch(branch, commit)
         pull = self.open_pull_request(branch, base, pr_title, pr_body)
         return PushRecord(
             owner=self.owner, repo=self.repo, base_branch=base, base_sha=base_sha, branch=branch, commit_sha=commit,
-            pr_number=int(pull.get("number", 0)), pr_url=str(pull.get("html_url", "")), files=[path for path, _ in files], previous=previous,
+            pr_number=int(pull.get("number", 0)), pr_url=str(pull.get("html_url", "")), files=[path for path, _ in files], previous=previous, modes=modes,
         )
 
     def initialize_repository(self, files: Sequence[Tuple[str, str]], branch: str, message: str) -> PushRecord:
@@ -181,12 +196,24 @@ class GitHubWriter:
         )
 
     def open_revert(self, record: PushRecord) -> PushRecord:
-        """Restore the pushed paths to what the base branch had at push time (or delete files that were new)."""
+        """Restore the pushed paths to what the base branch had at push time (or delete files that were new).
+
+        Refused unless the record knows the pre-push state of every path (a hand-made record without
+        ``previous`` would delete files that existed) and the pull request was actually merged.
+        """
+        if record.kind != "push":
+            raise GitHubPushError(f"only a push can be reverted, not a {record.kind}")
+        missing = [path for path in record.files if path not in record.previous]
+        if missing:
+            raise GitHubPushError(f"refusing to revert: no pre-push state recorded for {', '.join(missing[:5])}")
+        if record.pr_number and not self.pull_request_merged(record.pr_number):
+            raise GitHubPushError(f"nothing to revert: pull request #{record.pr_number} is not merged (close it instead)")
         base = record.base_branch
         head_sha = self.branch_sha(base)
         entries: List[Dict[str, Any]] = []
         for path in record.files:
-            entries.append({"path": path, "mode": "100644", "type": "blob", "sha": record.previous.get(path)})  # sha None deletes
+            mode = record.modes.get(path) or "100644"
+            entries.append({"path": path, "mode": mode, "type": "blob", "sha": record.previous.get(path)})  # sha None deletes
         tree = self.create_tree(self.commit_tree(head_sha), entries)
         commit = self.create_commit(f"Revert deploy kit push ({record.branch})", tree, head_sha)
         branch = f"revert/{record.branch.split('/', 1)[-1]}"

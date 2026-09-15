@@ -6,9 +6,9 @@ The app is intentionally local-first:
 * Provider credentials are BYOK environment values and are never persisted.
 * Normal mode is a single bounded request; Heavy mode is a bounded
   draft/review/synthesis workflow. Private model reasoning is never displayed.
-* Repository work remains reviewable and sandboxed. GitHub authorization is a
-  read-oriented OAuth skeleton; it does not collect SSH private keys or push
-  changes automatically.
+* Repository work remains reviewable and sandboxed. GitHub access is a
+  session-only token slot; nothing is pushed without a button press, and the
+  default branch is never written.
 * Generated HTML previews are rendered in an isolated component after removing
   scripts, remote frames, forms, and event-handler attributes.
 """
@@ -94,7 +94,7 @@ from orchestrator.render_text import hold_fences, prepare_markdown
 from orchestrator.repo_ingest import repo_prompt_context
 from orchestrator.skills import select_skills
 from orchestrator.spatial_preview import scene_preview_document
-from orchestrator.webqa import browser_available, browser_check, check_markdown, check_url
+from orchestrator.webqa import browser_available, browser_check, check_markdown, check_url, unsafe_target
 from orchestrator.missions import (
     EXECUTORS,
     FAILURE_POLICIES,
@@ -370,7 +370,7 @@ def render_output_with_artifacts(
             st.markdown(prepare_markdown(before))
         language = match.group("language").strip() or "text"
         body = match.group("body")
-        left, right = st.columns([0.88, 0.12], gap="small")
+        left, right = st.columns([0.8, 0.2], gap="small")
         with left:
             st.code(body, language=display_language(language, body))
         with right:
@@ -782,8 +782,8 @@ def render_github_tab() -> None:
     render_push_ledger()
 
 
-def render_push_ledger() -> None:
-    """Every push made this session (Deploy Kit or pipeline) with a revert action."""
+def render_push_ledger(key_prefix: str = "ledger") -> None:
+    """Every push made this session (Deploy Kit or pipeline) with a revert action; ``key_prefix`` keeps two renderings apart."""
     state = github_push_status()
     pushes: List[PushRecord] = st.session_state.setdefault("kit_pushes", [])
     if not pushes:
@@ -793,7 +793,7 @@ def render_push_ledger() -> None:
         label = {"revert": "revert", "init": "initial commit"}.get(record.kind, "push")
         target = f"PR #{record.pr_number}" if record.pr_number else "no pull request (first commit)"
         st.caption(f"{label} · {record.owner}/{record.repo} · branch {record.branch} · {target} · {record.pr_url}")
-        if record.kind == "push" and state["armed"] and st.button("Open revert PR", key=f"ledger_revert_{index}"):
+        if record.kind == "push" and state["armed"] and st.button("Open revert PR", key=f"{key_prefix}_revert_{index}"):
             try:
                 reverted = GitHubWriter(str(st.session_state.get("github_push_token", "")), f"{record.owner}/{record.repo}").open_revert(record)
                 pushes.append(reverted)
@@ -955,17 +955,7 @@ def render_kit_push(spec: KitSpec, files: Sequence[Any]) -> None:
                 st.success(f"Pushed {len(record.files)} file(s) to {record.branch} and opened pull request #{record.pr_number}: {record.pr_url}")
             except GitHubPushError as exc:
                 st.error(f"GitHub push failed: {exc}")
-    for index, record in enumerate(pushes):
-        label = "revert" if record.kind == "revert" else "push"
-        st.caption(f"{label} · {record.owner}/{record.repo} · branch {record.branch} · PR #{record.pr_number} · {record.pr_url}")
-        if record.kind == "push" and state["armed"] and st.button("Open revert PR", key=f"kit_revert_{index}"):
-            try:
-                reverted = GitHubWriter(str(st.session_state.get("github_push_token", "")), f"{record.owner}/{record.repo}").open_revert(record)
-                pushes.append(reverted)
-                st.success(f"Revert pull request #{reverted.pr_number}: {reverted.pr_url}")
-                st.rerun()
-            except GitHubPushError as exc:
-                st.error(f"Revert failed: {exc}")
+    render_push_ledger("kit")
 
 
 # =============================================================================
@@ -1278,6 +1268,9 @@ def dispatch_chat(
 def render_history(project_scope: str, heading: str, workspace: Optional[str] = None, limit: int = 24) -> None:
     st.markdown(f"#### {heading}")
     focus = st.session_state.get(f"focus_{workspace}")
+    if focus and int(focus.get("thread_id", -1)) != int(active_thread(project_scope, workspace)["id"]):
+        st.session_state.pop(f"focus_{workspace}", None)  # a jump belongs to the chat it was made in
+        focus = None
     if focus:
         # The navigator jumped here: show the window around that message instead of the tail.
         rows = messages_around(int(focus["thread_id"]), int(focus["message_id"]), before=limit // 2, after=limit // 2, project_scope=project_scope)
@@ -1560,8 +1553,8 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger, submission: Optiona
     dispatch_chat(project_scope, "chat_bot", submission, ledger, injected, injection_notes)
 
 
-def launch_mission(project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, plan: Sequence[Dict[str, Any]]) -> int:
-    """Queue the mission as a background job; the chat shows each result as it lands and the bar stays free."""
+def launch_mission(project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, plan: Sequence[Dict[str, Any]]) -> Tuple[int, int]:
+    """Queue the mission as a background job; returns (job id, the thread it landed on, which a migration may have changed)."""
     migration = health_sweep(project_scope, ledger, workspace="task_finder")
     if migration:
         st.info(f"Thread health agent migrated to optimized chat #{migration['new_thread_id']} before launching.")
@@ -1574,8 +1567,10 @@ def launch_mission(project_scope: str, ledger: QuotaLedger, thread_id: int, goal
         "paid_model": str(st.session_state.get("paid_slot_model", "") or ""),
         "paid_enabled": bool(st.session_state.get("paid_slot_enabled", False)),
     }
-    # Keys go to the runner's in-memory stash for this job only; the row never holds them.
-    return enqueue_job(project_scope, mission_runner.KIND, payload, job_secrets_for_session(), thread_id=thread_id)
+    # Keys travel encrypted or in the runner's memory for this job only; the row never holds them.
+    job_id = enqueue_job(project_scope, mission_runner.KIND, payload, job_secrets_for_session(), thread_id=thread_id)
+    save_mission_nodes(thread_id, plan, project_scope)  # on the thread the mission actually lives in
+    return job_id, thread_id
 
 
 def render_jobs_strip(project_scope: str) -> None:
@@ -1587,6 +1582,18 @@ def render_jobs_strip(project_scope: str) -> None:
     if not list_jobs(project_scope, ACTIVE_STATUSES, limit=1):
         st.session_state.pop("jobs_seen", None)
         return
+    active_rows = [job_view(row) for row in list_jobs(project_scope, ACTIVE_STATUSES, limit=6)]
+    unclaimed = [j for j in active_rows if j["status"] == "queued" and time.time() - max(float(j["created_at"]), float(j["run_after"] or 0)) > 600]
+    if unclaimed and len(unclaimed) == len(active_rows):
+        st.warning(
+            f"{len(unclaimed)} job(s) have waited over 10 minutes with no worker claiming them: this deployment runs jobs only "
+            "when a worker exists (CHAT_JOHNSON_JOB_WORKERS, or the worker container on the VM). Cancel them or start a worker."
+        )
+        for job in unclaimed:
+            if st.button(f"Cancel job #{job['id']}", key=f"cancel_stale_{job['id']}"):
+                request_cancel(job["id"], project_scope)
+                st.rerun()
+        return  # no polling while nothing can move
 
     def body() -> None:
         jobs = [job_view(row) for row in list_jobs(project_scope, ACTIVE_STATUSES, limit=6)]
@@ -1806,7 +1813,6 @@ def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int
             disabled=not configured_provider_names() or bool(reasons),
             help=("Fix the reasons above first." if reasons else "Runs the nodes strictly in order, each one seeing the results before it; results are saved to this chat."),
         ):
-            save_mission_nodes(thread_id, plan, project_scope)
             launch_mission(project_scope, ledger, thread_id, goal, plan)
             pending.pop(thread_id, None)
             st.session_state.get("pending_plans", {}).pop(thread_id, None)
@@ -1910,6 +1916,35 @@ def company_facts(project_scope: str, company: Dict[str, Any]) -> List[str]:
     return facts
 
 
+def render_release_wave(project_scope: str, company_id: int, company: Dict[str, Any]) -> None:
+    """The studio releases wave 1 as one review: six finals go to the board together, approved or returned with feedback."""
+    if company.get("kind") != "studio":
+        return
+    status = society.wave_status(project_scope, company_id, 1)
+    release = status["release"]
+    st.markdown(f"**Release wave 1** · {status['ready']} of {status['size']} works final")
+    if release and release["status"] == "board_review":
+        st.info("Wave 1 is with the board. Read the manuscripts under Locked artifacts (company/…/works/), then decide.")
+        note = st.text_area("Board feedback on the wave", key=f"wave_note_{company_id}", height=80)
+        ok, back = st.columns(2)
+        if ok.button("Approve and publish all six", key=f"wave_approve_{company_id}", type="primary", use_container_width=True):
+            published = society.approve_release(project_scope, int(release["id"]), note)
+            st.success(f"Wave 1 released: {len(published)} work(s) published; marketing and sales opened.")
+            st.rerun()
+        if back.button("Return the wave with feedback", key=f"wave_return_{company_id}", use_container_width=True, disabled=not note.strip()):
+            reopened = society.return_release(project_scope, int(release["id"]), note)
+            st.warning(f"Wave returned: {reopened} final-edit item(s) opened with your feedback.")
+            st.rerun()
+    elif release and release["status"] == "released":
+        st.caption(f"Wave 1 released on {time.strftime('%Y-%m-%d', time.gmtime(float(release['released_at'] or 0)))}.")
+    elif status["gate_met"]:
+        if st.button("Send wave 1 to the board for review", key=f"wave_assemble_{company_id}", type="primary"):
+            society.assemble_wave(project_scope, company_id, 1)
+            st.rerun()
+    else:
+        st.caption("The wave goes to the board as one review once all six wave-1 works are final (each work's manuscript is assembled from its finished items).")
+
+
 def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
     st.subheader("Company")
     companies = society_store.companies_for(project_scope)
@@ -1946,7 +1981,7 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
                     extra_system=board_persona(company, company_facts(project_scope, company)),
                 )
                 if answer_id:
-                    rows = recent_messages(project_scope, 2, thread_id=thread_id)
+                    rows = recent_messages(project_scope, 2, workspace="company")  # the active chat, even after a migration
                     created = ingest_board_reply(project_scope, company_id, rows[-1]["content"] if rows else "")
                     if created:
                         st.info("Added to the backlog: " + "; ".join(created) + ". The CEO rates it in the next cycle.")
@@ -2049,13 +2084,14 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
                         society_store.set_work_status(int(item["id"]), "assigned", feedback=note or "returned by the board")
                         society.record_board_feedback(project_scope, company_id, item.get("catalog_id"), note or "returned")
                         st.rerun()
-        finals = [c for c in catalog if c["stage"] == "final"]
+        render_release_wave(project_scope, company_id, company)
+        finals = [c for c in catalog if c["stage"] == "final" and (company.get("kind") != "studio" or int(c.get("release_wave") or 0) != 1)]
         if finals:
             st.markdown("**Ready to publish**")
             for cat in finals:
                 if st.button(f"Publish · {cat['title']}", key=f"publish_{cat['id']}"):
                     society.publish_work(project_scope, int(cat["id"]))
-                    st.success(f"Published {cat['title']}: the artifact is locked and marketing and sales work is queued.")
+                    st.success(f"Published {cat['title']}: the manuscript is locked and marketing and sales work is queued.")
                     st.rerun()
     with rocks_tab:
         st.markdown("**Rocks (this quarter)**")
@@ -2132,6 +2168,18 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
 
 
 
+def parse_custom_sources(text: str) -> List[Dict[str, str]]:
+    """``name = url`` lines into inquiry sources; only public http(s) hosts with a {query} slot count."""
+    sources: List[Dict[str, str]] = []
+    for line in (text or "").splitlines():
+        name, sep, url = line.partition("=")
+        name, url = name.strip().lower().replace(" ", "_"), url.strip()
+        if not sep or not name or "{query}" not in url or unsafe_target(url.replace("{query}", "x")):
+            continue
+        sources.append({"name": name[:40], "url": url[:500]})
+    return sources
+
+
 def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
     st.subheader("Academy")
     st.caption(
@@ -2173,9 +2221,14 @@ def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional
         tick_minutes = int(t1.number_input("Tick every (minutes)", min_value=5, max_value=240, value=30, step=5, key="tick_minutes"))
         academy_hours = int(t2.number_input("Academy every (hours)", min_value=1, max_value=48, value=3, key="tick_academy_hours"))
         leisure_cap = int(t3.number_input("Agents exploring per tick", min_value=0, max_value=10, value=3, key="tick_leisure_cap"))
+        sources_text = st.text_area(
+            "Custom leisure sources (one per line: name = https://host/search?q={query})", key="tick_custom_sources", height=68,
+            help="Public JSON or HTML endpoints agents may spend tokens on; {query} is replaced. Headers with secrets are not supported here.",
+        )
+        custom_sources = parse_custom_sources(sources_text)
         s1, s2 = st.columns(2)
         if s1.button("Start the society tick", key="start_tick", type="primary", use_container_width=True, disabled=state["running"] or not configured_provider_names()):
-            society.start_tick(project_scope, job_secrets_for_session(), mode=active_mode(), interval_s=tick_minutes * 60, academy_interval_s=academy_hours * 3600, leisure_cap=leisure_cap, call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 1200))
+            society.start_tick(project_scope, job_secrets_for_session(), mode=active_mode(), interval_s=tick_minutes * 60, academy_interval_s=academy_hours * 3600, leisure_cap=leisure_cap, custom_sources=custom_sources, call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 1200))
             st.rerun()
         if s2.button("Stop the tick", key="stop_tick", use_container_width=True, disabled=not state["running"]):
             society.stop_tick(project_scope)

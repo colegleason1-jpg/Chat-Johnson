@@ -71,8 +71,10 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   AVS Studio (17-project IP catalog, six-work first wave, editorial/research/production/art seats)
   and AVS Software (one product manager per product, docs, support, marketing, sales, release, QA).
   Every seat has 3–5 roles and KPIs; founding agents fill the active seats until the academy
-  graduates replacements. A **company cycle** is a background job: weekly scorecard → Level 10
-  meeting (minutes locked as an artifact, issues and to-dos recorded) → the CEO rates the backlog →
+  graduates replacements. A **company cycle** is a background job: scorecard over a rolling seven-day
+  window (one row per seat, week, and KPI) → Level 10 meeting (minutes locked as an artifact; issues
+  and to-dos recorded; ROCK and DONE lines update rocks and close to-dos; timeline milestones complete
+  from catalog stages) → the CEO rates the backlog →
   the Executive Assistant delegates by role and load → analytics breaks large items down → seats
   produce deliverables in their own threads → the managing editor (or QA reviewer) passes or
   returns them with a deterministic check alongside → a report lands in the Board inbox. The chat
@@ -97,11 +99,21 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   how long it sleeps. The next time it works, the keyword-ranked excerpt of its own research rides in
   its persona. The **society tick** is one chained job (every 30 minutes by default) that wakes due
   agents for leisure and queues company and academy cycles on their intervals; it stops with the
-  app process and runs around the clock on the VM worker. The **release loop**: board feedback on a
-  work opens a final-edit item, Publish locks the artifact, opens marketing and sales, and queues
-  positioning, landing copy (rendered in the preview), a launch plan, outreach drafts, and pricing
-  notes; feedback themes are extracted for marketing. **Skip-level escalations** in a seat's output
-  are routed one level above the superior or below a subordinate and answered in the next cycle.
+  app process and runs around the clock on the VM worker; a cycle that fails (a provider outage)
+  is recorded as failed and the tick doubles its wait for every consecutive failure. The **release
+  loop**: a work's **manuscript** is assembled from every finished item (story bible, chapters, the
+  final edit last); the studio's six wave-1 works go to the board as one **release wave** once all
+  are final, and the board approves it (every manuscript published, marketing and sales opened,
+  positioning, landing copy, launch plan, outreach, and pricing queued) or returns it with feedback
+  that reopens a final edit carrying the manuscript. Feedback themes are extracted for marketing.
+  **Skip-level escalations** are one line, `ESCALATE: up|down :: message`, routed one level above the
+  superior or below a subordinate and answered in the next cycle. The **treasury** is the persisted
+  daily counters minus caps; each company's Settings slider is its share and the academy and leisure
+  split the rest; allowances go to free academy agents out of the academy's own budget; a registered
+  local model is a separate pool for producer-tier seats and academy tasks. Open seats prefer an
+  **exploring agent whose interest matches the roles**, woken into exploitation; failed academy tasks
+  come back with the grader's teaching note; the Head of Production and Art Director carry reachable
+  KPIs, the reviewer seat is never fired, and a CEO HOLD buys a seat a full week.
 - **Self-hosted VM (batch F, hardened in G)**: the Deploy Kit's `oracle-vm` target (also committed at
   the repo root: `Dockerfile`, `docker-compose.yml`, `Caddyfile`, `Caddyfile.open`, `scripts/vm-*.sh`)
   runs the app, a 24/7 worker container (`python -m orchestrator.jobs --worker`) that serves every
@@ -119,7 +131,8 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   where meant, the More menu has a **navigator** (search this chat, jump to any turn, show the window
   around it, back to latest), and **skills** in `skills/*.md` (front matter with keywords) are loaded
   into the prompt only when their keywords appear in the message; the answer caption names the skills
-  applied. Shipped: deploy-kit, repository-patching, mission-writing, company-reporting.
+  applied. Shipped: deploy-kit, repository-patching, mission-writing, company-reporting, spatial-layout,
+  mission-nodes.
 - **Spatial layout and web QA (batch D)**: a spatial mission (room, floor plan, arrangement…) asks the
   model for one fenced `scene` JSON block (room, objects with size, mass, anchor), then a
   deterministic numpy solver resolves it (floor snap, wall clamp, pairwise push-out along the
@@ -174,7 +187,7 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | Repository Work hub connector: fetch a GitHub repository through the API (public, or private with the armed token) into a temporary sandbox, run the pipeline, download the patch, push the change as a branch plus pull request; four tabs (Work, Deploy Kit, GitHub, Directions) | Implemented · tests of the fetched repository run only when ticked |
 | Deploy Kit (Repository Work): CI/CD workflow, Dockerfile, Helm chart, Terraform skeleton, serverless template, observability, rollback script, runbook; offline validation; zip download; lock as artifacts | Implemented · generation only, nothing is pushed or applied |
 | Post-deploy checks for this app: `?health=1` JSON view, `scripts/smoke_drive.py`, `post-deploy-smoke` workflow, `docs/RUNBOOK.md` | Implemented · set the `DEPLOY_URL` repository variable to arm the workflow |
-| Mission nodes (sub-agents, connectors, APIs per workstream) and chat → Task Finder handoff | Planned · `docs/MISSION_NODES_DESIGN.md` |
+| Mission nodes: executors, connectors, sub-missions, offline validation, stored node graph, chat handoff | Implemented (batch E) |
 | Session-only GitHub push: token and repo armed per session, one commit on a new branch plus an opened pull request, revert PR for any push from the session | Implemented · never the default branch |
 | App observability: every send persisted to `route_log`, Ops view (sends, share, p50/p95, truncations) and CSV export under the routing expander | Implemented |
 
@@ -190,7 +203,7 @@ confirmation; locked artifacts stay). Rename, Migrate now, and **Download this c
 with the archive, summaries, and inherited digest) live under More. Commit a download to a `transcripts/`
 folder in the repository to hand a full conversation to the assistant for an audit without pasting it.
 
-Every send is traced in the **Routing log** on the right (workspace, task type, provider/model,
+Every send is traced in the **Routing log** expander at the bottom of the page (workspace, task type, provider/model,
 latency, solver reason) and stored with its task type on the message, so routing can be judged
 against the project's vision over a long session.
 Each thread has its own 200-message window and its own texturized summaries.

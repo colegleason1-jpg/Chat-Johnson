@@ -9,6 +9,7 @@ allowed only as inline data: URIs; links only as in-page anchors.
 from __future__ import annotations
 
 import html
+import secrets
 import re
 from typing import Optional, Set
 
@@ -78,7 +79,7 @@ def sanitize_markup(source: str) -> str:
         link_rel=None,
         strip_comments=True,
         # nh3 strips <style> with its content by default; we allow it (CSS cannot run
-        # scripts, and url() is neutralised below) but keep every executable tag stripped.
+        # scripts, and url() is rewritten below as belt and braces; the document's CSP is the real control) but keep every executable tag stripped.
         clean_content_tags={"script", "iframe", "object", "embed", "form", "base", "link", "noscript", "template", "svg", "math"},
     )
     # <style> text survives as text; strip CSS that could reach the network or run.
@@ -123,16 +124,17 @@ def safe_preview_document(source: str) -> str:
         "<p class='notice' data-preview-status>Preview sandbox: scripts, frames, forms, event handlers, and remote "
         "resources are removed by an allowlist sanitizer; only inline data: images and in-page links survive.</p>"
     )
-    runtime = """
-    <script>
-    (() => {
+    nonce = secrets.token_urlsafe(12)  # the only script the CSP runs is this one; nothing that survives the sanitizer can execute
+    runtime = f"""
+    <script nonce="{nonce}">
+    (() => {{
       const status = document.querySelector('[data-preview-status]');
-      document.querySelectorAll('button').forEach((button) => {
-        button.addEventListener('click', () => {
+      document.querySelectorAll('button').forEach((button) => {{
+        button.addEventListener('click', () => {{
           if (status) status.textContent = 'Local preview interaction captured.';
-        });
-      });
-    })();
+        }});
+      }});
+    }})();
     </script>
     """
     if "preview-shell" not in value:
@@ -140,6 +142,6 @@ def safe_preview_document(source: str) -> str:
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'; "
-        "script-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-src 'none'; form-action 'none'\">"
+        f"script-src 'nonce-{nonce}'; img-src data:; connect-src 'none'; frame-src 'none'; form-action 'none'\">"
         f"</head><body>{value}{runtime}</body></html>"
     )

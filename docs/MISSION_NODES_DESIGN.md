@@ -1,6 +1,6 @@
 # Design · Mission nodes and the chat → Task Finder handoff
 
-Status: design only (operator asked for the plan; nothing here is built). Builds on the shipped
+Status: built in batch E (N1–N4 shipped: `orchestrator/missions.py`, `mission_runner.py`, `connectors_nodes.py`, the plan panel and the chat handoff in `app.py`); hardened in batch G (scope checks, gated execution, positional ids). Builds on the shipped
 Task Finder (writing missions, sized sections, assembled deliverable), the session-only GitHub
 push, the hub connector, and the Deploy Kit generator.
 

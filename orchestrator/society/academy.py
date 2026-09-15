@@ -11,6 +11,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .. import vault
+from ..errors import plain_error
 from ..jobs import JobCancelled, JobContext, enqueue, register_handler
 from ..router import _estimate_tokens, cortex_wait_seconds, generate_mode, local_endpoint, local_first_generate, strip_reasoning_tags
 from . import economy, evaluate, store
@@ -19,14 +20,18 @@ from .personas import build_academy_messages
 from .templates import ALLOWANCES
 
 KIND_ACADEMY = "academy_cycle"
-DEFAULT_MAX_CALLS = 12
+DEFAULT_MAX_CALLS = 24
 DEFAULT_MAX_TOKENS = 40_000
 DEFAULT_CALL_TOKENS = 700
-PRODUCERS_PER_CYCLE = 4
+PRODUCERS_PER_CYCLE = 4   # the floor; the budget raises it up to PRODUCERS_MAX so the society actually works
+PRODUCERS_MAX = 8
 PROMOTIONS_PER_CYCLE = 3
 PASSES_TO_AUXILIARY = 3
 AGREEMENTS_TO_EXAM = 3
 EXAM_PASS_SCORE = 70
+EXAM_COOLDOWN_SECONDS = 3 * 86_400.0
+ALLOWANCE_SHARE = 0.2  # of the cycle's token budget may be paid out as allowances
+TEACHING_PREFIX = "TEACHING"
 
 PRODUCER_TASKS: Tuple[Tuple[str, str], ...] = (
     ("Summarise a brief", "Summarise this in 120 words for a busy editor: 'The studio releases six literature works in wave one after a preliminary review by the board; feedback from each work shapes marketing and the company vision; the remaining eleven projects are outlined meanwhile.' Keep every number."),
@@ -53,6 +58,21 @@ EXAM_GRADE_PROMPT = (
     "'PLANNING: <0-100>' (ordered, concrete steps with inputs and outputs), 'SYNTHESIS: <0-100>' (one coherent recommendation), then 'PASS' or 'FAIL'.\nANSWER:\n{answer}"
 )
 _SCORE_RE = re.compile(r"SCORE\s*:\s*(\d{1,3})", re.I)
+_PASS_LINE_RE = re.compile(r"^\s*(?:verdict\s*:\s*)?(PASS|FAIL)\b", re.I)
+
+
+def verdict_passes(verdict: str) -> Optional[bool]:
+    """PASS/FAIL from the grader's lines ('PASS', 'Verdict: PASS', 'PASS.'); None when no line says either."""
+    for line in verdict.splitlines():
+        match = _PASS_LINE_RE.match(line)
+        if match:
+            return match.group(1).upper() == "PASS"
+    return None
+
+
+def producer_count(max_tokens: int, call_tokens: int, floor: int = PRODUCERS_PER_CYCLE, ceiling: int = PRODUCERS_MAX) -> int:
+    """How many producers work this cycle: the budget decides between the floor and the ceiling (a task plus its grade ≈ 4 calls' tokens)."""
+    return max(floor, min(ceiling, int(max_tokens) // max(1, int(call_tokens) * 4)))
 _RUBRIC_RE = re.compile(r"(CONTEXT|PLANNING|SYNTHESIS)\s*:\s*(\d{1,3})", re.I)
 _AUDIT_RE = re.compile(r"AUDIT\s*:\s*(.+)", re.I)
 
@@ -109,6 +129,11 @@ def _passes(scope: str, agent_id: int) -> int:
     return store.count("evaluations", scope, "agent_id = ? AND kind = 'task' AND passed = 1", (int(agent_id),))
 
 
+def _last_exam(scope: str, agent_id: int) -> float:
+    latest = store.rows("evaluations", scope, "agent_id = ? AND kind = 'graduation'", (int(agent_id),), order="id DESC", limit=1)
+    return float(latest[0]["timestamp"]) if latest else 0.0
+
+
 def _agreements(scope: str, grader_id: int) -> int:
     return sum(1 for r in store.rows("evaluations", scope, "grader_agent_id = ? AND kind = 'task'", (int(grader_id),), limit=500) if store.load_json(r.get("rubric"), {}).get("agree"))
 
@@ -129,26 +154,36 @@ def academy_cycle(ctx: JobContext) -> Dict[str, Any]:
     payload = ctx.payload
     mode = str(payload.get("mode") or "normal")
     call_tokens = int(payload.get("call_tokens") or DEFAULT_CALL_TOKENS)
-    treasury = economy.Treasury(ctx.ledger)
-    budget = CycleBudget(int(payload.get("max_calls") or DEFAULT_MAX_CALLS), max(call_tokens * 2, treasury.cycle_budget("academy", int(payload.get("max_tokens") or DEFAULT_MAX_TOKENS))))
+    treasury = economy.Treasury(ctx.ledger, economy.shares_for(scope))
+    budget = CycleBudget(int(payload.get("max_calls") or DEFAULT_MAX_CALLS), treasury.cycle_budget("academy", int(payload.get("max_tokens") or DEFAULT_MAX_TOKENS)))
     cycle_id = store.start_cycle(scope, "academy", None, ctx.job_id, budget.max_tokens)
+    if budget.max_tokens < call_tokens * 2:
+        note = [{"step": "budget", "stopped": f"treasury exhausted for today: {budget.max_tokens} tokens available for the academy"}]
+        store.finish_cycle(cycle_id, "budget", 0, 0, note)
+        ctx.progress(step=6, total=6, text="No treasury left for the academy today; nothing was called")
+        return {"cycle_id": cycle_id, "status": "budget", "calls": 0, "tokens": 0, "promoted": 0, "graduated": 0, "hired": 0, "log": note, "next_job": None}
     log: List[Dict[str, Any]] = []
     status = "done"
     stage = "allowance"
     promoted = graduated = 0
     hired: List[Dict[str, Any]] = []
     try:
-        granted = economy.allowance_run(scope, cycle_id)
+        # Allowances come out of this cycle's budget (free agents only), so nothing is minted from nothing.
+        granted = economy.allowance_run(scope, cycle_id, max_total=int(budget.max_tokens * ALLOWANCE_SHARE))
+        budget.tokens += granted
         log.append({"step": "allowance", "tokens": granted})
         ctx.progress(step=1, total=6, text=f"Allowances paid: {granted} tokens")
 
-        # Producers work: the ones with the fewest tasks so far go first.
+        # Producers work: the ones with the fewest tasks so far go first; the budget decides how many.
         stage = "producers"
         producers = sorted(store.agents_for(scope, tier="producer", employment="free"), key=lambda a: (_task_count(scope, int(a["id"])), int(a["id"])))
         pending: List[Tuple[Dict[str, Any], Tuple[str, str], str]] = []
-        for agent in producers[: int(payload.get("producers_per_cycle") or PRODUCERS_PER_CYCLE)]:
+        count = int(payload.get("producers_per_cycle") or producer_count(budget.max_tokens, call_tokens))
+        for agent in producers[:count]:
             title, brief = PRODUCER_TASKS[(int(agent["id"]) + cycle_id) % len(PRODUCER_TASKS)]
-            text, _ = call_free(ctx, budget, cycle_id, agent, f"TASK: {title}\n{brief}", "quick_text", call_tokens, mode=mode, prefer_local=True)
+            teaching = str(agent.get("note") or "")
+            role_note = f"A guardian's note on your last task: {teaching[len(TEACHING_PREFIX) + 1:].strip()}" if teaching.startswith(TEACHING_PREFIX) else ""
+            text, _ = call_free(ctx, budget, cycle_id, agent, f"TASK: {title}\n{brief}", "quick_text", call_tokens, mode=mode, role_note=role_note, prefer_local=True)
             pending.append((agent, (title, brief), text))
         log.append({"step": "producers", "tasks": len(pending)})
         ctx.progress(step=2, total=6, text=f"{len(pending)} producer task(s) done")
@@ -170,10 +205,17 @@ def academy_cycle(ctx: JobContext) -> Dict[str, Any]:
                 if verdict:
                     match = _SCORE_RE.search(verdict)
                     score = min(100, int(match.group(1))) / 100 if match else score
-                    model_pass = "PASS" in verdict.upper().splitlines()[1:3] if len(verdict.splitlines()) > 1 else "PASS" in verdict.upper()
+                    model_pass = verdict_passes(verdict)
                     audit_match = _AUDIT_RE.search(verdict)
                     audit = audit_match.group(1).strip()[:200] if audit_match else "ok"
             passed = bool(check["passed"] and (model_pass if model_pass is not None else True))
+            if grader and verdict and not passed:
+                # Auxiliaries teach as well as guard: the grader's notes reach the producer's next task.
+                notes = " ".join(line.strip() for line in verdict.splitlines()[2:5] if line.strip() and not line.upper().startswith("AUDIT"))[:300]
+                if notes:
+                    store.update("agents", int(agent["id"]), note=f"{TEACHING_PREFIX} ({grader['name']}): {notes}")
+            elif passed and str(agent.get("note") or "").startswith(TEACHING_PREFIX):
+                store.update("agents", int(agent["id"]), note="")
             store.insert("evaluations", scope, agent_id=int(agent["id"]), grader_agent_id=int(grader["id"]) if grader else None, kind="task", prompt_key=title,
                          score=round(score, 2), rubric={"check": check, "model_pass": model_pass, "audit": audit, "agree": (model_pass == check["passed"]) if model_pass is not None else None},
                          passed=int(passed), cycle_id=cycle_id, timestamp=time.time())
@@ -188,20 +230,26 @@ def academy_cycle(ctx: JobContext) -> Dict[str, Any]:
             if _passes(scope, int(agent["id"])) >= PASSES_TO_AUXILIARY:
                 _promote(scope, agent, "auxiliary", cycle_id, 1.0, f"{PASSES_TO_AUXILIARY} graded passes")
                 promoted += 1
+        # Candidates rotate: a failed exam sits out the cooldown, and the longest-waiting candidate goes first.
+        now = time.time()
         candidates = [a for a in store.agents_for(scope, tier="auxiliary", employment="free") if _agreements(scope, int(a["id"])) >= AGREEMENTS_TO_EXAM]
+        candidates = [a for a in candidates if now - _last_exam(scope, int(a["id"])) >= EXAM_COOLDOWN_SECONDS]
+        candidates.sort(key=lambda a: (_last_exam(scope, int(a["id"])), int(a["id"])))
         exam_log: Dict[str, Any] = {}
         if candidates:
             candidate = candidates[0]
             answer, _ = call_free(ctx, budget, cycle_id, candidate, PHILOSOPHER_EXAM, "reasoning", max(call_tokens, 900), mode=mode, role_note="This is your Philosopher evaluation.")
             check = evaluate.deterministic_check(PHILOSOPHER_EXAM, answer, min_words=250)
             scores: Dict[str, int] = {}
-            examiners = store.agents_for(scope, tier="philosopher")
+            examiners = store.agents_for(scope, tier="philosopher", employment="free") or store.agents_for(scope, tier="philosopher")
             model_pass = None
             if examiners:
                 try:
                     verdict, _ = call_free(ctx, budget, cycle_id, examiners[0], EXAM_GRADE_PROMPT.format(answer=answer[:6000]), "reasoning", min(call_tokens, 300), mode=mode, role_note="You are examining a graduation candidate.")
                     scores = {k.lower(): min(100, int(v)) for k, v in _RUBRIC_RE.findall(verdict)}
-                    model_pass = "PASS" in verdict.upper() and "FAIL" not in verdict.upper().splitlines()[-1]
+                    model_pass = verdict_passes(verdict)
+                    if model_pass is None:
+                        model_pass = "PASS" in verdict.upper() and "FAIL" not in verdict.upper().splitlines()[-1]
                 except CycleBudgetExceeded:
                     verdict = ""
             rubric_ok = bool(scores) and all(scores.get(k, 0) >= EXAM_PASS_SCORE for k in ("context", "planning", "synthesis"))
@@ -226,6 +274,10 @@ def academy_cycle(ctx: JobContext) -> Dict[str, Any]:
         log.append({"step": stage, "stopped": f"budget exhausted at {exc}"})
     except JobCancelled:
         store.finish_cycle(cycle_id, "cancelled", budget.tokens, budget.calls, log)
+        raise
+    except Exception as exc:  # the cycle row records the failure; the tick backs off instead of retrying blindly
+        log.append({"step": stage, "error": plain_error(exc)[:300]})
+        store.finish_cycle(cycle_id, "failed", budget.tokens, budget.calls, log)
         raise
     next_run_after: Optional[float] = None
     next_job: Optional[int] = None

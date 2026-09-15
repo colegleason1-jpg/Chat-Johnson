@@ -8,7 +8,7 @@ themselves when the tick is running; the tick is the scheduler.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .. import vault
 from ..jobs import ACTIVE_STATUSES, JobCancelled, JobContext, enqueue, register_handler
@@ -19,6 +19,7 @@ DEFAULT_INTERVAL_S = 30 * 60
 DEFAULT_ACADEMY_INTERVAL_S = 3 * 3600
 LEISURE_MAX_CALLS = 8
 LEISURE_MAX_TOKENS = 12_000
+MAX_BACKOFF_DOUBLINGS = 4
 
 
 def _company_job_active(scope: str, company_id: int) -> bool:
@@ -32,11 +33,25 @@ def _academy_job_active(scope: str) -> bool:
     return bool(vault.list_jobs(scope, ACTIVE_STATUSES, limit=1, kind=academy.KIND_ACADEMY))
 
 
-def _last_finished(scope: str, kind: str, company_id: Optional[int]) -> float:
-    where = "kind = ? AND finished_at IS NOT NULL" + (" AND company_id = ?" if company_id is not None else "")
+def _last_attempt(scope: str, kind: str, company_id: Optional[int]) -> Tuple[float, int]:
+    """(when the latest cycle of this kind started, how many consecutive latest cycles failed): a failed cycle counts as an attempt."""
+    where = "kind = ?" + (" AND company_id = ?" if company_id is not None else "")
     params: List[Any] = [kind] + ([int(company_id)] if company_id is not None else [])
-    rows = store.rows("cycles", scope, where, params, order="id DESC", limit=1)
-    return float(rows[0]["finished_at"]) if rows else 0.0
+    rows = store.rows("cycles", scope, where, params, order="id DESC", limit=MAX_BACKOFF_DOUBLINGS + 1)
+    if not rows:
+        return 0.0, 0
+    failures = 0
+    for row in rows:
+        if row.get("status") != "failed":
+            break
+        failures += 1
+    return float(rows[0]["started_at"]), failures
+
+
+def _due(scope: str, kind: str, company_id: Optional[int], interval: float, now: float) -> bool:
+    """Due when the interval has passed since the last attempt, doubled for every consecutive failure (bounded)."""
+    last, failures = _last_attempt(scope, kind, company_id)
+    return now - last >= interval * (2 ** min(failures, MAX_BACKOFF_DOUBLINGS))
 
 
 def society_tick(ctx: JobContext) -> Dict[str, Any]:
@@ -50,23 +65,29 @@ def society_tick(ctx: JobContext) -> Dict[str, Any]:
     # Companies whose interval has passed and that have no cycle queued or running.
     for company in store.companies_for(scope):
         cid = int(company["id"])
-        if now - _last_finished(scope, "company", cid) >= float(company["interval_s"]) and not _company_job_active(scope, cid):
+        if _due(scope, "company", cid, float(company["interval_s"]), now) and not _company_job_active(scope, cid):
             cycles.run_now(scope, cid, ctx.secrets, mode=mode, call_tokens=int(payload.get("call_tokens") or cycles.DEFAULT_CALL_TOKENS), chain=False)
             queued.append(company["name"])
-    if store.agents_for(scope) and now - _last_finished(scope, "academy", None) >= academy_interval and not _academy_job_active(scope):
+    if store.agents_for(scope) and _due(scope, "academy", None, academy_interval, now) and not _academy_job_active(scope):
         academy.run_now(scope, ctx.secrets, mode=mode, call_tokens=min(int(payload.get("call_tokens") or 900), 900), chain=False)
         queued.append("academy")
-    # Leisure runs inline: a few agents explore per tick.
-    treasury = economy.Treasury(ctx.ledger)
-    budget = cycles.CycleBudget(LEISURE_MAX_CALLS, max(800, treasury.cycle_budget("leisure", LEISURE_MAX_TOKENS)))
+    # Leisure runs inline: a few agents explore per tick, only while the leisure share can afford a call.
+    treasury = economy.Treasury(ctx.ledger, economy.shares_for(scope))
+    budget = cycles.CycleBudget(LEISURE_MAX_CALLS, treasury.cycle_budget("leisure", LEISURE_MAX_TOKENS))
     cycle_id = store.start_cycle(scope, "leisure", None, ctx.job_id, budget.max_tokens)
     explored: List[Dict[str, Any]] = []
     status = "done"
-    try:
-        explored = leisure.run_leisure(ctx, budget, cycle_id, academy.call_free, cap=int(payload.get("leisure_cap") or leisure.MAX_PER_TICK), custom_sources=payload.get("custom_sources") or [], mode=mode)
-    except JobCancelled:
-        store.finish_cycle(cycle_id, "cancelled", budget.tokens, budget.calls, [])
-        raise
+    if budget.max_tokens < 800:
+        status = "budget"
+    else:
+        try:
+            explored = leisure.run_leisure(ctx, budget, cycle_id, academy.call_free, cap=int(payload.get("leisure_cap") or leisure.MAX_PER_TICK), custom_sources=payload.get("custom_sources") or [], mode=mode)
+        except JobCancelled:
+            store.finish_cycle(cycle_id, "cancelled", budget.tokens, budget.calls, [])
+            raise
+        except Exception as exc:  # leisure never takes the tick down; the row says what happened
+            status = "failed"
+            explored = [{"error": str(exc)[:200]}]
     store.finish_cycle(cycle_id, status, budget.tokens, budget.calls, [{"step": "leisure", "explored": explored, "queued": queued}])
     next_run_after = now + max(60.0, interval)
     next_job = enqueue(scope, KIND_TICK, {k: v for k, v in payload.items() if k != "chained_from"} | {"chained_from": ctx.job_id}, ctx.secrets, run_after=next_run_after)
@@ -76,6 +97,9 @@ def society_tick(ctx: JobContext) -> Dict[str, Any]:
 
 
 def start_tick(scope: str, secrets: Dict[str, str], mode: str = "normal", interval_s: float = DEFAULT_INTERVAL_S, academy_interval_s: float = DEFAULT_ACADEMY_INTERVAL_S, leisure_cap: int = leisure.MAX_PER_TICK, custom_sources: Optional[List[Dict[str, Any]]] = None, call_tokens: int = cycles.DEFAULT_CALL_TOKENS) -> int:
+    state = tick_state(scope)
+    if state["running"]:
+        return int(state["jobs"][0]["id"])  # two chains would double every leisure spend
     payload = {"mode": mode, "interval_s": float(interval_s), "academy_interval_s": float(academy_interval_s), "leisure_cap": int(leisure_cap), "custom_sources": list(custom_sources or []), "call_tokens": int(call_tokens)}
     return enqueue(scope, KIND_TICK, payload, secrets)
 

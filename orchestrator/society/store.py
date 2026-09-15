@@ -111,6 +111,11 @@ CREATE TABLE IF NOT EXISTS inquiries (
     url TEXT NOT NULL DEFAULT '', cost_tokens INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'done', cycle_id INTEGER,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS releases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, project_scope TEXT NOT NULL, company_id INTEGER NOT NULL, wave INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'draft', works TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL,
+    reviewed_at REAL, released_at REAL
+);
 CREATE TABLE IF NOT EXISTS cycles (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_scope TEXT NOT NULL, kind TEXT NOT NULL, company_id INTEGER, job_id INTEGER,
     started_at REAL NOT NULL, finished_at REAL, tokens_planned INTEGER NOT NULL DEFAULT 0, tokens_used INTEGER NOT NULL DEFAULT 0,
@@ -121,8 +126,9 @@ CREATE TABLE IF NOT EXISTS cycles (
 TABLES = (
     "companies", "departments", "teams", "seats", "rocks", "issues", "todos", "meetings", "timeline", "catalog",
     "work_items", "escalations", "scorecard", "feedback", "agents", "token_ledger", "evaluations", "dream_bank",
-    "inquiries", "cycles", "personnel_log",
+    "inquiries", "cycles", "personnel_log", "releases",
 )
+RELEASE_STATUSES = ("draft", "board_review", "released", "returned")
 WORK_STATUSES = ("backlog", "rated", "assigned", "running", "review", "board", "done", "rejected")
 CATALOG_STAGES = ("backlog", "development", "draft", "edit", "preliminary_review", "board_feedback", "final", "published", "marketed")
 TIERS = ("producer", "auxiliary", "philosopher")
@@ -153,21 +159,33 @@ def insert(table: str, project_scope: str, **columns: Any) -> int:
         return int(cursor.lastrowid)
 
 
-def update(table: str, row_id: int, **columns: Any) -> None:
+def update(table: str, row_id: int, project_scope: Optional[str] = None, **columns: Any) -> None:
     if table not in TABLES or not columns:
         return
     names = list(columns)
     values = [json.dumps(v) if isinstance(v, (dict, list)) else v for v in columns.values()]
     with vault._open_database() as connection:
+        vault._check_scope(connection, table, int(row_id), project_scope)
         connection.execute(f"UPDATE {table} SET {', '.join(f'{n} = ?' for n in names)} WHERE id = ?", (*values, int(row_id)))
 
 
-def row(table: str, row_id: int) -> Optional[Dict[str, Any]]:
+def row(table: str, row_id: int, project_scope: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """One row by id; with ``project_scope`` the row must belong to that scope (ScopeMismatch otherwise)."""
     if table not in TABLES:
         return None
     with vault._open_database() as connection:
+        vault._check_scope(connection, table, int(row_id), project_scope)
         found = connection.execute(f"SELECT * FROM {table} WHERE id = ?", (int(row_id),)).fetchone()
     return dict(found) if found else None
+
+
+def delete(table: str, project_scope: str, where: str, params: Sequence[Any] = ()) -> int:
+    """Delete rows of one scope matching ``where``; returns the count."""
+    if table not in TABLES or not where.strip():
+        return 0
+    with vault._open_database() as connection:
+        cursor = connection.execute(f"DELETE FROM {table} WHERE project_scope = ? AND {where}", (_scope(project_scope), *params))
+        return int(cursor.rowcount)
 
 
 def rows(
@@ -279,24 +297,49 @@ def add_agent(project_scope: str, name: str, persona: str, tier: str = "producer
 
 
 def seat_agent(project_scope: str, seat_id: int, agent_id: int) -> None:
+    """Seat an agent: it is woken into exploitation now (an exploring agent's sleep ends when work calls)."""
     update("seats", seat_id, agent_id=int(agent_id), status="filled", miss_weeks=0, miss_week="", idle_cycles=0)
-    update("agents", agent_id, seat_id=int(seat_id), employment="seated", mode="exploit")
+    update("agents", agent_id, seat_id=int(seat_id), employment="seated", mode="exploit", wake_after=0)
 
 
 def log_personnel(project_scope: str, event: str, company_id: Optional[int] = None, seat_id: Optional[int] = None, agent_id: Optional[int] = None, reason: str = "", approved_by: str = "") -> int:
     return insert("personnel_log", project_scope, company_id=company_id, seat_id=seat_id, agent_id=agent_id, event=event, reason=reason[:500], approved_by=approved_by, created_at=time.time())
 
 
+def _released_recently(agent: Dict[str, Any], now: float) -> bool:
+    """A fired or retired agent sits out its cooldown; an exploring agent's sleep is not a cooldown."""
+    return str(agent.get("mode") or "") != "explore" and float(agent.get("wake_after") or 0) > now
+
+
 def graduate_pool(project_scope: str) -> List[Dict[str, Any]]:
-    """Free Philosophers ranked by their latest evaluation score (cooldown honoured), best first."""
+    """Free Philosophers ranked by their latest evaluation score (fire cooldown honoured), best first."""
     now = time.time()
-    pool = [a for a in agents_for(project_scope, tier="philosopher", employment="free") if float(a.get("wake_after") or 0) <= now]
+    pool = [a for a in agents_for(project_scope, tier="philosopher", employment="free") if not _released_recently(a, now)]
 
     def rank(agent: Dict[str, Any]) -> float:
         latest = rows("evaluations", project_scope, "agent_id = ?", (int(agent["id"]),), order="id DESC", limit=1)
         return float(latest[0]["score"]) if latest else 0.5
 
     return sorted(pool, key=lambda a: (-rank(a), int(a["id"])))
+
+
+def wake_for_seat(pool: List[Dict[str, Any]], seat: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Pick the graduate for a seat: an exploring agent whose interest matches the seat's roles is woken first,
+    then the best-ranked free graduate. The chosen agent is removed from ``pool``."""
+    from ..keyword_search import keywords
+
+    if not pool:
+        return None
+    roles = " ".join(load_json(seat.get("roles"), [])) + " " + str(seat.get("title", ""))
+    role_words = set(keywords(roles))
+    best_index, best_score = 0, -1
+    for index, agent in enumerate(pool):
+        interest = f"{agent.get('interest', '')} {agent.get('focus', '')}"
+        overlap = len(role_words & set(keywords(interest)))
+        score = overlap * 10 + (5 if str(agent.get("mode")) == "explore" and overlap else 0) - index * 0.01
+        if score > best_score:
+            best_index, best_score = index, score
+    return pool.pop(best_index)
 
 
 def fill_open_seats(project_scope: str, company_id: Optional[int] = None, active_departments_only: bool = True) -> List[Dict[str, Any]]:
@@ -311,10 +354,14 @@ def fill_open_seats(project_scope: str, company_id: Optional[int] = None, active
             continue
         if not pool:
             break
-        agent = pool.pop(0)
+        agent = wake_for_seat(pool, seat)
+        if agent is None:
+            break
+        woken = str(agent.get("mode")) == "explore"
         seat_agent(project_scope, int(seat["id"]), int(agent["id"]))
-        log_personnel(project_scope, "hire", company_id=seat.get("company_id"), seat_id=int(seat["id"]), agent_id=int(agent["id"]), reason="graduate filled an open seat", approved_by="ceo")
-        hired.append({"seat": seat, "agent": agent})
+        log_personnel(project_scope, "hire", company_id=seat.get("company_id"), seat_id=int(seat["id"]), agent_id=int(agent["id"]),
+                      reason=("woken from exploration: " + str(agent.get("interest") or "")[:120]) if woken else "graduate filled an open seat", approved_by="ceo")
+        hired.append({"seat": seat, "agent": agent, "woken": woken})
     return hired
 
 

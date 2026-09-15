@@ -83,7 +83,9 @@ def github_revert(ctx: Any, config: Mapping[str, Any], outputs: Outputs, extras:
     raw = config.get("record") or (extras.get("push_records") or [None])[-1]
     if not raw:
         raise ValueError("nothing to revert: no push record in this mission or config")
-    record = PushRecord(**raw)
+    if not isinstance(raw, Mapping) or not raw.get("files") or not isinstance(raw.get("previous"), Mapping):
+        raise ValueError("the revert record must carry the pushed files and their pre-push state (previous)")
+    record = PushRecord(**{k: v for k, v in raw.items() if k in PushRecord.__dataclass_fields__})
     result = GitHubWriter(token, f"{record.owner}/{record.repo}").open_revert(record)
     return f"Revert pull request #{result.pr_number} opened: {result.pr_url}"
 

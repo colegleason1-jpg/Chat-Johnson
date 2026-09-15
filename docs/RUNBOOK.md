@@ -82,15 +82,30 @@
 ## Company cycles
 - A cycle is a `company_cycle` job. Its budget is the smaller of the cycle's hard cap and the
   company's treasury share of what the keyed vendors can still serve today; it stops cleanly
-  (`status = budget`) when either runs out and reports what it did. "Keep cycling" queues the next
-  cycle with `run_after`; the chain lives only while the process and its session keys survive
-  (the VM worker with env keys makes it 24/7). Pause cancels the queued successor.
+  (`status = budget`) when either runs out and reports what it did; a treasury that cannot afford one
+  call ends the cycle before any request. "Keep cycling" queues the next cycle with `run_after`; the
+  chain lives only while the process and its session keys survive (the VM worker with env keys makes
+  it 24/7). Pause cancels the queued successor. The tick backs off a failing cycle: each consecutive
+  failure doubles the wait, up to sixteen intervals.
+
+- Release waves: the studio's six wave-1 works go to the board together once every one is `final`
+  (Company → Backlog & catalog → *Send wave 1 to the board for review*). Each work's manuscript is
+  assembled from its finished items (story bible, chapters, final edit last) under
+  `company/avs_studio/works/`; Approve publishes all six and opens marketing and sales, Return
+  records the feedback and opens a final-edit item per work that carries the manuscript. Software
+  products still publish one at a time.
 
 ## Academy cycles and personnel
-- `academy_cycle` jobs are bounded to 12 calls and the academy's treasury share. Promotions are
-  capped per cycle and every grade is paired with the deterministic check, so a model cannot promote
-  by flattery alone. Firing needs two missed scorecard weeks and the CEO's APPROVE; released agents
-  keep their history and sit out a week before graduation can seat them again.
+- `academy_cycle` jobs are bounded to 24 calls and the academy's treasury share (the remainder the
+  companies' sliders leave, split 5:3 with leisure). Between 4 and 8 producers work per cycle as the
+  budget allows; allowances are paid to free agents out of the same budget (never more than a fifth
+  of it). Promotions are capped per cycle and every grade is paired with the deterministic check, so
+  a model cannot promote by flattery alone; a failed task returns to the producer with the grader's
+  note; a failed Philosopher exam sits out three days while other candidates go first. Firing needs
+  two missed weeks (rolling seven-day KPIs) and the CEO's APPROVE; a HOLD resets the count to one
+  week; the reviewer seat and the executive seats are never fired; released agents keep their
+  history and sit out a week before graduation can seat them again. A cycle that raises is recorded
+  as `failed` with the reason and its running items go back to `assigned`.
 
 ## Society tick and leisure
 - Start the tick in the Academy workspace; it queues cycles on their intervals and runs a few

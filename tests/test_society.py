@@ -204,7 +204,8 @@ def test_academy_cycle_grades_promotes_graduates_and_fills_open_seats(db, monkey
     store.unseat_agent(db, int(writer["id"]), note="left")
     assert store.open_seats(db, avs)[0]["key"] in {s["key"] for s in store.seats_for(db, avs, "open")}
     free_philosophers_before = len(store.agents_for(db, tier="philosopher", employment="free"))
-    allowances_before = sum(int(a["allowance"]) for a in store.agents_for(db))  # paid before promotions raise anyone's allowance
+    free_allowances = sum(int(a["allowance"]) for a in store.agents_for(db, employment="free"))  # only free agents draw an allowance
+    seated_before = {int(a["id"]) for a in store.agents_for(db, employment="seated")}
     calls = []
     monkeypatch.setattr(academy, "generate_mode", fake_academy_model(calls))
     monkeypatch.setattr(academy, "cortex_wait_seconds", lambda ledger, messages, budget: 0.0)
@@ -217,9 +218,11 @@ def test_academy_cycle_grades_promotes_graduates_and_fills_open_seats(db, monkey
     assert result["status"] == "done" and result["calls"] <= academy.DEFAULT_MAX_CALLS
     steps = [entry["step"] for entry in result["log"]]
     assert steps == ["allowance", "producers", "grading", "promotions", "hiring"]
-    assert result["log"][1]["tasks"] == academy.PRODUCERS_PER_CYCLE and result["log"][2]["graded"] == academy.PRODUCERS_PER_CYCLE
+    tasks = result["log"][1]["tasks"]  # the budget decides between the floor and the ceiling (fewer only when the pool is smaller)
+    assert academy.PRODUCERS_PER_CYCLE <= tasks <= academy.PRODUCERS_MAX and result["log"][2]["graded"] == tasks
+    assert tasks == min(len(producers), academy.producer_count(academy.DEFAULT_MAX_TOKENS, academy.DEFAULT_CALL_TOKENS))
     graded = store.rows("evaluations", db, "kind = 'task' AND cycle_id = ?", (result["cycle_id"],))
-    assert len(graded) == academy.PRODUCERS_PER_CYCLE and all(g["grader_agent_id"] and g["passed"] for g in graded)
+    assert len(graded) == result["log"][1]["tasks"] and all(g["grader_agent_id"] and g["passed"] for g in graded)
     assert store.load_json(graded[0]["rubric"], {})["agree"] is True and store.load_json(graded[0]["rubric"], {})["audit"] == "ok"
     assert store.row("agents", int(producers[0]["id"]))["tier"] == "auxiliary"  # three graded passes
     assert result["promoted"] >= 1 and result["graduated"] == 1
@@ -228,7 +231,9 @@ def test_academy_cycle_grades_promotes_graduates_and_fills_open_seats(db, monkey
     assert len(store.agents_for(db, tier="philosopher", employment="free")) <= free_philosophers_before + 1
     events = [r["event"] for r in store.rows("personnel_log", db)]
     assert "promote" in events and "graduate" in events and "hire" in events
-    assert sum(r["amount"] for r in store.rows("token_ledger", db, "kind = 'allowance'")) == allowances_before
+    paid = sum(r["amount"] for r in store.rows("token_ledger", db, "kind = 'allowance'"))
+    assert 0 < paid <= min(free_allowances, int(academy.DEFAULT_MAX_TOKENS * academy.ALLOWANCE_SHARE))  # funded from the cycle budget, free agents only
+    assert not any(r["agent_id"] in seated_before for r in store.rows("token_ledger", db, "kind = 'allowance'"))  # founders in seats earn by working
     assert store.rows("cycles", db, "kind = 'academy'")[0]["status"] == "done"
     assert vault.list_jobs(db, ("queued",), kind=academy.KIND_ACADEMY)  # chained successor
 

@@ -14,9 +14,9 @@ from . import store
 
 DAY = 86_400.0
 DEFAULT_PRODUCTS: Tuple[Tuple[str, str, str], ...] = (
-    ("supply_chain_optimizer", "Supply Chain Optimizer", "Optimises supply chain routing and stock decisions (name to confirm)."),
-    ("chatbot_book_system", "Chat Bot Book System", "A chat bot that reads, indexes, and converses about books."),
-    ("api", "The API", "The operator's API product: programmatic access to the studio's capabilities."),
+    ("supply_chain_optimizer", "Supply Chain Optimizer", "Routes stock between warehouses to cut shortages: runs nightly, exports a CSV plan, needs no new hardware (product name to confirm with the board)."),
+    ("chatbot_book_system", "Chat Bot Book System", "A chat bot that reads, indexes, and converses about a reader's own books; books stay on the reader's device and only selected passages reach the model."),
+    ("api", "The API", "Programmatic access to the operator's software: routing, chat-over-documents, and the studio's tooling as endpoints with keys, quotas, and usage reports."),
 )
 
 
@@ -58,13 +58,13 @@ AVS_SEATS: Tuple[SeatSpec, ...] = EXEC_SEATS + (
     SeatSpec("editor_2", "Editor", "editorial", "managing_editor", ("line edit", "continuity notes", "prepare works for preliminary review"), {"deliverables": 1, "review_pass_rate": 0.6}),
     SeatSpec("research_lead", "Research Lead", "research", "ea_ceo", ("plan research per project", "verify facts and settings", "brief writers"), {"deliverables": 1}, 4),
     SeatSpec("researcher_1", "Researcher", "research", "research_lead", ("gather sources", "summarise findings", "answer writers' questions"), {"deliverables": 1, "review_pass_rate": 0.6}),
-    SeatSpec("production_lead", "Head of Production", "production", "ea_ceo", ("schedule drafts", "balance writer load", "keep projects on the timeline"), {"reviews": 1}, 4),
+    SeatSpec("production_lead", "Head of Production", "production", "ea_ceo", ("schedule drafts", "balance writer load", "keep projects on the timeline"), {"reports": 1, "review_pass_rate": 0.6}, 4),
     SeatSpec("lead_writer_1", "Lead Writer", "production", "production_lead", ("outline and draft assigned works", "keep voice consistent", "revise on editor notes"), {"deliverables": 1, "review_pass_rate": 0.6}, 4),
     SeatSpec("lead_writer_2", "Lead Writer", "production", "production_lead", ("outline and draft assigned works", "keep voice consistent", "revise on editor notes"), {"deliverables": 1, "review_pass_rate": 0.6}, 4),
     SeatSpec("lead_writer_3", "Lead Writer", "production", "production_lead", ("outline and draft assigned works", "keep voice consistent", "revise on editor notes"), {"deliverables": 1, "review_pass_rate": 0.6}, 4),
     SeatSpec("writer_1", "Writer", "production", "lead_writer_1", ("draft chapters and scenes", "revise on notes", "keep the story bible current"), {"deliverables": 1, "review_pass_rate": 0.6}),
     SeatSpec("writer_2", "Writer", "production", "lead_writer_2", ("draft chapters and scenes", "revise on notes", "keep the story bible current"), {"deliverables": 1, "review_pass_rate": 0.6}),
-    SeatSpec("art_director", "Art Director", "art", "ea_ceo", ("define the visual identity per project", "brief illustration and design", "approve briefs"), {"reviews": 1}, 3),
+    SeatSpec("art_director", "Art Director", "art", "ea_ceo", ("define the visual identity per project", "brief illustration and design", "approve briefs"), {"reports": 1, "review_pass_rate": 0.6}, 3),
     SeatSpec("illustration_brief", "Illustration Brief Writer", "art", "art_director", ("write illustration briefs", "reference sheets", "cover concepts"), {"deliverables": 1, "review_pass_rate": 0.6}),
     SeatSpec("designer", "Designer", "art", "art_director", ("layout and cover design briefs", "typography notes", "format for release"), {"deliverables": 1, "review_pass_rate": 0.6}),
     SeatSpec("production_coordinator", "Production Coordinator", "coordination", "ea_ceo", ("hand work between departments", "flag timeline drift", "keep the vision in every brief"), {"reports": 1}, 3),

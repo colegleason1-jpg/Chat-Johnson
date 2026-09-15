@@ -1,0 +1,11 @@
+# The page paints its own dark gradient; the theme keeps Streamlit's text, tables, and inputs readable on it
+# whatever the viewer's system setting (an iPad in light mode drew dark text on a near-black page).
+[theme]
+base = "dark"
+primaryColor = "#6ea8fe"
+backgroundColor = "#0a1220"
+secondaryBackgroundColor = "#0b1527"
+textColor = "#e6edf7"
+
+[server]
+headless = true

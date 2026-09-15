@@ -8,7 +8,8 @@ from . import store
 
 SKIP_LEVEL_RULE = (
     "Skip-level rule: for advice or a problem your line cannot resolve you may consult one seat above your superior "
-    "({above}) or one seat below your subordinates ({below}); say so as an escalation, never act for them."
+    "({above}) or one seat below your subordinates ({below}); never act for them. To do so, end your answer with one line "
+    "exactly 'ESCALATE: up :: <your message>' or 'ESCALATE: down :: <your message>'; it is routed and answered next cycle."
 )
 EA_BOARD_INSTRUCTIONS = (
     "You are the Executive Assistant to the Board of {company}. The board (the operator) speaks to you directly. "

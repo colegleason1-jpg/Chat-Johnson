@@ -11,10 +11,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import vault
+from ..errors import plain_error
 from ..jobs import JobCancelled, JobContext, enqueue, register_handler
 from ..missions import assemble_deliverable, deliverable_slug, task_plan
-from ..router import _estimate_tokens, cortex_wait_seconds, generate_mode, strip_reasoning_tags
-from . import economy, eos, evaluate, store
+from ..router import _estimate_tokens, cortex_wait_seconds, generate_mode, local_endpoint, local_first_generate, strip_reasoning_tags
+from . import economy, eos, evaluate, release, store
 from .personas import build_agent_messages
 from .templates import match_seat
 
@@ -29,7 +30,9 @@ MAX_ITEM_RETRIES = 2
 L10_PROMPT = (
     "Run this week's Level 10 meeting from the agenda below. Reply with lines only, no prose: up to 3 lines "
     "'HEADLINE: <one sentence>', up to 3 lines 'ISSUE: <title> | RESOLUTION: <what we do>', up to 5 lines "
-    "'TODO: <seat_key>: <task>', and at most one 'QUESTION: <a decision only the board can make>'.\nAGENDA:\n{agenda}\nSEAT KEYS: {seats}"
+    "'TODO: <seat_key>: <task>', one line per rock whose status changed 'ROCK: <rock title> | on_track|off_track|done', "
+    "one line per finished to-do 'DONE: <seat_key>: <the to-do>', and at most one 'QUESTION: <a decision only the board can make>'."
+    "\nAGENDA:\n{agenda}\nSEAT KEYS: {seats}"
 )
 RATE_PROMPT = "Rate each backlog item 1–5 for importance to the rocks and the timeline (5 = do first). Reply one line per item, exactly '#<id>: <1-5>'.\nROCKS: {rocks}\nITEMS:\n{items}"
 DELEGATE_PROMPT = (
@@ -43,6 +46,8 @@ FIRE_PROMPT = (
     "Reply exactly APPROVE to release the agent back to the society (a graduate takes the seat), or HOLD followed by one line on why."
 )
 EXEC_KEYS = ("ea_board", "ceo", "ea_ceo")
+PROTECTED_KEYS = EXEC_KEYS + ("managing_editor", "qa_reviewer")  # the reviewer seat gone means nothing passes review
+PRODUCER_DEPARTMENTS = ("production", "research", "art", "docs", "support", "coordination")  # local-first when a local model exists
 FIRES_PER_CYCLE = 2
 IDLE_CYCLES_TO_RETIRE = 4
 REPORT_PROMPT = "Write this cycle's report for the board in under 200 words: what moved, what waits for the board, issues, and the next cycle. Facts:\n{facts}"
@@ -89,9 +94,12 @@ def ensure_seat_thread(scope: str, seat: Dict[str, Any], company: Dict[str, Any]
 
 def call(
     ctx: JobContext, budget: CycleBudget, cycle_id: int, agent: Dict[str, Any], seat: Dict[str, Any], company: Dict[str, Any],
-    prompt: str, task_type: str, seats_by_id: Dict[int, Dict[str, Any]], max_tokens: int, mode: str = "normal",
+    prompt: str, task_type: str, seats_by_id: Dict[int, Dict[str, Any]], max_tokens: int, mode: str = "normal", prefer_local: bool = False,
 ) -> Tuple[str, Any]:
-    """One metered model call in a seat's own thread; raises CycleBudgetExceeded before overspending."""
+    """One metered model call in a seat's own thread; raises CycleBudgetExceeded before overspending.
+
+    ``prefer_local`` sends producer-tier work (writers, researchers, art, docs, support) to a registered local model first.
+    """
     thread_id = ensure_seat_thread(ctx.project_scope, seat, company)
     from .leisure import dream_excerpt_for  # local: leisure imports this module
 
@@ -106,7 +114,10 @@ def call(
         ctx.sleep(wait + 0.5)
     started = time.perf_counter()
     with ctx.request_lock:
-        answer, decision = generate_mode(mode, task_type, messages, ctx.ledger, max_tokens=max_tokens, temperature=0.3)
+        if prefer_local and local_endpoint() is not None:
+            answer, decision = local_first_generate(mode, task_type, messages, ctx.ledger, max_tokens=max_tokens, temperature=0.3)
+        else:
+            answer, decision = generate_mode(mode, task_type, messages, ctx.ledger, max_tokens=max_tokens, temperature=0.3)
     answer = strip_reasoning_tags(answer)
     scope = ctx.project_scope
     vault.append_message(scope, "user", prompt, mode=mode, thread_id=thread_id, workspace=WORKSPACE, task_type=task_type)
@@ -159,7 +170,7 @@ def personnel_review(
         else:
             miss_weeks = 0
             store.update("seats", int(seat["id"]), miss_weeks=0)
-        if miss_weeks >= 2 and seat["key"] not in EXEC_KEYS and fires < FIRES_PER_CYCLE:
+        if miss_weeks >= 2 and seat["key"] not in PROTECTED_KEYS and fires < FIRES_PER_CYCLE:
             fires += 1
             agent = agents.get(int(seat["agent_id"]), {})
             details = "; ".join(f"{m['kpi']} {m['actual']} < {m['target']}" for m in misses if m["seat"] == seat["key"])
@@ -170,6 +181,8 @@ def personnel_review(
                 store.log_personnel(scope, "fire", company_id=company_id, seat_id=int(seat["id"]), agent_id=int(seat["agent_id"]), reason=details, approved_by="ceo")
                 events["fired"] += 1
             else:
+                # A HOLD buys the seat a week: the question comes back only after another missed week.
+                store.update("seats", int(seat["id"]), miss_weeks=1, miss_week=week)
                 store.log_personnel(scope, "hold", company_id=company_id, seat_id=int(seat["id"]), agent_id=int(seat["agent_id"]), reason=verdict.strip()[:300] or "no CEO verdict", approved_by="ceo")
                 events["held"] += 1
     # Seats follow load: one new seat per cycle where a department's assigned work exceeds twice its filled seats;
@@ -247,16 +260,27 @@ def company_cycle(ctx: JobContext) -> Dict[str, Any]:
     company_id = int(company["id"])
     mode = str(payload.get("mode") or "normal")
     call_tokens = int(payload.get("call_tokens") or DEFAULT_CALL_TOKENS)
-    treasury = economy.Treasury(ctx.ledger)
+    treasury = economy.Treasury(ctx.ledger, economy.shares_for(scope))
     hard_cap = int(payload.get("max_tokens") or DEFAULT_MAX_TOKENS)
-    share_key = "company" if company["key"] == "avs_studio" else "company_2"
-    budget = CycleBudget(int(payload.get("max_calls") or DEFAULT_MAX_CALLS), max(call_tokens * 2, treasury.cycle_budget(share_key, hard_cap)))
+    share_key = economy.share_key_for(company)
+    # The company's own slider is the share; no floor: a treasury that cannot afford one call means no cycle today.
+    budget = CycleBudget(int(payload.get("max_calls") or DEFAULT_MAX_CALLS), treasury.cycle_budget(share_key, hard_cap, share=float(company.get("daily_share") or 0.0) or None))
     cycle_id = store.start_cycle(scope, "company", company_id, ctx.job_id, budget.max_tokens)
+    if budget.max_tokens < call_tokens * 2:
+        note = [{"step": "budget", "stopped": f"treasury exhausted for today: {budget.max_tokens} tokens available for this company"}]
+        store.finish_cycle(cycle_id, "budget", 0, 0, note)
+        ctx.progress(step=8, total=8, text="No treasury left for this company today; nothing was called")
+        return {"cycle_id": cycle_id, "status": "budget", "calls": 0, "tokens": 0, "to_board": 0, "log": note, "next_job": None, "next_run_after": None}
+    # Items a crashed cycle left running go back to the queue before anything is delegated.
+    for stale in store.work_items_for(scope, company_id, ("running",), limit=200):
+        store.set_work_status(int(stale["id"]), "assigned")
     seats = store.seats_for(scope, company_id)
     seats_by_id = {int(s["id"]): s for s in seats}
     seats_by_key = {s["key"]: s for s in seats}
     agents = {int(a["id"]): a for a in store.agents_for(scope)}
-    active_depts = {int(d["id"]) for d in store.departments_for(scope, company_id) if d["active"]}
+    departments = store.departments_for(scope, company_id)
+    active_depts = {int(d["id"]) for d in departments if d["active"]}
+    producer_depts = {int(d["id"]) for d in departments if d["key"] in PRODUCER_DEPARTMENTS}
     load: Dict[int, int] = {}
     for item in store.work_items_for(scope, company_id, ("assigned", "running"), limit=500):
         if item.get("seat_id"):
@@ -306,12 +330,14 @@ def company_cycle(ctx: JobContext) -> Dict[str, Any]:
             seat_key, _, text = todo.partition(":")
             seat = seats_by_key.get(seat_key.strip())
             store.insert("todos", scope, company_id=company_id, seat_id=seat["id"] if seat else None, text=(text or todo).strip()[:300], due_at=time.time() + 7 * eos.DAY, created_at=time.time())
+        applied = eos.apply_minutes(scope, company_id, minutes, seats_by_key)
+        milestones_done = eos.advance_timeline(scope, company_id)
         minutes_artifact = None
         if minutes_text.strip():
             body = f"# L10 minutes · {company['name']} · {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}\n\n## Agenda\n{eos.agenda_text(agenda)}\n\n## Minutes\n{minutes_text.strip()}\n"
             minutes_artifact, _ = vault.save_artifact(scope, f"l10-{company['key']}-{int(time.time())}.md", f"company/{company['key']}/l10/{time.strftime('%Y%m%d-%H%M', time.gmtime())}.md", body, "markdown")
         store.insert("meetings", scope, company_id=company_id, kind="l10", held_at=time.time(), agenda=agenda, minutes_artifact_id=minutes_artifact)
-        log.append({"step": "l10", "headlines": minutes["headline"][:3], "issues": len(minutes["issue"]), "todos": len(minutes["todo"]), "question": minutes["question"][:1]})
+        log.append({"step": "l10", "headlines": minutes["headline"][:3], "issues": len(minutes["issue"]), "todos": len(minutes["todo"]), "question": minutes["question"][:1], "rocks_updated": applied["rocks"], "todos_done": applied["todos"], "milestones_done": milestones_done})
         ctx.progress(step=2, total=total_steps, text="L10 held")
 
         # 3 · CEO rates the backlog
@@ -381,7 +407,8 @@ def company_cycle(ctx: JobContext) -> Dict[str, Any]:
                 for step in plan:
                     feedback = f"\nEDITOR NOTES FROM THE LAST ROUND:\n{item['feedback']}" if item.get("feedback") else ""
                     prompt = f"WORK ITEM: {item['title']} (importance {item['importance']})\nBRIEF: {item['brief']}{feedback}\n\nTASK: {step['description']}"
-                    text, _ = call(ctx, budget, cycle_id, agent, seat, company, prompt, str(step["type"]), seats_by_id, call_tokens, mode=mode)
+                    text, _ = call(ctx, budget, cycle_id, agent, seat, company, prompt, str(step["type"]), seats_by_id, call_tokens, mode=mode,
+                                   prefer_local=int(seat.get("department_id") or 0) in producer_depts)
                     outputs.append((str(step["title"]), text))
                     record_escalations(scope, company_id, seat, seats_by_id, text)
             except CycleBudgetExceeded:
@@ -422,7 +449,8 @@ def company_cycle(ctx: JobContext) -> Dict[str, Any]:
                     passed_count += 1
                     if item.get("catalog_id"):
                         cat = store.row("catalog", int(item["catalog_id"]))
-                        if cat and cat["stage"] in ("draft", "edit"):
+                        # A work reaches preliminary review only as a manuscript: every finished item assembled into one text.
+                        if cat and cat["stage"] in ("draft", "edit") and release.assemble_manuscript(scope, int(cat["id"])):
                             store.update("catalog", int(cat["id"]), stage="preliminary_review")
                 else:
                     failed_count += 1
@@ -480,6 +508,12 @@ def company_cycle(ctx: JobContext) -> Dict[str, Any]:
         log.append({"step": stage, "stopped": f"budget exhausted at {exc}"})
     except JobCancelled:
         store.finish_cycle(cycle_id, "cancelled", budget.tokens, budget.calls, log)
+        raise
+    except Exception as exc:  # a provider outage or a bug: the cycle row says so and nothing stays half-running
+        log.append({"step": stage, "error": plain_error(exc)[:300]})
+        for stale in store.work_items_for(scope, company_id, ("running",), limit=200):
+            store.set_work_status(int(stale["id"]), "assigned")
+        store.finish_cycle(cycle_id, "failed", budget.tokens, budget.calls, log)
         raise
     next_run_after: Optional[float] = None
     next_job: Optional[int] = None

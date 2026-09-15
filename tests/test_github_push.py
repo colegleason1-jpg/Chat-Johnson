@@ -34,6 +34,10 @@ def make_fake(calls, existing=("docs/RUNBOOK.md",)):
             return FakeResponse(200, {"object": {"sha": f"sha-of-{branch}"}}) if branch == "main" else FakeResponse(404, text="nope")
         if path.startswith("/repos/me/proj/git/commits/"):
             return FakeResponse(200, {"tree": {"sha": "tree-of-main"}})
+        if path.startswith("/repos/me/proj/git/trees/tree-of-main"):
+            return FakeResponse(200, {"tree": [{"path": p, "type": "blob", "sha": f"old-{p}", "mode": "100755" if p.endswith(".sh") else "100644"} for p in existing]})
+        if path.startswith("/repos/me/proj/pulls/"):
+            return FakeResponse(200, {"number": int(path.rsplit("/", 1)[-1]), "merged": True})
         if path.startswith("/repos/me/proj/contents/"):
             file_path = path.split("/contents/", 1)[1].split("?")[0]
             return FakeResponse(200, {"sha": f"old-{file_path}"}) if file_path in existing else FakeResponse(404, text="missing")
