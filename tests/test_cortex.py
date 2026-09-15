@@ -851,14 +851,16 @@ def test_visible_chunks_handles_unterminated_and_absent_tags():
     assert "".join(router._visible_chunks(iter(["<THINK>x</THINK>\nAnswer"]))) == "Answer"
 
 
-def test_prompt_context_chars_keeps_every_keyed_endpoint_feasible(monkeypatch):
+def test_prompt_context_chars_follows_the_widest_keyed_endpoint(monkeypatch):
     for name in ("GEMINI_API_KEY", "GROQ_API_KEY", "HF_TOKEN", "HUGGINGFACE_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GROQ_API_KEY", "k")
-    assert router.prompt_context_chars(2048) == 4 * (8_000 - 2048 - 500)
+    assert router.prompt_context_chars(2048) == 4 * (8_000 - 2048 - 500)  # Groq alone: sized to Groq
     assert router.prompt_context_chars(8192) == 8_000
-    monkeypatch.delenv("GROQ_API_KEY")
     monkeypatch.setenv("GEMINI_API_KEY", "k")
+    assert router.prompt_context_chars(2048) == 24_000  # Groq plus Gemini: the solver steers long chats to Gemini, memory is not starved
+    assert router.prompt_context_chars(8192) == 24_000
+    monkeypatch.delenv("GROQ_API_KEY")
     assert router.prompt_context_chars(2048) == 24_000
     monkeypatch.delenv("GEMINI_API_KEY")
     assert router.prompt_context_chars(2048) == 24_000

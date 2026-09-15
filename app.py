@@ -2712,6 +2712,13 @@ with st.sidebar:
             if right.button("Restore from bucket", key="vault_restore_now", disabled=not confirm, use_container_width=True):
                 result = vaultsync.restore_now()
                 (st.success if result.get("ok") else st.warning)(f"Restore: {result.get('bytes', result.get('note'))}; reload the page.")
+            if st.button("Send all chats to Supabase for audit", key="vault_export_chats", use_container_width=True,
+                         help="Every chat of this scope goes to the chat_exports table (one row per chat, the same JSON as the download) so it can be read with SQL."):
+                result = vaultsync.export_chats(st.session_state.project_scope)
+                if result.get("ok") and result.get("threads"):
+                    st.success(f"Audit export: {result['threads']} chat(s) upserted into table {result['table']}")
+                else:
+                    (st.info if result.get("ok") else st.warning)(f"Audit export: {result.get('note')}")
     with st.expander("Controlled chaos (pink-wave signal)", expanded=False):
         chaos_settings = pinkwave.settings_for(st.session_state.project_scope)
         st.caption(

@@ -293,8 +293,8 @@ def test_heavy_stream_returns_an_unexhausted_synthesis_stream(monkeypatch):
     assert isinstance(stream.inner, FakeStream) and log == ["chat", "reasoning"] and stream.text == ""
     assert "".join(stream) == "final answer" and stream.text == "final answer" and stream.decision.finish == "stop"
     assert decision is stream.decision and "draft -> review(free) -> synthesis" in decision.reason
-    payload = json.loads(stream.inner.messages[-1]["content"])
-    assert payload["candidate"] == "chat-text" and payload["review"] == "reasoning-text"
+    final_turn = stream.inner.messages[-1]["content"]
+    assert final_turn.startswith("q\n\n[CANDIDATE ANSWER]\nchat-text") and "[REVIEW OF THE CANDIDATE]\nreasoning-text" in final_turn
     text, decision = router.heavy_stream("explode", [{"role": "user", "content": "q"}], None, max_tokens=900)
     assert text == "explode-text" and "synthesis was unavailable" in decision.reason
     monkeypatch.setattr(router, "cortex_available", lambda: False)

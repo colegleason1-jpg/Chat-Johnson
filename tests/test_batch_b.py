@@ -39,7 +39,7 @@ def test_daily_cap_table_and_env_override(monkeypatch):
 
 # ---- B2 Heavy Mode payload -------------------------------------------------------------------
 
-def test_heavy_mode_sends_only_the_last_user_turn_with_the_draft():
+def test_heavy_mode_critique_sees_an_excerpt_and_the_synthesis_keeps_the_conversation():
     seen = []
 
     def one_pass(task_type, messages, tokens):
@@ -53,12 +53,16 @@ def test_heavy_mode_sends_only_the_last_user_turn_with_the_draft():
         {"role": "user", "content": "the actual request"},
     ]
     _heavy_pipeline(one_pass, "chat", messages, 900)
-    critique_payload = seen[1][1][-1]["content"]
-    synthesis_payload = seen[2][1][-1]["content"]
-    for payload in (critique_payload, synthesis_payload):
-        assert "SECRET SYSTEM PROMPT" not in payload and "older question" not in payload
-        assert json.loads(payload)["request"] == "the actual request"
-    assert seen[0][1] == messages  # the draft still sees the full conversation
+    assert seen[0][1] == messages  # the draft sees the full conversation
+    critique = json.loads(seen[1][1][-1]["content"])
+    assert "SECRET SYSTEM PROMPT" not in seen[1][1][-1]["content"] and "SECRET SYSTEM PROMPT" not in seen[1][1][0]["content"]
+    assert critique["request"] == "the actual request" and "ASSISTANT: older answer" in critique["context"]
+    # The synthesis writes the final answer, so it keeps the system prompt (memory) and the earlier turns.
+    synthesis = seen[2][1]
+    assert synthesis[0]["role"] == "system" and "SECRET SYSTEM PROMPT" in synthesis[0]["content"] and "SYNTHESIS PASS" in synthesis[0]["content"]
+    assert [m["content"] for m in synthesis[1:-1]] == ["older question", "older answer"]
+    assert synthesis[-1]["role"] == "user" and synthesis[-1]["content"].startswith("the actual request\n\n[CANDIDATE ANSWER]\nchat-answer")
+    assert "[REVIEW OF THE CANDIDATE]\nreasoning-answer" in synthesis[-1]["content"]
 
 
 # ---- B3 pytest gate and timeouts ------------------------------------------------------------

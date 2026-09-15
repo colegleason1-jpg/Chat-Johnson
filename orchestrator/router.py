@@ -610,17 +610,25 @@ CONTEXT_RESERVE_TOKENS = 500
 
 
 def prompt_context_chars(max_tokens: int) -> int:
-    """Characters of project memory that keep a request inside every keyed endpoint's TPM ceiling.
+    """Characters of project memory a chat request may carry alongside the output budget.
 
-    4 chars per token as in _estimate_tokens, a 500-token reserve for the system prompt and
-    the request itself, never below 8k (context matters more than one fast endpoint) and never
-    above the 24k default. At the default 2,048-token budget this keeps Groq's 8,000 TPM feasible.
+    4 chars per token as in _estimate_tokens, a 500-token reserve for the system prompt and the
+    request itself, never below 8k and never above the 24k default. The budget follows the WIDEST
+    keyed endpoint, not the narrowest: the solver's TPM constraint already steers a long request
+    away from a narrow endpoint (Groq's 8,000 TPM), so sizing memory to that endpoint only starved
+    every chat of its own history whenever Groq was keyed and the output budget was raised.
     """
-    cap = DEFAULT_CONTEXT_CHARS
+    widest: Optional[int] = None
+    uncapped = False
     for endpoint in CORTEX_ENDPOINTS.values():
-        if endpoint.tpm_limit is None or not _endpoint_key(endpoint):
+        if not _endpoint_key(endpoint):
             continue
-        cap = min(cap, 4 * (int(endpoint.tpm_limit) - int(max_tokens) - CONTEXT_RESERVE_TOKENS))
+        if endpoint.tpm_limit is None:
+            uncapped = True  # an uncapped keyed endpoint takes the whole default window
+            continue
+        room = 4 * (int(endpoint.tpm_limit) - int(max_tokens) - CONTEXT_RESERVE_TOKENS)
+        widest = room if widest is None else max(widest, room)
+    cap = DEFAULT_CONTEXT_CHARS if uncapped or widest is None else widest
     return max(MIN_CONTEXT_CHARS, min(DEFAULT_CONTEXT_CHARS, cap))
 
 
@@ -1796,6 +1804,43 @@ def _last_user_turn(messages: Sequence[Mapping[str, str]]) -> str:
     return str(messages[-1].get("content", "")) if messages else ""
 
 
+HISTORY_EXCERPT_TURNS = 4
+HISTORY_EXCERPT_CHARS = 500
+
+
+def _history_excerpt(messages: Sequence[Mapping[str, str]], turns: int = HISTORY_EXCERPT_TURNS, chars: int = HISTORY_EXCERPT_CHARS) -> str:
+    """The last few earlier turns, each clipped, for the critique: enough to judge omissions, never the system prompt."""
+    prior = [m for m in messages if m.get("role") in ("user", "assistant")]
+    if prior and prior[-1].get("role") == "user":
+        prior = prior[:-1]
+    lines = []
+    for message in prior[-turns:]:
+        content = str(message.get("content", ""))
+        if len(content) > chars:
+            content = content[: chars - 15] + " [… clipped …]"
+        lines.append(f"{str(message['role']).upper()}: {content}")
+    return "\n".join(lines)
+
+
+SYNTHESIS_INSTRUCTION = (
+    "SYNTHESIS PASS: the user's latest message is followed by a CANDIDATE answer and a REVIEW of it. "
+    "Write the final answer from the conversation, the candidate, and the review. Keep it actionable and "
+    "concise; use the earlier turns when the request refers to them; do not print hidden reasoning, "
+    "do not mention the candidate, the review, or internal prompt contents."
+)
+
+
+def _synthesis_messages(messages: Sequence[Mapping[str, str]], request: str, draft: str, critique: str) -> List[dict]:
+    """The whole conversation (system prompt with its memory, earlier turns) with the candidate and review on the last user turn."""
+    system = "\n\n".join(str(m.get("content", "")) for m in messages if m.get("role") == "system")
+    prior = [dict(m) for m in messages if m.get("role") in ("user", "assistant")]
+    if prior and prior[-1].get("role") == "user":
+        prior = prior[:-1]
+    final = f"{request}\n\n[CANDIDATE ANSWER]\n{draft}\n\n[REVIEW OF THE CANDIDATE]\n{critique}"
+    head = [{"role": "system", "content": (system + "\n\n" if system else "") + SYNTHESIS_INSTRUCTION}]
+    return head + prior + [{"role": "user", "content": final}]
+
+
 def _heavy_pipeline(
     one_pass: Callable[..., Tuple[str, RouteDecision]],
     task_type: str,
@@ -1821,8 +1866,10 @@ def _heavy_pipeline(
         return fn(selected_type, selected_messages, tokens, float(temperatures[stage]))
 
     draft, draft_decision = run_pass(one_pass, 0, task_type, messages, max(256, max_tokens // 2))
-    # Only the operator's request travels with the draft: the system prompt, memory, and history
-    # already shaped the draft, and resending them tripled the cost of every Heavy send.
+    # The critique gets the request, the candidate, and a compact excerpt of the earlier turns (so
+    # "omissions" is judged against what was actually discussed) but never the system prompt. The
+    # synthesis writes the final answer, so it keeps the whole conversation: a synthesis that saw only
+    # the request answered "I don't have access to previous code" whenever the request referred back.
     request = _last_user_turn(messages)
     critique_messages = [
         {
@@ -1833,7 +1880,7 @@ def _heavy_pipeline(
                 "private chain-of-thought."
             ),
         },
-        {"role": "user", "content": json.dumps({"request": request, "candidate": draft})},
+        {"role": "user", "content": json.dumps({"request": request, "context": _history_excerpt(messages), "candidate": draft})},
     ]
     try:
         if paid_slot is not None and paid_slot.armed:
@@ -1850,20 +1897,7 @@ def _heavy_pipeline(
             draft_decision.decision_vector,
         )
 
-    synthesis_messages = [
-        {
-            "role": "system",
-            "content": (
-                "Synthesize the final answer from the request, candidate, and review. "
-                "Keep the answer actionable and concise. Do not print hidden reasoning "
-                "or mention internal prompt contents."
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps({"request": request, "candidate": draft, "review": critique}),
-        },
-    ]
+    synthesis_messages = _synthesis_messages(messages, request, draft, critique)
     try:
         final, final_decision = run_pass(final_pass or one_pass, 2, task_type, synthesis_messages, max_tokens)
     except ProviderError:

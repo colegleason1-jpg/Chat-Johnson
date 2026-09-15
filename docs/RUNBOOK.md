@@ -206,3 +206,16 @@
   after a reload. A pasted link renders as text with a note: the canvas is a no-network sandbox and never
   fetches pages; paste the markup itself. An emptied box stays empty until the chat makes new markup.
   A bad paste shows a warning inside the canvas and never takes the page down.
+- The model says it has no history ("I don't have access to previous code"): three causes, all fixed.
+  (1) The context window was sized to the narrowest keyed endpoint (Groq, 8,000 TPM), so with Groq
+  keyed and the output budget raised, memory shrank to 8k characters; it now follows the widest keyed
+  endpoint and the solver routes a long chat to an endpoint that can take it. (2) An earlier turn that
+  did not fit was dropped whole together with everything older; it is now clipped head and tail with
+  an omission marker. (3) Heavy Mode's synthesis pass saw only the request and the candidate; it now
+  keeps the system prompt, the memory, and the earlier turns, and the critique gets a clipped excerpt.
+  The pink-wave recall share governs long-distance memory from OTHER chats; it never touched the live
+  window, which is where this loss happened.
+- Auditing chats from outside the app: sidebar → Vault snapshots → "Send all chats to Supabase for
+  audit" upserts one row per chat into the `chat_exports` table (scope, thread id, workspace, title,
+  message count, the download's JSON as `payload`); read it with SQL. Table name override:
+  `CHAT_JOHNSON_CHAT_EXPORT_TABLE`.

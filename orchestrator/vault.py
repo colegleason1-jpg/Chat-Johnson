@@ -1052,9 +1052,11 @@ def context_parts(
         content = str(row["content"])
         prefix = len(role.upper()) + 2
         if prefix + len(content) + 1 > remaining:
-            marker = " [TRUNCATED]"
-            if not window and remaining > 200 + len(marker):
-                window.append((role, content[: remaining - 1 - prefix - len(marker)] + marker))
+            # The turn that no longer fits is clipped to the room left (head and tail, the middle marked)
+            # rather than dropped with everything older: a long answer stays referable from the next turn.
+            clipped = clip_turn(content, remaining - 1 - prefix, newest=not window)
+            if clipped:
+                window.append((role, clipped))
             break
         window.append((role, content))
         remaining -= prefix + len(content) + 1
@@ -1073,14 +1075,40 @@ def context_parts(
     }
 
 
+CLIP_MIN_CHARS = 400
+TRUNCATED_MARKER = " [TRUNCATED]"
+
+
+def clip_turn(content: str, room: int, newest: bool = False) -> str:
+    """Fit ``content`` into ``room`` characters. The newest turn keeps its head; an older turn keeps its head
+    and its tail around an omission marker; '' when the room is too small to be useful."""
+    if len(content) <= room:
+        return content
+    if room < CLIP_MIN_CHARS:
+        return ""
+    if newest:
+        return content[: room - len(TRUNCATED_MARKER)] + TRUNCATED_MARKER
+    marker = f"\n[… {len(content) - room} characters of this turn omitted to fit the context window …]\n"
+    keep = room - len(marker)
+    if keep < CLIP_MIN_CHARS // 2:
+        return ""
+    head = int(keep * 0.7)
+    return content[:head] + marker + content[len(content) - (keep - head):]
+
+
 def alternating_turns(turns: Sequence[Mapping[str, str]], request: str) -> Tuple[str, List[Dict[str, str]]]:
     """Strict user/assistant alternation ending with ``request`` as the final user turn.
 
     Gemini rejects consecutive same-role turns and a leading model turn, so same-role
     neighbours are joined and a leading assistant reply is handed back for the memory block.
+    The request is stored as the newest turn before the prompt is built, so an identical
+    trailing user turn is dropped rather than sent twice.
     """
     merged: List[Dict[str, str]] = []
-    for turn in list(turns) + [{"role": "user", "content": request}]:
+    items = list(turns)
+    if items and str(items[-1]["role"]) == "user" and str(items[-1]["content"]).strip() == request.strip():
+        items = items[:-1]
+    for turn in items + [{"role": "user", "content": request}]:
         item = {"role": str(turn["role"]), "content": str(turn["content"])}
         if merged and merged[-1]["role"] == item["role"]:
             merged[-1] = {"role": item["role"], "content": merged[-1]["content"] + "\n\n" + item["content"]}

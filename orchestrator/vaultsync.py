@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import os
 import sqlite3
 import tempfile
@@ -33,6 +34,8 @@ ENV_KEY = "CHAT_JOHNSON_SUPABASE_KEY"
 ENV_BUCKET = "CHAT_JOHNSON_VAULT_BUCKET"
 ENV_OBJECT = "CHAT_JOHNSON_VAULT_OBJECT"
 ENV_INTERVAL = "CHAT_JOHNSON_VAULT_SNAPSHOT_MINUTES"
+ENV_EXPORT_TABLE = "CHAT_JOHNSON_CHAT_EXPORT_TABLE"
+DEFAULT_EXPORT_TABLE = "chat_exports"
 DEFAULT_BUCKET = "chat-johnson-vault"
 DEFAULT_OBJECT = "vault/chat_johnson_vault.db.gz"
 DEFAULT_INTERVAL_MINUTES = 10
@@ -41,7 +44,7 @@ MAX_SNAPSHOT_BYTES = 200 * 1024 * 1024
 
 _STATE: Dict[str, Any] = {
     "last_upload_at": 0.0, "last_upload_bytes": 0, "last_restore_at": 0.0, "last_restore_bytes": 0,
-    "last_error": "", "uploads": 0, "thread": None, "snapshot_mtime": 0.0,
+    "last_error": "", "uploads": 0, "thread": None, "snapshot_mtime": 0.0, "last_export_at": 0.0, "last_export_threads": 0,
 }
 _LOCK = threading.Lock()
 
@@ -220,6 +223,42 @@ def restore_now() -> Dict[str, Any]:
     return {"ok": True, "bytes": size}
 
 
+def export_chats(project_scope: str, limit: int = 500) -> Dict[str, Any]:
+    """Send every chat of a scope to the ``chat_exports`` table (one row per thread, upserted on scope + thread id)
+    so it can be audited with SQL from outside the app. The payload is the chat download's JSON; nothing is deleted."""
+    if not configured():
+        return {"ok": False, "note": "not configured"}
+    from .vault import export_thread, list_threads
+
+    rows = []
+    for thread in list_threads(project_scope, include_closed=True, limit=limit):
+        payload = export_thread(int(thread["id"]), project_scope)
+        rows.append({
+            "scope": project_scope, "thread_id": int(thread["id"]), "workspace": str(thread["workspace"] or ""),
+            "title": str(thread["title"] or ""), "message_count": len(payload["messages"]), "payload": payload,
+        })
+    table = _env(ENV_EXPORT_TABLE, DEFAULT_EXPORT_TABLE)
+    if not rows:
+        return {"ok": True, "threads": 0, "table": table, "note": "no chats in this scope"}
+    headers = _headers("application/json")
+    headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    try:
+        response = requests.post(
+            f"{_env(ENV_URL).rstrip('/')}/rest/v1/{table}", data=json.dumps(rows).encode("utf-8"), headers=headers, timeout=TIMEOUT_SECONDS
+        )
+        if response.status_code >= 300:
+            raise RuntimeError(f"chat export failed: HTTP {response.status_code}: {response.text[:200]}")
+    except Exception as exc:
+        with _LOCK:
+            _STATE["last_error"] = str(exc)[:300]
+        return {"ok": False, "note": str(exc)[:300]}
+    with _LOCK:
+        _STATE["last_export_at"] = time.time()
+        _STATE["last_export_threads"] = len(rows)
+        _STATE["last_error"] = ""
+    return {"ok": True, "threads": len(rows), "table": table}
+
+
 def dirty() -> bool:
     return _mtime() > float(_STATE["snapshot_mtime"])
 
@@ -255,9 +294,10 @@ def status() -> Dict[str, Any]:
             "last_restore_at": float(_STATE["last_restore_at"]), "last_restore_bytes": int(_STATE["last_restore_bytes"]),
             "uploads": int(_STATE["uploads"]), "last_error": str(_STATE["last_error"]),
             "running": bool(_STATE["thread"] is not None and _STATE["thread"].is_alive()), "dirty": dirty() if configured() else False,
+            "last_export_at": float(_STATE["last_export_at"]), "last_export_threads": int(_STATE["last_export_threads"]),
         }
 
 
 def reset_for_tests() -> None:
     with _LOCK:
-        _STATE.update({"last_upload_at": 0.0, "last_upload_bytes": 0, "last_restore_at": 0.0, "last_restore_bytes": 0, "last_error": "", "uploads": 0, "thread": None, "snapshot_mtime": 0.0})
+        _STATE.update({"last_upload_at": 0.0, "last_upload_bytes": 0, "last_restore_at": 0.0, "last_restore_bytes": 0, "last_error": "", "uploads": 0, "thread": None, "snapshot_mtime": 0.0, "last_export_at": 0.0, "last_export_threads": 0})
