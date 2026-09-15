@@ -5,6 +5,8 @@ nh3>=0.2
 pyyaml>=6.0
 cryptography>=42
 streamlit>=1.40,<2
+# The supply-chain resilience engine for the plan of the day (Python 3.12+ only; 3.11 hosts skip it and use fixed shares).
+scrcae @ git+https://github.com/colegleason1-jpg/supply-chain-resilience-engine@ed03d4b#subdirectory=engine ; python_version >= "3.12"
 python-dotenv>=1.0
 numpy>=1.26
 scipy>=1.13
