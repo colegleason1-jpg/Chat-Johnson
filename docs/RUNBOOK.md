@@ -71,9 +71,13 @@
   job with a "restarted" note, since its session keys died with the process; launch it again.
 
 ## Vault snapshots (Supabase Storage)
-- Supabase project → Storage → a **private** bucket `chat-johnson-vault`; Project Settings → API → the
-  service key. On Streamlit Cloud put `CHAT_JOHNSON_SUPABASE_URL` and `CHAT_JOHNSON_SUPABASE_KEY` in
-  the app secrets; on the VM put them in `.env` (the worker uploads, the app restores).
+- Supabase project → Storage → a **private** bucket `chat-johnson-vault`. The key can be a secret /
+  service_role key (bypasses row-level security) **or** the project's publishable / anon key: the
+  migration `chat_johnson_vault_bucket_policies` grants that role select, insert, update, and delete
+  on this one bucket only ("new row violates row-level security policy" means the policies are
+  missing). Either way the key lives only in the Streamlit app secrets or the VM's `.env`; never in a
+  page, a repo, or a chat. On Streamlit Cloud put `CHAT_JOHNSON_SUPABASE_URL` and
+  `CHAT_JOHNSON_SUPABASE_KEY` in the app secrets; on the VM put them in `.env`.
 - Startup: a fresh vault (no threads, no artifacts) is replaced by the bucket's snapshot before the
   first query; a vault that holds work is never overwritten automatically. Sidebar → *Vault snapshots*
   shows the last upload and restore, *Snapshot now* uploads at once, *Restore from bucket* needs the
