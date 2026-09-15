@@ -41,11 +41,20 @@ def test_plan_settings_round_trip_and_activities_come_from_the_society(db):
     assert config["goal_fraction"] == 0.6 and config["chat_reserve_fraction"] == 0.2 and treasury_plan.config_for(db)["values"]["academy"] == 20.0
     templates.seed_company(db, "avs_studio")
     templates.seed_academy(db, 10)
-    activities, budget = treasury_plan.build_activities(db, get_quota_ledger())
+    activities, budget, capacities = treasury_plan.build_activities(db, get_quota_ledger())
     keys = [a.key for a in activities]
     assert keys[0] == "chat" and activities[0].min_scale == 1.0 and any(k.startswith("company:") for k in keys) and "academy" in keys and "leisure" in keys
     assert "missions" not in keys and budget > 0 and all(a.cost_tokens > 0 for a in activities)
     assert activities[0].cost_tokens >= treasury_plan.CHAT_RESERVE_MIN_TOKENS
+    assert set(capacities) == {"gemini", "groq"} and sum(capacities.values()) == budget
+    # With no route history every activity draws evenly from the keyed vendors; the usage sums to the activity's cost.
+    assert all(abs(sum(a.mix.values()) - 1.0) < 1e-9 for a in activities) and abs(sum(activities[0].usage().values()) - activities[0].cost_tokens) < 1e-6
+    for _ in range(6):
+        vault.record_route(db, "society", "chat", "groq/m", "normal", 100, "", "r")
+    vault.record_route(db, "society", "chat", "google_ai_studio/m", "normal", 100, "", "r")
+    vault.record_route(db, "society", "chat", "failed", "normal", 100, "", "r")  # never counted
+    assert treasury_plan.vendor_mix(db, ("society",), ["gemini", "groq"]) == {"gemini": 1 / 7, "groq": 6 / 7}
+    assert treasury_plan.vendor_mix(db, ("normal_chat",), ["gemini", "groq"]) == {"gemini": 0.5, "groq": 0.5}
 
 
 def test_without_the_engine_the_plan_is_the_fixed_shares_and_says_so(db, monkeypatch):
@@ -80,6 +89,26 @@ def test_a_short_day_names_the_shortfall_and_still_funds_the_chat_first(db):
     assert unfunded  # something was left out rather than everything deferred
     beyond = treasury_plan.plan_day(db, get_quota_ledger(), goal_points=150.0, activities=ACTIVITIES, budget=2_000_000, with_stress=False, with_tail=False)
     assert beyond.status == "ceiling" and beyond.diagnosis and beyond.scale_for("chat") == 1.0
+
+
+@pytest.mark.skipif(not ENGINE or not treasury_plan.engine_knows_resources(), reason="scrcae with resources not installed")
+def test_vendors_are_resources_and_a_small_vendor_cap_binds_the_plan(db):
+    mixed = [
+        Activity("chat", "Chat reserve", 100_000, 30.0, min_scale=1.0, mix={"gemini": 0.5, "groq": 0.5}),
+        Activity("academy", "Academy", 200_000, 18.0, min_scale=0.3, mix={"groq": 1.0}),          # groq only
+        Activity("company:1", "AVS studio", 200_000, 25.0, min_scale=0.3, mix={"gemini": 1.0}),  # gemini only
+    ]
+    capacities = {"gemini": 400_000, "groq": 90_000}  # groq: 50k reserved for the chat, 40k left: the academy fits at 0.3 (60k) only if groq allows
+    plan = treasury_plan.plan_day(db, get_quota_ledger(), activities=mixed, budget=490_000, capacities=capacities, with_stress=False, with_tail=False)
+    assert plan.status in ("optimal", "short", "ceiling") and plan.scale_for("chat") == 1.0
+    rows = {r["vendor"]: r for r in plan.resources}
+    assert rows["groq"]["capacity"] == 90_000 and rows["groq"]["reserved"] == 50_000 and rows["groq"]["planned"] <= 40_000 and rows["groq"]["headroom"] >= 0
+    assert plan.scale_for("academy") == 0.0  # 30% of the academy needs 60k groq tokens; only 40k are left after the reserve
+    assert plan.scale_for("company:1") == 1.0 and rows["gemini"]["planned"] == 200_000 and rows["gemini"]["headroom"] == 150_000
+    assert plan.spend_tokens == 300_000 and plan.value_points == 55.0
+    # The pooled budget alone would have funded the academy: the per-vendor supply is what the plan now respects.
+    pooled = treasury_plan.plan_day(db, get_quota_ledger(), activities=[Activity(a.key, a.label, a.cost_tokens, a.value_points, min_scale=a.min_scale) for a in mixed], budget=490_000, with_stress=False, with_tail=False)
+    assert pooled.scale_for("academy") > 0.0 and pooled.resources == []
 
 
 @pytest.mark.skipif(not ENGINE, reason="scrcae not installed")

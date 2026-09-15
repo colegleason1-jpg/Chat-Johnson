@@ -133,8 +133,10 @@ tasks first) is a rule, not an optimum.
 
 ## 6. Gaps that decide the integration shape
 
-1. **One scalar budget.** Per-vendor daily caps cannot be expressed as constraints. The plan
-   allocates the pooled day; Cortex 2 enforces vendor feasibility call by call.
+1. **One scalar budget.** Closed on 2026-09-15: the engine's resource family (pull request 1,
+   merged as 6f0fc8b) adds one verified row per capped supply, and the plan of the day models
+   each keyed vendor as a resource with its remaining daily tokens. Cortex 2 still enforces every
+   limit call by call.
 2. **No time axis.** The tick re-plans every interval, the right cadence for a day-level plan.
 3. **Estimated costs.** Token demand per activity is an estimate; the re-plan reconciles it.
 4. **Uncalibrated exponent, unsourced prices.** Use target mode, which needs neither; move to

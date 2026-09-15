@@ -2389,6 +2389,9 @@ def render_plan_of_the_day(project_scope: str, ledger: QuotaLedger) -> None:
                 [{"activity": line["label"], "size": f"{float(line['scale']):.0%}", "tokens": int(line["tokens"]), "points": round(float(line["value_points"]), 1)} for line in plan["lines"]],
                 use_container_width=True, hide_index=True,
             )
+        if plan.get("resources"):
+            st.caption("Per-vendor supply today (tokens): capacity, held for the chat, planned by the activities, headroom left.")
+            st.dataframe(plan["resources"], use_container_width=True, hide_index=True)
         if plan.get("saturation_budget"):
             st.caption(f"Recommended daily share: {float(plan.get('recommended_share', 0)):.0%} of today's tokens ({int(plan['saturation_budget']):,}) buys everything worth buying; more buys nothing.")
         if plan.get("stress", 1.0) < 1.0:

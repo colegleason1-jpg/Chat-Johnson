@@ -16,6 +16,10 @@ remaining tokens across the keyed vendors; the chat reserve is a node pinned at 
   shock size from the route log's failure share, correlation from the dynamics coupling.
 - Vendor stress: the engine's calibration fits a failure elasticity to load from hourly route-log
   bins and refuses thin evidence; the current load above anchor scales value down (macro).
+- Each keyed vendor is a resource with its remaining daily tokens as capacity, and each activity
+  draws on the vendors in the mix its workspace actually routed to (route log, 72 h; an even split
+  with no history), so the plan respects per-vendor supply directly; Cortex 2 still enforces every
+  limit call by call.
 - Every plan carries the engine's content hashes and version; the latest plan is stored per scope.
 
 The engine is optional (``requirements-supply.txt``, Python 3.12+). Without it ``plan_day`` returns
@@ -77,6 +81,11 @@ class Activity:
     lead_days: float = 0.0
     prerequisite: str = ""
     company_id: Optional[int] = None
+    mix: Dict[str, float] = field(default_factory=dict)   # vendor -> share of this activity's tokens (sums to 1 when set)
+
+    def usage(self) -> Dict[str, float]:
+        """Tokens drawn from each vendor at full scale."""
+        return {vendor: float(self.cost_tokens) * share for vendor, share in self.mix.items() if share > 0.0}
 
 
 @dataclass
@@ -105,6 +114,7 @@ class DayPlan:
     recommended_share: float = 0.0
     stress: float = 1.0
     stress_rows: List[Dict[str, Any]] = field(default_factory=list)
+    resources: List[Dict[str, Any]] = field(default_factory=list)   # per vendor: capacity, planned use, headroom
     tail: Dict[str, float] = field(default_factory=dict)
     engine: str = ""
     input_hash: str = ""
@@ -155,32 +165,71 @@ def _hours_left(now: float) -> float:
     return max(0.25, 24.0 - (stamp.tm_hour + stamp.tm_min / 60.0))
 
 
-def build_activities(scope: str, ledger: Any, now: Optional[float] = None) -> Tuple[List[Activity], int]:
-    """The day's activities at full scale and the tokens the keyed vendors can still serve today."""
-    from .society import academy, cycles, economy, store, tick
+def vendor_capacities(ledger: Any) -> Dict[str, int]:
+    """Tokens each keyed cloud vendor can still serve today (its daily cap minus the persisted counters)."""
+    from .config import daily_cap
+    from .society import economy
+
+    capacities: Dict[str, int] = {}
+    for vendor in economy.keyed_vendors():
+        cap, used = daily_cap(vendor), 0
+        if ledger is not None and ledger.known(vendor):
+            use = ledger.usage(vendor)
+            cap = int(use.get("daily_limit") or 0) or cap
+            used = int(use.get("daily_tokens", 0))
+        capacities[vendor] = max(0, (cap or economy.UNCAPPED_VENDOR_ASSUMPTION) - used)
+    return capacities
+
+
+def vendor_mix(scope: str, workspaces: Sequence[str], vendors: Sequence[str], hours: float = 72.0) -> Dict[str, float]:
+    """Share of answered sends per vendor for these workspaces over the window; an even split over ``vendors`` with no history."""
+    from . import discovery
+
+    counts: Dict[str, int] = {}
+    for row in vault.recent_routes(scope, limit=5000, hours=hours):
+        if workspaces and str(row["workspace"] or "") not in workspaces:
+            continue
+        route = str(row["route"] or "")
+        if not route or route == "failed":
+            continue
+        vendor = discovery.vendor_for(route.split("/", 1)[0])
+        if vendor in vendors:
+            counts[vendor] = counts.get(vendor, 0) + 1
+    total = sum(counts.values())
+    if total == 0 or not vendors:
+        return {vendor: 1.0 / len(vendors) for vendor in vendors} if vendors else {}
+    return {vendor: counts.get(vendor, 0) / total for vendor in vendors}
+
+
+def build_activities(scope: str, ledger: Any, now: Optional[float] = None) -> Tuple[List[Activity], int, Dict[str, int]]:
+    """The day's activities at full scale, the tokens the keyed vendors can still serve today, and that total per vendor."""
+    from .society import academy, cycles, store, tick
 
     stamp = float(now if now is not None else time.time())
     config = config_for(scope)
     values, mins = config["values"], config["min_scale"]
-    treasury = economy.Treasury(ledger, economy.shares_for(scope))
-    budget = int(treasury.daily_remaining())
+    capacities = vendor_capacities(ledger)
+    vendors = list(capacities)
+    budget = int(sum(capacities.values()))
+    chat_mix = vendor_mix(scope, ("normal_chat", "chat_bot", "task_finder", "repository"), vendors)
+    society_mix = vendor_mix(scope, ("society",), vendors)
     hours = _hours_left(stamp)
     reserve = max(CHAT_RESERVE_MIN_TOKENS, int(budget * config["chat_reserve_fraction"]))
-    activities = [Activity("chat", "Chat reserve", min(reserve, max(budget, 1)), float(values["chat"]), min_scale=1.0, lead_days=1.0)]
+    activities = [Activity("chat", "Chat reserve", min(reserve, max(budget, 1)), float(values["chat"]), min_scale=1.0, lead_days=1.0, mix=chat_mix)]
     for company in store.companies_for(scope):
         cid = int(company["id"])
         cycles_left = max(1, int(math.ceil(hours * 3600.0 / max(600.0, float(company.get("interval_s") or cycles.DEFAULT_MAX_TOKENS)))))
         activities.append(Activity(f"company:{cid}", str(company.get("name") or f"Company {cid}"), int(cycles.DEFAULT_MAX_TOKENS * cycles_left),
-                                   float(values["company"]), min_scale=float(mins["company"]), lead_days=0.5, prerequisite="chat", company_id=cid))
+                                   float(values["company"]), min_scale=float(mins["company"]), lead_days=0.5, prerequisite="chat", company_id=cid, mix=society_mix))
     if store.agents_for(scope, limit=1):
         academy_cycles = max(1, int(math.ceil(hours / 3.0)))
-        activities.append(Activity("academy", "Academy", int(academy.DEFAULT_MAX_TOKENS * academy_cycles), float(values["academy"]), min_scale=float(mins["academy"])))
+        activities.append(Activity("academy", "Academy", int(academy.DEFAULT_MAX_TOKENS * academy_cycles), float(values["academy"]), min_scale=float(mins["academy"]), mix=society_mix))
         ticks = max(1, int(math.ceil(hours * 2)))
-        activities.append(Activity("leisure", "Leisure", int(tick.LEISURE_MAX_TOKENS * ticks), float(values["leisure"]), min_scale=float(mins["leisure"])))
+        activities.append(Activity("leisure", "Leisure", int(tick.LEISURE_MAX_TOKENS * ticks), float(values["leisure"]), min_scale=float(mins["leisure"]), mix=society_mix))
     queued = vault.list_jobs(scope, ("queued",), limit=100, kind="mission")
     if queued:
-        activities.append(Activity("missions", f"{len(queued)} queued mission(s)", int(MISSION_TOKENS_PER_JOB * len(queued)), float(values["missions"]), min_scale=float(mins["missions"]), lead_days=1.0))
-    return [a for a in activities if a.cost_tokens > 0], budget
+        activities.append(Activity("missions", f"{len(queued)} queued mission(s)", int(MISSION_TOKENS_PER_JOB * len(queued)), float(values["missions"]), min_scale=float(mins["missions"]), lead_days=1.0, mix=chat_mix))
+    return [a for a in activities if a.cost_tokens > 0], budget, capacities
 
 
 def fallback_plan(scope: str, activities: Sequence[Activity], budget: int, goal_points: float, reason: str, now: float) -> DayPlan:
@@ -275,15 +324,18 @@ def tail_risk(scope: str, plan: DayPlan, sigma: Optional[float] = None, rho: Opt
 
 
 def plan_day(scope: str, ledger: Any, goal_points: Optional[float] = None, now: Optional[float] = None, activities: Optional[Sequence[Activity]] = None,
-             budget: Optional[int] = None, with_tail: bool = True, with_stress: bool = True, store_result: bool = True) -> DayPlan:
-    """The plan of the day: the most value within today's tokens, with the goal checked in target mode and its shortfall named."""
+             budget: Optional[int] = None, capacities: Optional[Mapping[str, int]] = None, with_tail: bool = True, with_stress: bool = True,
+             store_result: bool = True) -> DayPlan:
+    """The plan of the day: the most value within today's tokens (per vendor when the engine knows resources), the goal checked in target mode."""
     stamp = float(now if now is not None else time.time())
     if activities is None or budget is None:
-        built, built_budget = build_activities(scope, ledger, stamp)
+        built, built_budget, built_capacities = build_activities(scope, ledger, stamp)
         activities = built if activities is None else activities
         budget = built_budget if budget is None else budget
+        capacities = built_capacities if capacities is None else capacities
     activities = list(activities)
     budget = max(0, int(budget))
+    capacities = {str(k): max(0, int(v)) for k, v in (capacities or {}).items()}
     config = config_for(scope)
     full_value = sum(a.value_points for a in activities)
     goal = float(goal_points) if goal_points is not None else round(full_value * config["goal_fraction"], 2)
@@ -294,7 +346,7 @@ def plan_day(scope: str, ledger: Any, goal_points: Optional[float] = None, now: 
         return _store(scope, fallback_plan(scope, activities, budget, goal, "engine not installed (requirements-supply.txt, Python 3.12+): fixed treasury shares apply", stamp), store_result)
     started = time.perf_counter()
     try:
-        plan = _solve(scope, activities, budget, goal, stamp, with_stress)
+        plan = _solve(scope, activities, budget, goal, stamp, with_stress, capacities)
     except Exception as exc:  # the society never stops because a planner failed
         plan = fallback_plan(scope, activities, budget, goal, f"planner error, fixed shares apply: {str(exc)[:160]}", stamp)
         plan.status = "error"
@@ -307,53 +359,96 @@ def plan_day(scope: str, ledger: Any, goal_points: Optional[float] = None, now: 
     return _store(scope, plan, store_result)
 
 
-def _solve(scope: str, activities: Sequence[Activity], budget: int, goal: float, stamp: float, with_stress: bool) -> DayPlan:
+def engine_knows_resources() -> bool:
+    try:
+        from scrcae import Resource  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _solve(scope: str, activities: Sequence[Activity], budget: int, goal: float, stamp: float, with_stress: bool, capacities: Optional[Mapping[str, int]] = None) -> DayPlan:
+    import scrcae
     from scrcae import Dependency, Intervention, MinimizeCapitalObjective, OptimizationRequest, SupplyNetwork, solve
     from scrcae.optimization import budget_levels, sweep_budget
     from scrcae.optimization.objectives import MaximizeRiskReductionObjective
     from scrcae.risk import LinearResponse
 
-    keys = {a.key for a in activities}
+    full_value = sum(a.value_points for a in activities)
+    # Safety stock is not a candidate: the chat reserve is held back from the budget and from every vendor's supply
+    # before anything is allocated, so no configured value can ever trade it away.
+    reserve = next((a for a in activities if a.key == "chat"), None)
+    candidates = [a for a in activities if a.key != "chat"]
+    held = min(int(reserve.cost_tokens), budget) if reserve else 0
+    solve_budget = max(0, budget - held)
+    supply: Dict[str, float] = {k: float(v) for k, v in (capacities or {}).items()}
+    if reserve and supply:
+        for vendor, tokens in reserve.usage().items():
+            if vendor in supply:
+                supply[vendor] = max(0.0, supply[vendor] - tokens * (held / max(reserve.cost_tokens, 1)))
+    reserve_line = [PlanLine(reserve.key, reserve.label, 1.0 if held >= reserve.cost_tokens else round(held / max(reserve.cost_tokens, 1), 4), held,
+                             round(float(reserve.value_points) * (held / max(reserve.cost_tokens, 1)), 3))] if reserve else []
+    reserve_value = reserve_line[0].value_points if reserve_line else 0.0
+    stress, stress_rows = vendor_stress(scope, now=stamp) if with_stress else (1.0, [])
+    day = time.strftime("%Y-%m-%d", time.gmtime(stamp))
+    if not candidates:
+        return DayPlan(scope, day, budget, goal, "optimal", reserve_line, spend_tokens=held, value_points=reserve_value, full_value_points=round(full_value, 3),
+                       stress=round(float(stress), 3), stress_rows=stress_rows, engine=engine_version(), created_at=stamp, notes=["only the chat reserve is planned today"])
+    keys = {a.key for a in candidates}
+    # Vendors as resources (engine 6f0fc8b and later): each activity draws its tokens from the vendors its workspace routes to.
+    with_resources = bool(supply) and engine_knows_resources() and any(a.mix for a in candidates)
+    resources = tuple(scrcae.Resource(vendor, float(capacity)) for vendor, capacity in sorted(supply.items())) if with_resources else ()
+    declared = {r.name for r in resources}
     interventions = tuple(
         Intervention(a.key, a.label, "", cost=float(a.cost_tokens), risk_reduction_pts=float(a.value_points), lead_time_saved_days=float(a.lead_days),
-                     min_funding_scale=float(a.min_scale), max_funding_scale=float(a.max_scale))
-        for a in activities
+                     min_funding_scale=float(a.min_scale), max_funding_scale=float(a.max_scale),
+                     **({"usage": {v: u for v, u in a.usage().items() if v in declared}} if with_resources else {}))
+        for a in candidates
     )
-    dependencies = tuple(Dependency(dependent=a.key, prerequisite=a.prerequisite) for a in activities if a.prerequisite and a.prerequisite in keys and a.prerequisite != a.key)
-    network = SupplyNetwork(interventions=interventions, baseline_risk_pts=BASELINE_POINTS, dependencies=dependencies)
-    stress, stress_rows = vendor_stress(scope, now=stamp) if with_stress else (1.0, [])
+    dependencies = tuple(Dependency(dependent=a.key, prerequisite=a.prerequisite) for a in candidates if a.prerequisite and a.prerequisite in keys and a.prerequisite != a.key)
+    network = SupplyNetwork(interventions=interventions, baseline_risk_pts=BASELINE_POINTS, dependencies=dependencies, **({"resources": resources} if with_resources else {}))
     common = {"network": network, "risk_response": LinearResponse(), "macro_multiplier": stress, "enforce_risk_cap": True}
-    full_value = sum(a.value_points for a in activities)
-    # Free-tier tokens expire at midnight, so the plan is "the most value today's tokens can buy" (budget mode, chat
-    # reserve pinned). The goal is a check, solved in target mode: feasible means the day is on plan; infeasible names
-    # the shortfall in tokens or the ceiling, and that verdict rides along with the budget-mode allocation.
-    result = solve(OptimizationRequest(objective=MaximizeRiskReductionObjective(), budget=float(budget), diagnose=False, **common))
-    target = solve(OptimizationRequest(objective=MinimizeCapitalObjective(), budget=float(budget), required_risk_reduction_pts=float(goal), **common))
+    # Free-tier tokens expire at midnight, so the plan is "the most value today's tokens can buy" (budget mode). The goal
+    # is a check, solved in target mode: feasible means the day is on plan; infeasible names the shortfall in tokens or
+    # the ceiling, and that verdict rides along with the budget-mode allocation.
+    result = solve(OptimizationRequest(objective=MaximizeRiskReductionObjective(), budget=float(solve_budget), diagnose=False, **common))
+    target = solve(OptimizationRequest(objective=MinimizeCapitalObjective(), budget=float(solve_budget), required_risk_reduction_pts=max(0.0, float(goal) - reserve_value), **common))
     status, diagnosis, shortfall = "optimal", "", 0
     if target.status != "optimal":
         kind = str(getattr(target.diagnosis, "kind", "") or "")
         diagnosis = str(getattr(target.diagnosis, "summary", lambda: "")() or f"goal infeasible ({target.status})")
         required = getattr(target.diagnosis, "capital_required", None)
         if kind == "exceeds_budget" and required:
-            shortfall, status = max(0, int(math.ceil(float(required) - budget)), 1), "short"
+            shortfall, status = max(0, int(math.ceil(float(required) - solve_budget)), 1), "short"
         else:
             status = "ceiling"
-    lines = [PlanLine(a.node_id, a.name, round(float(a.funding_scale), 4), int(round(float(a.capital))), round(float(a.risk_reduction_pts), 3)) for a in result.allocations]
-    plan = DayPlan(scope, time.strftime("%Y-%m-%d", time.gmtime(stamp)), budget, goal, status if result.status == "optimal" else "error", lines,
-                   spend_tokens=int(round(float(result.net_capital))), value_points=round(float(result.baseline_risk_pts - result.optimized_risk_pts), 3),
+    lines = reserve_line + [PlanLine(a.node_id, a.name, round(float(a.funding_scale), 4), int(round(float(a.capital))), round(float(a.risk_reduction_pts), 3)) for a in result.allocations]
+    plan = DayPlan(scope, day, budget, goal, status if result.status == "optimal" else "error", lines,
+                   spend_tokens=held + int(round(float(result.net_capital))), value_points=round(reserve_value + float(result.baseline_risk_pts - result.optimized_risk_pts), 3),
                    full_value_points=round(full_value, 3), shortfall_tokens=shortfall, diagnosis=diagnosis, stress=round(float(stress), 3), stress_rows=stress_rows,
                    engine=engine_version(), input_hash=str(result.audit.get("input_hash", "")), output_hash=str(result.audit.get("output_hash", "")), created_at=stamp)
     if result.status != "optimal":
         plan.notes.append(f"budget-mode solve returned {result.status}")
+    if with_resources:
+        use = dict(getattr(result, "resource_use", {}) or {})
+        reserved_by_vendor = {v: t * (held / max(reserve.cost_tokens, 1)) for v, t in reserve.usage().items()} if reserve else {}
+        plan.resources = [
+            {"vendor": r.name, "capacity": int((capacities or {}).get(r.name, r.capacity)), "reserved": int(round(reserved_by_vendor.get(r.name, 0.0))),
+             "planned": int(round(float(use.get(r.name, 0.0)))), "headroom": int(round(r.capacity - float(use.get(r.name, 0.0))))}
+            for r in resources
+        ]
+        limited = str(getattr(getattr(target.diagnosis, "attainable", None), "limited_by", "") or "")
+        if limited.startswith("resource:"):
+            plan.notes.append(f"the goal is bounded by the daily supply of {limited.split(':', 1)[1]}, not by the pooled budget")
     violations = getattr(result.constraint_report, "violations", ())
     if violations:
         plan.notes.append(f"{len(violations)} constraint violation(s) reported by the engine's re-check")
     try:
-        sweep = sweep_budget(OptimizationRequest(objective=MaximizeRiskReductionObjective(), budget=float(max(budget, 1)), diagnose=False, **common), budget_levels(max(budget, 1)))
+        sweep = sweep_budget(OptimizationRequest(objective=MaximizeRiskReductionObjective(), budget=float(max(solve_budget, 1)), diagnose=False, **common), budget_levels(max(solve_budget, 1)))
         saturation = getattr(sweep, "saturation_budget", None)
         if saturation is not None:
-            plan.saturation_budget = int(saturation)
-            plan.recommended_share = round(min(1.0, float(saturation) / float(max(budget, 1))), 3)
+            plan.saturation_budget = held + int(saturation)
+            plan.recommended_share = round(min(1.0, float(plan.saturation_budget) / float(max(budget, 1))), 3)
     except Exception as exc:
         plan.notes.append(f"budget sweep unavailable: {str(exc)[:120]}")
     return plan

@@ -149,6 +149,11 @@
   tick reads the plan every interval: an unfunded activity is skipped (`skipped_by_plan` in the tick's
   cycle row), the rest run at the planned size (a company's or the academy's `max_tokens`, the
   leisure budget). Sliders: goal share and chat reserve; *Plan now* solves on demand.
+- Vendors are resources: each keyed vendor's remaining daily tokens is a capacity row, each activity
+  draws on vendors in the mix its workspace routed to over the last 72 h (an even split with no
+  history), and the chat reserve is held back from every vendor before the solve, never traded
+  away. The panel's per-vendor table shows capacity, reserved, planned, and headroom; a goal bounded
+  by one vendor's supply says so instead of asking for a bigger pooled budget.
 - Engine: `pip install -r requirements-supply.txt` (Python 3.12+; pinned to an audited commit of
   `colegleason1-jpg/supply-chain-resilience-engine`). Without it the panel says so and the fixed
   treasury shares apply; nothing else changes. Solves take 15–70 ms; never per chat send.
