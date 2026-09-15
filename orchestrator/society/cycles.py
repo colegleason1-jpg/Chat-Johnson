@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import vault
+from ..quota_registry import job_lock
 from ..errors import plain_error
 from ..jobs import JobCancelled, JobContext, enqueue, register_handler
 from ..missions import assemble_deliverable, deliverable_slug, task_plan
@@ -113,7 +114,7 @@ def call(
         ctx.progress(text=f"Waiting {int(wait) + 1}s for a free-tier window ({seat['title']})…")
         ctx.sleep(wait + 0.5)
     started = time.perf_counter()
-    with ctx.request_lock:
+    with job_lock(ctx.request_lock):  # steps aside for a waiting chat send first
         if prefer_local and local_endpoint() is not None:
             answer, decision = local_first_generate(mode, task_type, messages, ctx.ledger, max_tokens=max_tokens, temperature=0.3)
         else:

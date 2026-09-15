@@ -11,6 +11,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .. import vault
+from ..quota_registry import job_lock
 from ..errors import plain_error
 from ..jobs import JobCancelled, JobContext, enqueue, register_handler
 from ..router import _estimate_tokens, cortex_wait_seconds, generate_mode, local_endpoint, local_first_generate, strip_reasoning_tags
@@ -105,7 +106,7 @@ def call_free(ctx: JobContext, budget: CycleBudget, cycle_id: int, agent: Dict[s
         ctx.progress(text=f"Waiting {int(wait) + 1}s for a free-tier window ({agent['name']})…")
         ctx.sleep(wait + 0.5)
     started = time.perf_counter()
-    with ctx.request_lock:
+    with job_lock(ctx.request_lock):  # steps aside for a waiting chat send first
         if prefer_local and local_endpoint() is not None:
             answer, decision = local_first_generate(mode, task_type, messages, ctx.ledger, max_tokens=max_tokens, temperature=0.3)
         else:

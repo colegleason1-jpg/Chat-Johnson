@@ -188,6 +188,10 @@
 3. Revoke the old key at the vendor. Keys shown in screenshots or logs count as exposed.
 
 ## Incident quick checks
+- Chat looks frozen while the academy or a company cycle runs: sends wait at most 20 s for the job to
+  release the provider lock (the job yields to a waiting chat for up to 30 s), then proceed metered.
+  If it still hangs, the free-tier window is full: the send shows "Free-tier window is full; sending
+  in N s" and waits up to 65 s. Manage app → Logs shows any traceback.
 - `Generation failed: HTTP 429` on every send: free-tier window exhausted; wait a minute or add a
   second vendor key. Task Finder waits up to 65 s on its own.
 - `retired model` messages: discovery will replace the id on the next call; if it persists set

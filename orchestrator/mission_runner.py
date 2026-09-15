@@ -18,6 +18,7 @@ from .prompting import build_prompt_messages
 from .router import PaidReasoningSlot, RouteDecision, cortex_wait_seconds, generate_mode, strip_reasoning_tags
 from .spatial import SceneError, parse_scene_block, scene_json, scene_markdown, solve_layout
 from .webqa import browser_available, browser_check, check_markdown, check_url, first_url
+from .quota_registry import job_lock
 
 KIND = "mission"
 WORKSPACE = "task_finder"
@@ -90,7 +91,7 @@ def _run_model_node(ctx: JobContext, node: Dict[str, Any], context: str, thread_
         ctx.progress(text=f"Waiting {int(wait) + 1}s for a free-tier window before step {position}…")
         ctx.sleep(wait + 0.5)
     # The lock covers selection, request, and ledger record, so a chat send cannot overspend the same key.
-    with ctx.request_lock:
+    with job_lock(ctx.request_lock):  # steps aside for a waiting chat send first
         answer, decision = generate_mode(mode, str(node.get("type") or "chat"), messages, ctx.ledger, max_tokens=step_budget, temperature=0.2, paid_slot=paid_slot)
     return strip_reasoning_tags(answer), decision
 

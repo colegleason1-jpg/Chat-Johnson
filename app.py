@@ -61,7 +61,7 @@ from orchestrator.society.personas import board_persona
 from orchestrator.keyword_search import keyword_rank
 from orchestrator.prompting import build_prompt_messages as _build_prompt_messages
 from orchestrator.quota import QuotaLedger
-from orchestrator.quota_registry import get_quota_ledger, get_request_lock
+from orchestrator.quota_registry import CHAT_LOCK_TIMEOUT_SECONDS, acquire_for_chat, get_quota_ledger, get_request_lock
 from orchestrator.router import (
     RouteDecision,
     CORTEX_ENDPOINTS,
@@ -1207,8 +1207,13 @@ def run_generation(
                 st.info(f"Free-tier window is full; sending in {int(wait) + 1} s…")
             time.sleep(wait + 0.5)
             live_box.empty()
-        request_lock.acquire()
-        lock_held = True
+        if request_lock.locked():
+            with live_box.container():
+                st.info(f"A background job (academy, company cycle, or mission) is using the provider; waiting up to {int(CHAT_LOCK_TIMEOUT_SECONDS)} s for it to step aside…")
+        lock_held = acquire_for_chat(request_lock, CHAT_LOCK_TIMEOUT_SECONDS)
+        live_box.empty()
+        if not lock_held:
+            st.caption("The background job did not release the provider in time; sending anyway (the ledger still meters every attempt).")
         if mode == "normal" and cortex_available():
             # Normal mode streams token-by-token from the MILP-selected endpoint.
             try:

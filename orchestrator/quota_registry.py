@@ -130,7 +130,53 @@ def get_request_lock() -> threading.Lock:
         return lock
 
 
+CHAT_LOCK_TIMEOUT_SECONDS = 20.0   # a chat send waits this long for a background job to release the provider, then proceeds
+JOB_YIELD_SECONDS = 30.0           # a background job steps aside for a waiting chat send for at most this long
+_CHAT_WAITING = threading.Event()  # set while the operator's chat is waiting for the request lock
+
+
+def acquire_for_chat(lock: threading.Lock, timeout: float = CHAT_LOCK_TIMEOUT_SECONDS) -> bool:
+    """The operator's send takes the lock with a bounded wait, flagging background jobs to step aside meanwhile.
+
+    False means the wait ran out: the send proceeds without the lock (the ledger still meters every attempt and
+    the router handles a 429), which is better than a chat that looks frozen behind an academy cycle.
+    """
+    _CHAT_WAITING.set()
+    try:
+        return bool(lock.acquire(timeout=max(0.0, float(timeout))))
+    finally:
+        _CHAT_WAITING.clear()
+
+
+def chat_waiting() -> bool:
+    return _CHAT_WAITING.is_set()
+
+
+def yield_to_chat(max_wait: float = JOB_YIELD_SECONDS, step: float = 0.2) -> float:
+    """Background jobs call this before taking the lock: wait while a chat send is waiting; returns the seconds yielded."""
+    waited = 0.0
+    while _CHAT_WAITING.is_set() and waited < float(max_wait):
+        time.sleep(step)
+        waited += step
+    return round(waited, 2)
+
+
+class job_lock:
+    """``with job_lock(ctx.request_lock):`` yields to a waiting chat, then holds the lock for one provider call."""
+
+    def __init__(self, lock: threading.Lock) -> None:
+        self.lock = lock
+
+    def __enter__(self) -> None:
+        yield_to_chat()
+        self.lock.acquire()
+
+    def __exit__(self, *exc: object) -> None:
+        self.lock.release()
+
+
 def reset_for_tests() -> None:
     with _REGISTRY_LOCK:
         _BUCKETS.clear()
         _LOCKS.clear()
+    _CHAT_WAITING.clear()
