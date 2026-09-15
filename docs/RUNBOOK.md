@@ -129,8 +129,17 @@
   daily caps, and keys are constraints and never move); Heavy draft temperature + ≤ 0.4 × gain, the
   critique at 0.0; long-distance recall 10 % of the context budget + ≤ 15 % × gain; the digest's
   cross-chat section 600 + ≤ 600 × gain characters. Gain 0 restores deterministic behaviour.
-- Diagnosis: the routing log's reason string carries `chaos=<profile> jitter=<value>` and Heavy
-  sends carry `temperatures=draft/critique/synthesis`.
+- Diagnosis: the routing log's reason string carries `chaos=<profile> jitter=<value>` and
+  `runner_up=<endpoint>`, Heavy sends carry `temperatures=draft/critique/synthesis`.
+- Judging it: give answers a thumbs up or down and lock the artifacts you keep; the routing expander's
+  *Chaos on vs off* table (last 7 days) compares good rate, down rate, failures, truncations, latency,
+  and runner-up disagreements between sends made at gain > 0 and at gain 0. Run a week at each
+  setting before changing the bounds; `docs/MONTE_CARLO_PROCTOR.md` lists the next candidates.
+
+## Long-distance memory index
+- `recall_index` is an FTS5 table rebuilt automatically once for an older vault; `vault.rebuild_recall_index(scope)`
+  rebuilds it by hand after a restore. Lines decay with a 30-day half-life; migration marks the old
+  chat's summaries superseded, and a new digest supersedes the previous digest of the same chat.
 
 ## Quota caps
 - Per-vendor daily token ceilings default to the `DAILY_CAPS` table; set `CHAT_JOHNSON_DAILY_<VENDOR>`

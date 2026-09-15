@@ -122,11 +122,13 @@ def test_heavy_schedule_comes_from_the_active_wave(db):
 # ----------------------------------------------------------------------------- long-distance memory
 
 def seed_summary(scope, thread_id, content):
+    """A summary row the way enforce_window writes one: the row plus its lines in the recall index."""
     with vault._open_database() as connection:
-        connection.execute(
+        cursor = connection.execute(
             "INSERT INTO summaries (project_scope, covers_from_id, covers_to_id, message_count, content, method, created_at, thread_id) VALUES (?, 1, 2, 2, ?, 'extractive', ?, ?)",
             (scope, content, time.time(), int(thread_id)),
         )
+        vault._index_text(connection, scope, vault._thread_label(connection, int(thread_id)), "summary", int(thread_id), int(cursor.lastrowid), content, time.time())
 
 
 def test_recall_pulls_matching_lines_from_other_chats_only_inside_the_scope(db):

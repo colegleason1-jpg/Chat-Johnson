@@ -62,6 +62,7 @@ from orchestrator.prompting import build_prompt_messages as _build_prompt_messag
 from orchestrator.quota import QuotaLedger
 from orchestrator.quota_registry import get_quota_ledger, get_request_lock
 from orchestrator.router import (
+    RouteDecision,
     CORTEX_ENDPOINTS,
     TASK_TYPES,
     CortexStream,
@@ -117,41 +118,43 @@ from orchestrator.connectors_nodes import CONNECTORS, validate_nodes
 from orchestrator import mcp_client
 from orchestrator.preview import extract_preview_source, safe_preview_document
 from orchestrator.vault import (
-    answer_job,
-    redact_secrets,
-    mission_nodes_for,
-    save_mission_nodes,
-    messages_around,
-    search_messages,
-    thread_outline,
-    job_view,
-    list_jobs,
-    request_cancel,
     MESSAGE_WINDOW,
     WORKSPACES as VAULT_WORKSPACES,
     active_thread,
+    answer_job,
     append_message,
     archived_messages,
+    chaos_comparison,
     clear_thread,
-    delete_thread,
     create_thread,
+    delete_thread,
     export_artifact,
     health_check,
     initialize_database,
+    job_view,
+    list_jobs,
     list_threads,
+    messages_around,
     migrate_thread,
+    mission_nodes_for,
     recent_artifacts,
     recent_messages,
     recent_routes,
     recent_summaries,
     record_route,
+    redact_secrets,
+    rename_thread,
+    request_cancel,
     route_stats,
     routes_csv,
-    rename_thread,
     save_artifact,
+    save_mission_nodes,
     search_artifacts,
+    search_messages,
+    set_route_outcome,
     switch_thread,
     thread_health,
+    thread_outline,
     thread_transcript,
 )
 
@@ -388,6 +391,11 @@ def render_output_with_artifacts(
                     language,
                     source_message_id,
                 )
+                if source_message_id is not None:
+                    try:
+                        set_route_outcome(project_scope, int(source_message_id), "locked")
+                    except Exception:  # telemetry never blocks a lock
+                        pass
                 st.success(f"Locked artifact v{version} (id {artifact_id})")
         cursor = match.end()
     remainder = text[cursor:]
@@ -396,6 +404,22 @@ def render_output_with_artifacts(
     if not found:
         st.markdown(prepare_markdown(text))
     render_mission_handoff(text, project_scope, artifact_prefix)
+    render_verdict(project_scope, source_message_id, artifact_prefix)
+
+
+def render_verdict(project_scope: str, source_message_id: Optional[int], artifact_prefix: str) -> None:
+    """Thumbs under an answer: the cheapest outcome signal, attached to the routing decision that produced it."""
+    if source_message_id is None or not hasattr(st, "feedback"):
+        return
+    key = f"verdict:{artifact_prefix}"
+    value = st.feedback("thumbs", key=key)
+    if value is None or st.session_state.get(f"{key}:saved") == value:
+        return
+    try:
+        set_route_outcome(project_scope, int(source_message_id), "up" if int(value) == 1 else "down")
+        st.session_state[f"{key}:saved"] = value
+    except Exception:  # telemetry never blocks reading
+        pass
 
 
 def render_mission_handoff(text: str, project_scope: str, artifact_prefix: str) -> None:
@@ -1069,8 +1093,15 @@ def thread_mission(thread: sqlite3.Row) -> str:
     return str(thread["mission"]).strip() if "mission" in thread.keys() and thread["mission"] else ""
 
 
-def log_route(workspace: Optional[str], task_type: str, route: str, mode: str, started: float, reason: str, finish: str = "") -> None:
-    """Trace of every send (what was asked, where it went, how long, how it ended, why): session table plus the vault."""
+def log_route(
+    workspace: Optional[str], task_type: str, route: str, mode: str, started: float, reason: str, finish: str = "",
+    decision: Optional[RouteDecision] = None, message_id: Optional[int] = None,
+) -> None:
+    """Trace of every send (what was asked, where it went, how long, how it ended, why): session table plus the vault.
+
+    The vault row also keeps the runner-up endpoint and the pink-wave state, and is linked to the answer's message id so
+    a thumbs verdict or a locked artifact can be attached to the decision that produced it.
+    """
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     log: List[Dict[str, Any]] = st.session_state.setdefault("routing_log", [])
     log.append(
@@ -1087,7 +1118,11 @@ def log_route(workspace: Optional[str], task_type: str, route: str, mode: str, s
     )
     del log[:-ROUTING_LOG_LIMIT]
     try:
-        record_route(str(st.session_state.get("project_scope", "chat-johnson")), workspace or "", task_type, route, mode, elapsed_ms, finish, reason)
+        record_route(
+            str(st.session_state.get("project_scope", "chat-johnson")), workspace or "", task_type, route, mode, elapsed_ms, finish, reason,
+            runner_up=getattr(decision, "runner_up", "") if decision is not None else "",
+            chaos=getattr(decision, "chaos", None) if decision is not None else None, message_id=message_id,
+        )
     except Exception:  # telemetry must never break a send
         pass
 
@@ -1222,7 +1257,7 @@ def run_generation(
         workspace=workspace,
         task_type=task_type,
     )
-    log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish)
+    log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish, decision=decision, message_id=assistant_id)
     with st.chat_message("assistant"):
         applied = [skill.name for skill in select_skills(clean_prompt)]
         st.caption(f"{decision.provider}/{decision.model} · {task_type} · {mode}" + (f" · skills: {', '.join(applied)}" if applied else ""))
@@ -2381,9 +2416,20 @@ def render_routing_log() -> None:
     stats = route_stats(scope, hours=24.0)
     if stats:
         st.dataframe(stats, hide_index=True, use_container_width=True)
-        st.caption("share = fraction of sends; p50/p95 = latency percentiles in ms; 'failed' rows are sends no endpoint answered.")
+        st.caption("share = fraction of sends; p50/p95 = latency percentiles in ms; up/down/locked = your verdicts on the answers; 'failed' rows are sends no endpoint answered.")
     else:
         st.caption("No sends recorded yet in this project scope.")
+    st.markdown("#### Chaos on vs off · last 7 days")
+    comparison = chaos_comparison(scope, hours=168.0)
+    if comparison:
+        st.dataframe(comparison, hide_index=True, use_container_width=True)
+        st.caption(
+            "Sends made with the pink-wave gain above zero against sends made at zero: failures, truncations, latency, thumbs, locked "
+            "artifacts, and how often the solver's runner-up differed from the endpoint used. Switch the gain in the sidebar and "
+            "let both columns fill before judging; the math earns its place here, not in the docs."
+        )
+    else:
+        st.caption("Once sends exist, this compares chaos on against chaos off on outcomes: thumbs, locked artifacts, failures, latency.")
     if recent_routes(scope, limit=1):
         st.download_button(
             "⬇ Routing log (.csv, up to 5000 rows)", data=routes_csv(scope), file_name=f"routing-log-{scope}.csv", mime="text/csv",

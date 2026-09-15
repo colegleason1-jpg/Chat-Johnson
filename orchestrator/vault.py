@@ -126,7 +126,13 @@ CREATE TABLE IF NOT EXISTS route_log (
     mode TEXT NOT NULL DEFAULT 'normal',
     ms INTEGER NOT NULL DEFAULT 0,
     finish TEXT NOT NULL DEFAULT '',
-    reason TEXT NOT NULL DEFAULT ''
+    reason TEXT NOT NULL DEFAULT '',
+    runner_up TEXT NOT NULL DEFAULT '',
+    chaos_gain REAL NOT NULL DEFAULT 0,
+    chaos_profile TEXT NOT NULL DEFAULT '',
+    jitter REAL NOT NULL DEFAULT 0,
+    outcome TEXT NOT NULL DEFAULT '',
+    message_id INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_route_log_scope_time
@@ -247,6 +253,12 @@ def initialize_database() -> None:
         _ensure_column(connection, "agents", "focus", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "companies", "wave_size", "INTEGER NOT NULL DEFAULT 6")
         _ensure_column(connection, "catalog", "brief", "TEXT NOT NULL DEFAULT ''")
+        for column, ddl in (
+            ("runner_up", "TEXT NOT NULL DEFAULT ''"), ("chaos_gain", "REAL NOT NULL DEFAULT 0"), ("chaos_profile", "TEXT NOT NULL DEFAULT ''"),
+            ("jitter", "REAL NOT NULL DEFAULT 0"), ("outcome", "TEXT NOT NULL DEFAULT ''"), ("message_id", "INTEGER"),
+        ):
+            _ensure_column(connection, "route_log", column, ddl)
+        _ensure_recall_index(connection)
         # Backfill: every scope that has thread-less rows gets one "Main thread".
         scopes = {
             row[0]
@@ -260,7 +272,142 @@ def initialize_database() -> None:
                     f"UPDATE {table} SET thread_id = ? WHERE project_scope = ? AND thread_id IS NULL",
                     (thread_id, scope),
                 )
+        if _FTS["available"] and not connection.execute("SELECT 1 FROM recall_index LIMIT 1").fetchone():
+            _rebuild_recall_index(connection)  # an older vault: index what it already holds, once
         connection.commit()
+
+
+# =============================================================================
+# Long-distance memory index (SQLite FTS5, BM25 ranked; zero provider quota)
+# =============================================================================
+
+_FTS: Dict[str, bool] = {"available": True}
+RECALL_HALF_LIFE_DAYS = 30.0     # a recalled line loses half its weight every month
+RECALL_SUPERSEDED_WEIGHT = 0.5   # lines from a migrated chat or an older digest rank behind fresh ones
+_RECALL_FTS_SQL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS recall_index USING fts5("
+    "line, project_scope UNINDEXED, source UNINDEXED, kind UNINDEXED, thread_id UNINDEXED, ref_id UNINDEXED, "
+    "created_at UNINDEXED, superseded UNINDEXED, tokenize = \"unicode61 tokenchars '_'\")"
+)
+
+
+def _ensure_recall_index(connection: sqlite3.Connection) -> None:
+    try:
+        connection.execute(_RECALL_FTS_SQL)
+        _FTS["available"] = True
+    except sqlite3.OperationalError:
+        _FTS["available"] = False  # SQLite built without FTS5: recall falls back to keyword matching
+
+
+def recall_index_available() -> bool:
+    return bool(_FTS["available"])
+
+
+def _recall_lines(text: str) -> List[str]:
+    out: List[str] = []
+    for line in str(text or "").splitlines():
+        stripped = line.strip().lstrip("-*#> ").strip()
+        if len(stripped) < 12 or (stripped.startswith("[") and stripped.endswith("]")):
+            continue
+        out.append(stripped[:RECALL_LINE_MAX])
+    return out
+
+
+def _index_text(connection: sqlite3.Connection, scope: str, source: str, kind: str, thread_id: Optional[int], ref_id: int, text: str, created_at: float, superseded: int = 0) -> int:
+    """(Re)index one source's lines; idempotent per (scope, kind, ref_id). Returns the lines indexed."""
+    if not _FTS["available"]:
+        return 0
+    connection.execute("DELETE FROM recall_index WHERE project_scope = ? AND kind = ? AND ref_id = ?", (scope, kind, int(ref_id)))
+    lines = _recall_lines(text)
+    connection.executemany(
+        "INSERT INTO recall_index (line, project_scope, source, kind, thread_id, ref_id, created_at, superseded) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [(line, scope, source[:160], kind, int(thread_id) if thread_id is not None else None, int(ref_id), float(created_at), int(superseded)) for line in lines],
+    )
+    return len(lines)
+
+
+def _thread_label(connection: sqlite3.Connection, thread_id: Optional[int]) -> str:
+    row = connection.execute("SELECT title, workspace FROM threads WHERE id = ?", (int(thread_id or 0),)).fetchone()
+    return f'chat "{row["title"]}" ({row["workspace"]})' if row else "earlier chat"
+
+
+def _rebuild_recall_index(connection: sqlite3.Connection, project_scope: Optional[str] = None) -> int:
+    if not _FTS["available"]:
+        return 0
+    where, params = ("WHERE project_scope = ?", (project_scope,)) if project_scope else ("", ())
+    connection.execute(f"DELETE FROM recall_index {where}", params)
+    migrated = {int(r["id"]) for r in connection.execute("SELECT id FROM threads WHERE status = 'migrated'").fetchall()}
+    latest_digest: Dict[Tuple[str, str], int] = {}
+    count = 0
+    for row in connection.execute(f"SELECT id, project_scope, thread_id, content, created_at FROM summaries {where}", params).fetchall():
+        count += _index_text(connection, row["project_scope"], _thread_label(connection, row["thread_id"]), "summary", row["thread_id"], int(row["id"]), row["content"], float(row["created_at"]), int(int(row["thread_id"] or 0) in migrated))
+    for row in connection.execute(f"SELECT id, project_scope, title, mission FROM threads {where}", params).fetchall():
+        if row["mission"]:
+            count += _index_text(connection, row["project_scope"], f'mission of chat "{row["title"]}"', "mission", int(row["id"]), int(row["id"]), row["mission"], time.time())
+    artifacts = connection.execute(f"SELECT id, project_scope, name, code_body, structural_summary, created_at FROM artifact_store {where} ORDER BY id ASC", params).fetchall()
+    for row in artifacts:
+        if str(row["name"]).endswith("-digest.md"):
+            latest_digest[(row["project_scope"], row["name"])] = int(row["id"])
+    for row in artifacts:
+        name = str(row["name"])
+        if name.endswith("-digest.md"):
+            superseded = int(latest_digest.get((row["project_scope"], name)) != int(row["id"]))
+            count += _index_text(connection, row["project_scope"], f"digest {name}", "digest", None, int(row["id"]), str(row["code_body"])[:8_000], float(row["created_at"]), superseded)
+        elif row["structural_summary"]:
+            count += _index_text(connection, row["project_scope"], f"artifact {name}", "artifact", None, int(row["id"]), row["structural_summary"], float(row["created_at"]))
+    return count
+
+
+def rebuild_recall_index(project_scope: Optional[str] = None) -> int:
+    """Re-index every summary, mission, digest, and artifact summary (one scope, or all); returns lines indexed."""
+    with _open_database() as connection:
+        _ensure_recall_index(connection)
+        count = _rebuild_recall_index(connection, (project_scope.strip() or "default") if project_scope else None)
+        connection.commit()
+    return count
+
+
+def _fts_query(words: Sequence[str]) -> str:
+    return " OR ".join('"' + word.replace('"', "") + '"*' for word in words if word)
+
+
+def _recall_fts(connection: sqlite3.Connection, scope: str, words: Sequence[str], exclude_thread: Optional[int], needed: int, limit: int = 80) -> List[Tuple[float, str]]:
+    """(score, formatted line) from the FTS index: BM25 relevance, decayed by age, halved when superseded."""
+    try:
+        rows = connection.execute(
+            "SELECT line, source, kind, thread_id, ref_id, created_at, superseded, bm25(recall_index) AS rank "
+            "FROM recall_index WHERE project_scope = ? AND recall_index MATCH ? ORDER BY rank LIMIT ?",
+            (scope, _fts_query(words), int(limit)),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    live_summaries: set = set()
+    if exclude_thread is not None:
+        live_summaries = {int(r["id"]) for r in connection.execute(
+            "SELECT id FROM summaries WHERE project_scope = ? AND thread_id = ? ORDER BY created_at DESC, id DESC LIMIT 5", (scope, exclude_thread)
+        ).fetchall()}
+    now = time.time()
+    scored: List[Tuple[float, str]] = []
+    seen: set = set()
+    for row in rows:
+        thread_id = int(row["thread_id"]) if row["thread_id"] is not None else None
+        if exclude_thread is not None and thread_id == exclude_thread:
+            if row["kind"] == "mission" or (row["kind"] == "summary" and int(row["ref_id"]) in live_summaries):
+                continue  # the asking chat's own mission and live summaries are already in its context
+        lowered = str(row["line"]).lower()
+        if sum(1 for word in words if word in lowered) < needed:
+            continue
+        key = _normalized(str(row["line"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        age_days = max(0.0, now - float(row["created_at"] or now)) / 86_400.0
+        weight = (0.5 ** (age_days / RECALL_HALF_LIFE_DAYS)) * (RECALL_SUPERSEDED_WEIGHT if int(row["superseded"] or 0) else 1.0)
+        score = max(0.01, -float(row["rank"])) * weight
+        label = row["source"] if row["kind"] != "summary" or thread_id != exclude_thread else "this chat, older summary"
+        scored.append((score, f"- ({label}) {row['line']}"))
+    scored.sort(key=lambda item: -item[0])
+    return scored
 
 
 # =============================================================================
@@ -377,7 +524,11 @@ def set_thread_mission(thread_id: int, goal: str, project_scope: Optional[str] =
     """Pin the Task Finder mission to the thread so it outlives window eviction and migration."""
     with _open_database() as connection:
         _check_scope(connection, "threads", thread_id, project_scope)
-        connection.execute("UPDATE threads SET mission = ? WHERE id = ?", (redact_secrets((goal or "").strip())[:2000], int(thread_id)))
+        clean = redact_secrets((goal or "").strip())[:2000]
+        connection.execute("UPDATE threads SET mission = ? WHERE id = ?", (clean, int(thread_id)))
+        row = connection.execute("SELECT project_scope, title FROM threads WHERE id = ?", (int(thread_id),)).fetchone()
+        if row is not None:
+            _index_text(connection, row["project_scope"], f'mission of chat "{row["title"]}"', "mission", int(thread_id), int(thread_id), clean, time.time())
 
 
 def set_thread_status(thread_id: int, status: str, project_scope: Optional[str] = None) -> None:
@@ -436,6 +587,8 @@ def delete_thread(thread_id: int, project_scope: Optional[str] = None) -> Dict[s
         counts: Dict[str, int] = {}
         for table in ("message_history", "message_archive", "summaries", "mission_nodes"):
             cursor = connection.execute(f"DELETE FROM {table} WHERE thread_id = ?", (int(thread_id),))
+            if table == "summaries" and _FTS["available"]:
+                connection.execute("DELETE FROM recall_index WHERE thread_id = ? AND kind IN ('summary', 'mission')", (int(thread_id),))
             counts[table] = int(cursor.rowcount)
         # Finished jobs of the chat go with it; an active one keeps its row so the worker can end it cleanly.
         finished = connection.execute(
@@ -591,6 +744,7 @@ def enforce_window(project_scope: str, thread_id: Optional[int] = None, workspac
             (scope, min(ids), max(ids), len(ids), summary_text, time.time(), resolved_thread),
         )
         summary_id = int(cursor.lastrowid)
+        _index_text(connection, scope, _thread_label(connection, resolved_thread), "summary", resolved_thread, summary_id, summary_text, time.time())
         now = time.time()
         connection.executemany(
             """
@@ -701,6 +855,9 @@ def retexturize_summary(summary_id: int, new_content: str, method: str = "model"
             "UPDATE summaries SET content = ?, method = ? WHERE id = ?",
             (redact_secrets(new_content)[:6_000], method[:40], int(summary_id)),
         )
+        row = connection.execute("SELECT project_scope, thread_id, created_at FROM summaries WHERE id = ?", (int(summary_id),)).fetchone()
+        if row is not None:
+            _index_text(connection, row["project_scope"], _thread_label(connection, row["thread_id"]), "summary", row["thread_id"], int(summary_id), redact_secrets(new_content)[:6_000], float(row["created_at"]))
 
 
 def recent_messages(
@@ -768,10 +925,12 @@ def _recall_candidates(connection: sqlite3.Connection, scope: str, exclude_threa
 
 
 def recall_memory(project_scope: str, query: str, thread_id: Optional[int] = None, max_characters: int = 2_000) -> str:
-    """Long-distance memory: lines from other chats' summaries, digests, missions, and artifacts of this scope that share keywords with ``query``.
+    """Long-distance memory: lines from other chats' summaries, digests, missions, and artifacts of this scope that match ``query``.
 
-    Ranked by keyword overlap (then recency), bounded by ``max_characters``, never across scopes.
-    Empty when the request has no keywords or nothing in the project matches.
+    With FTS5 (the normal case) lines are BM25-ranked, decayed by age (half-life 30 days), and halved
+    when they come from a migrated chat or an older digest; without FTS5 they are ranked by keyword
+    overlap and recency. Bounded by ``max_characters``, never across scopes, empty when the request
+    has no keywords or nothing in the project matches.
     """
     from .keyword_search import keywords  # local import: keyword_search has no vault dependency
 
@@ -780,8 +939,21 @@ def recall_memory(project_scope: str, query: str, thread_id: Optional[int] = Non
         return ""
     scope = project_scope.strip() or "default"
     needed = 1 if len(words) == 1 else RECALL_MIN_HITS
+    exclude = int(thread_id) if thread_id is not None else None
     with _open_database() as connection:
-        candidates = _recall_candidates(connection, scope, int(thread_id) if thread_id is not None else None)
+        if _FTS["available"]:
+            ranked = _recall_fts(connection, scope, words, exclude, needed)
+            if not ranked:
+                return ""
+            lines = [RECALL_PREFIX]
+            used = len(RECALL_PREFIX) + 1
+            for _, line in ranked:
+                if used + len(line) + 1 > max_characters:
+                    continue
+                lines.append(line)
+                used += len(line) + 1
+            return "\n".join(lines) if len(lines) > 1 else ""
+        candidates = _recall_candidates(connection, scope, exclude)
     scored: List[Tuple[int, float, str]] = []
     seen: set = set()
     for label, text, created in candidates:
@@ -1000,8 +1172,15 @@ def save_artifact(
                 source_message_id,
             ),
         )
+        artifact_id = int(cursor.lastrowid)
+        if safe_name.endswith("-digest.md"):
+            if _FTS["available"]:
+                connection.execute("UPDATE recall_index SET superseded = 1 WHERE project_scope = ? AND kind = 'digest' AND source = ?", (safe_scope, f"digest {safe_name}"[:160]))
+            _index_text(connection, safe_scope, f"digest {safe_name}", "digest", None, artifact_id, safe_body[:8_000], time.time())
+        elif summary:
+            _index_text(connection, safe_scope, f"artifact {safe_name}", "artifact", None, artifact_id, summary, time.time())
         connection.commit()
-        return int(cursor.lastrowid), version
+        return artifact_id, version
 
 
 def artifact_by_id(artifact_id: int, project_scope: Optional[str] = None) -> Optional[sqlite3.Row]:
@@ -1118,22 +1297,78 @@ def export_artifact(artifact_id: int, project_scope: Optional[str] = None) -> Tu
 # =============================================================================
 
 
+ROUTE_OUTCOMES = ("up", "down", "locked")
+
+
 def record_route(
-    project_scope: str, workspace: str, task_type: str, route: str, mode: str, ms: int, finish: str = "", reason: str = ""
+    project_scope: str, workspace: str, task_type: str, route: str, mode: str, ms: int, finish: str = "", reason: str = "",
+    runner_up: str = "", chaos: Optional[Mapping[str, Any]] = None, message_id: Optional[int] = None,
 ) -> int:
-    """One row per send: where it went, how long it took, how it ended, why the solver chose it."""
+    """One row per send: where it went, how long it took, how it ended, why the solver chose it, what it would have chosen
+    otherwise (``runner_up``), and the pink-wave state (``chaos``: gain, profile, jitter); ``message_id`` lets an outcome
+    (thumbs, a locked artifact) be attached later so chaos on and off can be compared on results, not beliefs."""
     scope = project_scope.strip() or "default"
+    chaos = dict(chaos or {})
     with _open_database() as connection:
         cursor = connection.execute(
             """
-            INSERT INTO route_log (timestamp, project_scope, workspace, task_type, route, mode, ms, finish, reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO route_log (timestamp, project_scope, workspace, task_type, route, mode, ms, finish, reason,
+                                   runner_up, chaos_gain, chaos_profile, jitter, message_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (time.time(), scope, (workspace or "")[:40], (task_type or "")[:40], (route or "")[:120], (mode or "normal")[:40],
-             max(0, int(ms)), (finish or "")[:40], redact_secrets(reason or "")[:300]),
+             max(0, int(ms)), (finish or "")[:40], redact_secrets(reason or "")[:300], str(runner_up or "")[:120],
+             float(chaos.get("gain", 0.0) or 0.0), str(chaos.get("profile", "") or "")[:20], float(chaos.get("jitter", 0.0) or 0.0),
+             int(message_id) if message_id is not None else None),
         )
         connection.commit()
         return int(cursor.lastrowid)
+
+
+def set_route_outcome(project_scope: str, message_id: int, outcome: str) -> int:
+    """Attach the operator's verdict to the send that produced a message: 'up', 'down', or 'locked' (an artifact was kept)."""
+    if outcome not in ROUTE_OUTCOMES:
+        raise ValueError("unknown route outcome")
+    scope = project_scope.strip() or "default"
+    with _open_database() as connection:
+        cursor = connection.execute(
+            "UPDATE route_log SET outcome = ? WHERE project_scope = ? AND message_id = ?", (outcome, scope, int(message_id))
+        )
+        connection.commit()
+        return int(cursor.rowcount)
+
+
+def chaos_comparison(project_scope: str, hours: float = 168.0) -> List[Dict[str, Any]]:
+    """Chaos on (gain > 0) versus off over the window: sends, failures, truncations, latency, verdicts, runner-up disagreements."""
+    rows = recent_routes(project_scope, limit=5000, hours=hours)
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        keys = row.keys()
+        gain = float(row["chaos_gain"]) if "chaos_gain" in keys and row["chaos_gain"] is not None else 0.0
+        bucket = buckets.setdefault("chaos on" if gain > 0 else "chaos off", {"sends": 0, "failed": 0, "truncated": 0, "ms": [], "up": 0, "down": 0, "locked": 0, "runner_up_differs": 0})
+        bucket["sends"] += 1
+        bucket["failed"] += int(str(row["route"]) == "failed")
+        bucket["truncated"] += int(str(row["finish"]) == "length")
+        bucket["ms"].append(int(row["ms"]))
+        outcome = str(row["outcome"]) if "outcome" in keys and row["outcome"] else ""
+        if outcome in bucket:
+            bucket[outcome] += 1
+        runner_up = str(row["runner_up"]) if "runner_up" in keys and row["runner_up"] else ""
+        bucket["runner_up_differs"] += int(bool(runner_up) and not str(row["route"]).startswith(runner_up))
+    out = []
+    for name in ("chaos on", "chaos off"):
+        bucket = buckets.get(name)
+        if not bucket:
+            continue
+        sends = bucket["sends"] or 1
+        out.append({
+            "setting": name, "sends": bucket["sends"], "failed": bucket["failed"], "truncated": bucket["truncated"],
+            "p50_ms": _percentile(bucket["ms"], 0.5), "p95_ms": _percentile(bucket["ms"], 0.95),
+            "up": bucket["up"], "down": bucket["down"], "locked": bucket["locked"],
+            "good_rate": round((bucket["up"] + bucket["locked"]) / sends, 3), "down_rate": round(bucket["down"] / sends, 3),
+            "runner_up_differs": bucket["runner_up_differs"],
+        })
+    return out
 
 
 def recent_routes(project_scope: str, limit: int = 200, hours: Optional[float] = None) -> List[sqlite3.Row]:
@@ -1168,6 +1403,10 @@ def route_stats(project_scope: str, hours: float = 24.0) -> List[Dict[str, Any]]
         bucket["filtered"] += int(row["finish"] == "filtered")
         bucket["ms"].append(int(row["ms"]))
         bucket["last"] = max(float(bucket["last"]), float(row["timestamp"]))
+        outcome = str(row["outcome"]) if "outcome" in row.keys() and row["outcome"] else ""
+        bucket["up"] = bucket.get("up", 0) + int(outcome == "up")
+        bucket["down"] = bucket.get("down", 0) + int(outcome == "down")
+        bucket["locked"] = bucket.get("locked", 0) + int(outcome == "locked")
     total = sum(b["sends"] for b in buckets.values()) or 1
     stats = []
     for bucket in buckets.values():
@@ -1179,6 +1418,7 @@ def route_stats(project_scope: str, hours: float = 24.0) -> List[Dict[str, Any]]
             "p95_ms": _percentile(bucket["ms"], 0.95),
             "truncated": bucket["truncated"],
             "filtered": bucket["filtered"],
+            "up": bucket.get("up", 0), "down": bucket.get("down", 0), "locked": bucket.get("locked", 0),
             "last_seen": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(bucket["last"])),
         })
     stats.sort(key=lambda item: (-item["sends"], item["route"]))
@@ -1186,12 +1426,14 @@ def route_stats(project_scope: str, hours: float = 24.0) -> List[Dict[str, Any]]
 
 
 def routes_csv(project_scope: str, limit: int = 5000) -> str:
-    header = "id,timestamp_utc,workspace,task_type,route,mode,ms,finish,reason"
+    header = "id,timestamp_utc,workspace,task_type,route,mode,ms,finish,reason,runner_up,chaos_gain,chaos_profile,jitter,outcome"
     lines = [header]
     for row in reversed(recent_routes(project_scope, limit=limit)):
+        keys = row.keys()
         reason = str(row["reason"]).replace('"', "'").replace("\n", " ")
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(row["timestamp"])))
-        lines.append(f"{row['id']},{stamp},{row['workspace']},{row['task_type']},{row['route']},{row['mode']},{row['ms']},{row['finish']},\"{reason}\"")
+        extra = ",".join(str(row[k] if k in keys and row[k] is not None else "") for k in ("runner_up", "chaos_gain", "chaos_profile", "jitter", "outcome"))
+        lines.append(f"{row['id']},{stamp},{row['workspace']},{row['task_type']},{row['route']},{row['mode']},{row['ms']},{row['finish']},\"{reason}\",{extra}")
     return "\n".join(lines) + "\n"
 
 
@@ -1792,6 +2034,8 @@ def migrate_thread(
         mission = str(thread["mission"]) if "mission" in thread.keys() and thread["mission"] else ""
         connection.execute("UPDATE threads SET mission = ? WHERE id = ?", (mission, new_id))
         connection.execute("UPDATE threads SET status = 'migrated', updated_at = ? WHERE id = ?", (time.time(), old_id))
+        if _FTS["available"]:
+            connection.execute("UPDATE recall_index SET superseded = 1 WHERE project_scope = ? AND thread_id = ? AND kind = 'summary'", (scope, old_id))
         connection.commit()
     append_message(
         scope,

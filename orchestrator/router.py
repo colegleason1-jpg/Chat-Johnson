@@ -511,6 +511,8 @@ class MILPDecision:
     entropy_penalties: Dict[str, float]
     solver: str
     reason: str
+    runner_up: str = ""                      # the feasible endpoint that would have served without the winner
+    chaos: Dict[str, Any] = field(default_factory=dict)  # gain, profile, step, jitter of the winner (empty when no wave is active)
 
 
 def _vendor(endpoint: "CortexEndpoint") -> str:
@@ -811,7 +813,8 @@ def select_milp_endpoint(
     # Controlled chaos: the scope's pink wave adds a bounded jitter so near-ties break differently over time;
     # the capacity rows below are untouched, so it can never select a blocked endpoint.
     chaos = pinkwave.current()
-    jitter = chaos.routing_jitter([endpoint.name for endpoint in endpoints]) if chaos is not None else {}
+    chaos_step = chaos.step("routing") if chaos is not None and chaos.gain > 0.0 else 0
+    jitter = chaos.routing_jitter([endpoint.name for endpoint in endpoints], step=chaos_step) if chaos is not None else {}
     if jitter:
         penalties = {name: min(1.0, value + jitter.get(name, 0.0)) for name, value in penalties.items()}
     utilities = {endpoint.name: _utility_score(endpoint, task_type, penalties[endpoint.name]) for endpoint in endpoints}
@@ -864,6 +867,11 @@ def select_milp_endpoint(
 
     decision_vector = {endpoint.name: int(endpoint.name == chosen.name) for endpoint in endpoints}
     chaos_note = f"; chaos={chaos.profile('routing')} jitter={jitter.get(chosen.name, 0.0):.4f}" if jitter else ""
+    others = [endpoint for endpoint in feasible if endpoint.name != chosen.name]
+    runner_up = max(others, key=lambda endpoint: (utilities[endpoint.name], -endpoints.index(endpoint))).name if others else ""
+    chaos_state = (
+        {"gain": chaos.gain, "profile": chaos.profile("routing"), "step": chaos_step, "jitter": jitter.get(chosen.name, 0.0)} if jitter else {}
+    )
     return MILPDecision(
         endpoint=chosen,
         decision_vector=decision_vector,
@@ -873,7 +881,10 @@ def select_milp_endpoint(
         reason=(
             f"selected {chosen.name}; utility={utilities[chosen.name]:.4f}; "
             f"entropy_penalty={penalties[chosen.name]:.4f}; binary={decision_vector}{chaos_note}"
+            + (f"; runner_up={runner_up}" if runner_up else "")
         ),
+        runner_up=runner_up,
+        chaos=chaos_state,
     )
 
 
@@ -1328,6 +1339,8 @@ def cortex_generate(
                 reason=f"{decision.reason}; solver={decision.solver}; attempted={attempted}",
                 solver=decision.solver,
                 decision_vector=decision.decision_vector,
+                runner_up=decision.runner_up,
+                chaos=dict(decision.chaos),
             )
             return text, route_decision
         except ProviderError as exc:
@@ -1369,6 +1382,8 @@ class CortexStream:
             reason=f"{self.milp.reason}; solver={self.milp.solver}; streamed=True",
             solver=self.milp.solver,
             decision_vector=self.milp.decision_vector,
+            runner_up=self.milp.runner_up,
+            chaos=dict(self.milp.chaos),
         )
         self.text = ""
         self.status: Dict[str, Any] = {}
@@ -1619,6 +1634,8 @@ class RouteDecision:
     solver: str = "heuristic"
     decision_vector: Dict[str, int] = field(default_factory=dict)
     finish: str = ""  # "length" when the output budget cut the answer, "filtered" when the vendor did, else vendor value
+    runner_up: str = ""  # what Cortex 2 would have chosen instead (the counterfactual for the outcome log)
+    chaos: Dict[str, Any] = field(default_factory=dict)  # the pink-wave state behind this decision
 
 
 def classify(text: str) -> str:

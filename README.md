@@ -184,7 +184,7 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | Background Git-Streamer | Roadmap · not implemented |
 | Live SDK Document Scraper | Roadmap · not implemented |
 | Self-Correcting Execution Sandbox for chat output | Roadmap · exists only inside the repository pipeline |
-| Cross-thread semantic search | Partial · long-distance memory: keyword-ranked lines from the project's other chats (summaries, digests, missions, artifact summaries) in every prompt and every vision digest; no embedding index |
+| Cross-thread semantic search | Implemented as long-distance memory: FTS5/BM25 over the project's other chats (summaries, digests, missions, artifact summaries) with recency decay and superseding, in every prompt and every vision digest; no embedding index |
 | Controlled chaos: the validated 1/f signal applied across routing, Heavy Mode, memory recall, and migration | Implemented · bounded nudges only, per-project gain and frequency profiles, gain 0 is deterministic |
 | Society: per-project product briefs, per-company release waves, every seat's title/roles/KPIs and every persona editable | Implemented |
 | Capability card in every prompt (what the app can and cannot do) and memory as real chat turns | Implemented |
@@ -193,7 +193,7 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | Post-deploy checks for this app: `?health=1` JSON view, `scripts/smoke_drive.py`, `post-deploy-smoke` workflow, `docs/RUNBOOK.md` | Implemented · set the `DEPLOY_URL` repository variable to arm the workflow |
 | Mission nodes: executors, connectors, sub-missions, offline validation, stored node graph, chat handoff | Implemented (batch E) |
 | Session-only GitHub push: token and repo armed per session, one commit on a new branch plus an opened pull request, revert PR for any push from the session | Implemented · never the default branch |
-| App observability: every send persisted to `route_log`, Ops view (sends, share, p50/p95, truncations) and CSV export under the routing expander | Implemented |
+| App observability: every send persisted to `route_log` with the runner-up endpoint, the pink-wave state, and the operator's verdict (thumbs, locked artifact); Ops view, chaos on vs off comparison, CSV export | Implemented |
 
 Controls: **Heavy Mode** toggle (multi-pass, more tokens, longer wait), **Artifact Lock** beside every
 code block (versioned save to SQLite), output token budget slider, per-project scope.
@@ -231,6 +231,16 @@ texturized summaries, vision digests, pinned missions, this chat's own older sum
 summaries, ranked by keyword overlap with the request and bounded to a share of the context budget
 (a tenth, up to a quarter when the controlled-chaos gain lifts it). A vision digest carries the same
 recall into the successor thread. Recall never crosses a project scope, and it costs no provider quota.
+Under the hood it is an SQLite FTS5 index (`recall_index`, BM25 ranking, identifiers kept whole) fed
+by every summary, mission, digest, and artifact summary as it is written; a line loses half its weight
+every 30 days, and lines from a migrated chat or an older digest are halved again (superseded). Without
+FTS5 the same recall falls back to keyword overlap.
+
+**Outcome log.** Every send's `route_log` row also keeps the solver's runner-up endpoint and the
+pink-wave state (gain, profile, jitter), and is linked to the answer. Thumbs under an answer and a
+locked artifact attach a verdict to that decision. The routing expander's *Chaos on vs off* table
+compares the two settings on failures, truncations, latency, verdicts, and runner-up disagreements,
+so the math is judged on results.
 
 ## Setup
 
