@@ -225,3 +225,11 @@ chat_johnson_vault.db-shm
 .orchestrator/
 generated/
 phase3_output/
+
+# Chat Johnson: vault copies, backups, and keys never enter git
+backups/
+*.db
+*.db-wal
+*.db-shm
+.env.*
+!.env.example

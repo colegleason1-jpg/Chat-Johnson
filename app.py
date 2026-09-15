@@ -29,26 +29,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-# Keep the startup cleanup deliberately narrow and before any application
-# services are initialized. Only these three retired case-variant modules are
-# targets; the active lowercase app.py and orchestrator package are untouched.
-def _sanitize_duplicate_modules() -> List[str]:
-    root = Path(__file__).resolve().parent
-    removed: List[str] = []
-    for filename in ("App.py", "Router.py", "Sandbox.py"):
-        candidate = root / filename
-        try:
-            os.remove(candidate)
-            removed.append(filename)
-        except FileNotFoundError:
-            continue
-        except OSError:
-            continue
-    return removed
-
-
-SANITIZED_DUPLICATES = _sanitize_duplicate_modules()
-
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -68,10 +48,11 @@ except ImportError as _import_error:  # pragma: no cover - only reachable on a b
 
 from orchestrator.config import PROVIDERS, bind_session_keys, get_settings, provider_model, resolve_secret
 from orchestrator.discovery import vendor_for
+from orchestrator.envsafe import self_hosted
 from orchestrator.errors import plain_error
 from orchestrator.executor import Orchestrator
 from orchestrator import mission_runner  # noqa: F401  (registers the mission job handler)
-from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner
+from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner, secrets_deliverable
 from orchestrator import society
 from orchestrator.society import store as society_store
 from orchestrator.society.personas import board_persona
@@ -136,6 +117,7 @@ from orchestrator import mcp_client
 from orchestrator.preview import extract_preview_source, safe_preview_document
 from orchestrator.vault import (
     answer_job,
+    redact_secrets,
     mission_nodes_for,
     save_mission_nodes,
     messages_around,
@@ -523,6 +505,21 @@ NO_REPOSITORY_CONTEXT = (
 )
 
 
+def local_path_refusal(path: str, app_root: Optional[str] = None) -> str:
+    """Why a local path may not be read here ("" when it may): self-hosted only, never the studio's own checkout,
+    and only under the roots named in ``CHAT_JOHNSON_REPO_ROOTS`` (colon-separated) when that is set."""
+    if not self_hosted():
+        return "Local paths are read only on a self-hosted deployment."
+    root = os.path.realpath(app_root or str(Path(__file__).resolve().parent))
+    real = os.path.realpath(path)
+    if real == root or real.startswith(root + os.sep):
+        return "Refusing the studio's own checkout; point it at another repository."
+    allowed = [os.path.realpath(p) for p in os.environ.get("CHAT_JOHNSON_REPO_ROOTS", "").split(":") if p.strip()]
+    if allowed and not any(real == a or real.startswith(a + os.sep) for a in allowed):
+        return "That path is outside CHAT_JOHNSON_REPO_ROOTS; add it there on the VM to allow it."
+    return ""
+
+
 def repository_context(max_tokens: int) -> Tuple[str, str, bool]:
     """(context for the prompt, note for the operator, loaded?) for the repository conversation.
 
@@ -531,6 +528,8 @@ def repository_context(max_tokens: int) -> Tuple[str, str, bool]:
     """
     fetched: Optional[Dict[str, Any]] = st.session_state.get("repo_fetched")
     path = str(fetched["path"]) if fetched else str(st.session_state.get("repo_path", "") or "").strip()
+    if path and not fetched and local_path_refusal(path):
+        return NO_REPOSITORY_CONTEXT, f"Local path not read: {local_path_refusal(path)}", False
     if not path or not os.path.isdir(path):
         slot = github_push_status()
         hint = (
@@ -561,7 +560,10 @@ def repository_context(max_tokens: int) -> Tuple[str, str, bool]:
 def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
     """Fetch (GitHub) or point at (local) a repository, run the sandbox pipeline, review, push."""
     push_state = github_push_status()
-    source = st.radio("Source", ["GitHub repository", "Local path"], horizontal=True, key="repo_source_kind")
+    sources = ["GitHub repository", "Local path"] if self_hosted() else ["GitHub repository"]
+    source = st.radio("Source", sources, horizontal=True, key="repo_source_kind")
+    if source not in sources:
+        source = sources[0]
     fetched: Optional[Dict[str, Any]] = st.session_state.get("repo_fetched")
     repo_path = ""
     if source == "GitHub repository":
@@ -628,18 +630,22 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
         "Requested repository change", height=100, key="repo_goal",
         placeholder="Describe a reviewable change; generated edits stay in an isolated sandbox.",
     )
-    run_tests = st.checkbox(
-        "Run the repository's tests in the repair loop (executes its code in this app's container)",
-        value=(source == "Local path"), key="repo_run_tests",
-    )
+    if self_hosted():
+        run_tests = st.checkbox(
+            "Run the repository's tests in the repair loop (executes its code in the worker container)",
+            value=(source == "Local path"), key="repo_run_tests",
+        )
+    else:
+        run_tests = False  # a shared host never executes a visitor's repository
+        st.caption("The repository's own tests are not executed on a shared deployment; syntax guardrails still apply.")
     ready = bool(repo_goal.strip() and repo_path.strip() and configured_provider_names())
     if st.button("Run sandboxed pipeline", type="primary", key="run_repo_pipeline", disabled=not ready,
                  help="Needs a fetched or local repository, a requested change, and at least one provider key."):
         app_root = str(Path(__file__).resolve().parent)
         if not os.path.isdir(repo_path):
             st.error("Repository path does not exist.")
-        elif source == "Local path" and os.path.realpath(repo_path) == os.path.realpath(app_root):
-            st.error("Refusing to run the pipeline on the studio's own checkout; point it at another repository.")
+        elif source == "Local path" and local_path_refusal(repo_path, app_root):
+            st.error(local_path_refusal(repo_path, app_root))
         else:
             settings = get_settings()
             settings.max_output_tokens = int(st.session_state.get("max_tokens", 2048))
@@ -811,11 +817,11 @@ reviewable result. It never touches your default branch, never stores a token, a
 1. In the sidebar, open *GitHub push (session only)*: switch it on and paste a fine-grained token with Contents and Pull requests write access (read access is enough to connect a private repository). Nothing is stored.
 2. *Work* → Source *GitHub repository*: your repositories are listed; pick one (type to filter) and press **Connect**. The tree is downloaded through the GitHub API at one commit into a temporary sandbox; the commit and file count are shown. Without a token, enter a public `owner/name` instead. Pushes go to the connected repository.
 3. The conversation below the tabs now sees the repository (file map and the highest-value files within the token budget): ask it to inspect, explain, or plan. Changes are made by the pipeline, not by the chat.
-4. Describe the change and press **Run sandboxed pipeline**. The pipeline ingests the tree within a token budget, plans typed steps, asks the routed model for complete file blocks or unified diffs, applies them in the sandbox, and validates Python syntax. Tick *Run the repository's tests* only when you accept that the repository's own test suite executes here.
+4. Describe the change and press **Run sandboxed pipeline**. The pipeline ingests the tree within a token budget, plans typed steps, asks the routed model for complete file blocks or unified diffs, applies them in the sandbox, and validates Python syntax. On a self-hosted VM you may tick *Run the repository's tests*; a shared deployment never executes a repository's code.
 5. Review the diff and the changed-file list. **Download patch** gives you the unified diff; **Push … and open a pull request** creates one commit on a new branch off the fetched ref and opens the pull request.
 6. The GitHub tab lists the push; **Open revert PR** restores the touched paths.
 
-**Local path** works the same on a self-hosted run: point at a repository on the machine that runs the app; a git worktree is used when possible.
+**Local path** appears only on a self-hosted run: point at a repository on the machine that runs the app (under `CHAT_JOHNSON_REPO_ROOTS` when that is set); a git worktree is used when possible. Secret files (`.env`, `secrets.toml`, keys) are never read into the prompt.
 
 **Empty repositories** connect too: the sandbox starts blank, the chat proposes a structure, the pipeline creates the files, and the first push makes the initial commit on the default branch (later pushes get a branch and a pull request).
 
@@ -1144,6 +1150,7 @@ def run_generation(
     live_box = st.empty()
     started = time.perf_counter()
     request_lock = get_task_request_lock()
+    lock_held = False  # released only by the thread that acquired it: a mission may hold the same lock
     try:
         wait = cortex_wait_seconds(ledger, messages, max_tokens)
         if 0 < wait <= CHAT_MAX_WAIT_SECONDS:
@@ -1153,6 +1160,7 @@ def run_generation(
             time.sleep(wait + 0.5)
             live_box.empty()
         request_lock.acquire()
+        lock_held = True
         if mode == "normal" and cortex_available():
             # Normal mode streams token-by-token from the MILP-selected endpoint.
             try:
@@ -1202,18 +1210,15 @@ def run_generation(
     except Exception as exc:
         live_box.empty()
         # Shown in plain words; the raw vendor body stays in the session's provider events only.
-        st.session_state.setdefault("provider_events", []).append(str(exc)[:600])
+        st.session_state.setdefault("provider_events", []).append(redact_secrets(str(exc))[:600])
         log_route(workspace, task_type, "failed", mode, started, str(exc)[:160])
         st.error(plain_error(exc))
         with st.expander("Technical detail", expanded=False):
-            st.code(str(exc)[:600])
+            st.code(redact_secrets(str(exc))[:600])
         return user_message_id
     finally:
-        if request_lock.locked():
-            try:
-                request_lock.release()
-            except RuntimeError:
-                pass
+        if lock_held:
+            request_lock.release()
     live_box.empty()
     answer = strip_reasoning_tags(answer)
     assistant_id = append_message(
@@ -1275,7 +1280,7 @@ def render_history(project_scope: str, heading: str, workspace: Optional[str] = 
     focus = st.session_state.get(f"focus_{workspace}")
     if focus:
         # The navigator jumped here: show the window around that message instead of the tail.
-        rows = messages_around(int(focus["thread_id"]), int(focus["message_id"]), before=limit // 2, after=limit // 2)
+        rows = messages_around(int(focus["thread_id"]), int(focus["message_id"]), before=limit // 2, after=limit // 2, project_scope=project_scope)
         left, right = st.columns([0.7, 0.3])
         left.caption(f"Showing {len(rows)} messages around message #{focus['message_id']} (from the navigator).")
         if right.button("Back to latest", key=f"unfocus_{workspace}", use_container_width=True):
@@ -1326,7 +1331,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
     st.session_state[select_key] = int(current["id"])
 
     def _on_select(key: str = select_key) -> None:
-        switch_thread(int(st.session_state[key]))
+        switch_thread(int(st.session_state[key]), project_scope)
 
     st.selectbox(
         "Chat", ids, format_func=lambda value: labels.get(value, str(value)), key=select_key,
@@ -1339,7 +1344,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
         st.rerun()
     if clear.button("Clear chat", key=f"clear_thread_{workspace}", use_container_width=True,
                     help="Empty this chat. The messages move to the archive and leave the context; keys are untouched."):
-        moved = clear_thread(int(current["id"]))
+        moved = clear_thread(int(current["id"]), project_scope)
         for bucket in ("pending_missions", "pending_plans"):
             st.session_state.get(bucket, {}).pop(int(current["id"]), None)
         st.session_state[f"notice_{workspace}"] = f"Chat cleared: {moved} message(s) archived and out of context."
@@ -1352,7 +1357,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
         title_key = f"thread_title_{workspace}_{current['id']}"
         new_title = st.text_input("Rename this chat", value=current["title"], key=title_key)
         if st.button("Save name", key=f"save_title_{workspace}") and new_title.strip() and new_title.strip() != current["title"]:
-            rename_thread(int(current["id"]), new_title)
+            rename_thread(int(current["id"]), new_title, project_scope)
             st.rerun()
         health = thread_health(project_scope, workspace=workspace)
         st.progress(min(float(health["pressure"]), 1.0), text=f"Context load {min(health['pressure'], 1.0):.0%} of the migration threshold")
@@ -1379,8 +1384,8 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
                 f"{last_migration['digest_artifact_id']} · {last_migration['method']}"
             )
         st.caption("Download this chat (archive, summaries, and digest included) for review or hand-off.")
-        md_name, md_body = thread_transcript(int(current["id"]), "markdown")
-        js_name, js_body = thread_transcript(int(current["id"]), "json")
+        md_name, md_body = thread_transcript(int(current["id"]), "markdown", project_scope)
+        js_name, js_body = thread_transcript(int(current["id"]), "json", project_scope)
         st.download_button("⬇ Chat (.md)", data=md_body, file_name=md_name, mime="text/markdown",
                            key=f"download_md_{workspace}_{current['id']}", use_container_width=True)
         st.download_button("⬇ Chat (.json)", data=js_body, file_name=js_name, mime="application/json",
@@ -1398,7 +1403,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
                 if st.button(f"#{hit['id']} {hit['role']}: {snippet}", key=f"nav_hit_{workspace}_{hit['id']}", use_container_width=True):
                     st.session_state[f"focus_{workspace}"] = {"thread_id": int(current["id"]), "message_id": int(hit["id"])}
                     st.rerun()
-        outline = thread_outline(int(current["id"]))
+        outline = thread_outline(int(current["id"]), project_scope=project_scope)
         if outline:
             # Distinct names on purpose: the chat select box's formatter closes over ``labels`` above.
             turn_labels = [f"#{entry['id']} {entry['role']}: {entry['text']}" for entry in outline]
@@ -1416,7 +1421,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
         )
         yes, no = st.columns(2, gap="small")
         if yes.button("Yes, delete this chat", type="primary", key=f"delete_yes_{workspace}", use_container_width=True):
-            counts = delete_thread(int(current["id"]))
+            counts = delete_thread(int(current["id"]), project_scope)
             for bucket in ("pending_missions", "pending_plans"):
                 st.session_state.get(bucket, {}).pop(int(current["id"]), None)
             st.session_state.pop(f"confirm_delete_{workspace}", None)
@@ -1598,13 +1603,13 @@ def render_jobs_strip(project_scope: str) -> None:
                 head, tail = st.columns([0.8, 0.2], gap="small")
                 head.markdown(f"**{JOB_LABELS.get(job['kind'], job['kind'].title())} #{job['id']}** · {job['status'].replace('_', ' ')}")
                 if tail.button("Cancel", key=f"cancel_job_{job['id']}", use_container_width=True, disabled=job["cancel_requested"]):
-                    request_cancel(job["id"])
+                    request_cancel(job["id"], project_scope)
                 st.progress(min(1.0, step / total) if total else 0.0, text=str(progress.get("text") or job["status"]))
                 if job["status"] == "waiting_input":
                     st.info(job["question"])
                     answer = st.text_input("Your answer", key=f"job_answer_{job['id']}")
                     if st.button("Send answer", key=f"job_answer_btn_{job['id']}") and answer.strip():
-                        answer_job(job["id"], answer.strip())
+                        answer_job(job["id"], answer.strip(), project_scope)
 
     fragment = getattr(st, "fragment", None)
     if fragment is not None:
@@ -1637,11 +1642,11 @@ def render_launch_summary(job: Dict[str, Any], thread_id: int, dismissed: set) -
             f"{measure.get('words', 0)} words{target_note}. Locked as artifact v{result['deliverable_version']}; "
             "it is also under Locked artifacts in the sidebar."
         )
-        filename, body = export_artifact(int(result["deliverable_artifact"]))
+        filename, body = export_artifact(int(result["deliverable_artifact"]), st.session_state.project_scope)
         st.download_button("⬇ Download deliverable (.md)", data=body, file_name=filename, mime="text/markdown",
                            key=f"deliverable_{thread_id}_{result['deliverable_artifact']}")
     if result.get("scene_artifact"):
-        filename, body = export_artifact(int(result["scene_artifact"]))
+        filename, body = export_artifact(int(result["scene_artifact"]), st.session_state.project_scope)
         try:
             scene = json.loads(body)
         except ValueError:
@@ -1779,7 +1784,7 @@ def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int
             with st.expander(f"Configure step {step['id']} · {step['title']} ({step['executor']})", expanded=bool(needs_form and step["executor"] in ("connector", "sub_mission"))):
                 render_node_config(step, thread_id)
         push_state = github_push_status()
-        reasons = validate_nodes(plan, push_armed=bool(push_state["armed"]), mcp_servers=mcp_server_names())
+        reasons = validate_nodes(plan, push_armed=bool(push_state["armed"]), mcp_servers=mcp_server_names(), secrets_deliverable=secrets_deliverable())
         for reason in reasons:
             st.error(reason)
         heavy = active_mode() == "heavy"
@@ -1801,7 +1806,7 @@ def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int
             disabled=not configured_provider_names() or bool(reasons),
             help=("Fix the reasons above first." if reasons else "Runs the nodes strictly in order, each one seeing the results before it; results are saved to this chat."),
         ):
-            save_mission_nodes(thread_id, plan)
+            save_mission_nodes(thread_id, plan, project_scope)
             launch_mission(project_scope, ledger, thread_id, goal, plan)
             pending.pop(thread_id, None)
             st.session_state.get("pending_plans", {}).pop(thread_id, None)
@@ -1858,10 +1863,10 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
     goal = preset["statement"] if preset else pending.get(thread_id, "")
     if goal and not running:
         render_mission_panel(project_scope, ledger, thread_id, goal, pending, preset=preset)
-    elif has_mission and not running and mission_nodes_for(thread_id):
+    elif has_mission and not running and mission_nodes_for(thread_id, project_scope):
         st.caption("Mission in progress: the chat bar continues it with every result in context. Start another mission with New chat.")
         if st.button("Re-run this mission", key=f"rerun_{thread_id}", help="Reopens the stored nodes of this chat in the plan panel; nothing runs until Launch."):
-            pending_plans[thread_id] = {"statement": mission, "plan": mission_nodes_for(thread_id)}
+            pending_plans[thread_id] = {"statement": mission, "plan": mission_nodes_for(thread_id, project_scope)}
             st.rerun()
     elif not has_mission and not running:
         st.caption("No mission in this chat yet. Type one in the chat bar to see its proposed workstreams before anything runs.")
@@ -1873,7 +1878,7 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
 def job_secrets_for_session() -> Dict[str, str]:
     """Keys handed to a background job for its lifetime only; never written anywhere."""
     secrets = dict(st.session_state.get("byok_keys", {}) or {})
-    if active_mode() == "heavy" and st.session_state.get("paid_slot_key"):
+    if active_mode() == "heavy" and st.session_state.get("paid_slot_enabled") and st.session_state.get("paid_slot_key"):
         secrets["paid_slot_key"] = str(st.session_state.get("paid_slot_key"))
     if github_push_status()["armed"]:
         # Connector nodes that write to GitHub use the same session-only slot as the Repository Work button.
@@ -2015,7 +2020,7 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
             for item in waiting:
                 with st.expander(f"#{item['id']} · {item['title']}", expanded=False):
                     if item.get("artifact_id"):
-                        filename, body = export_artifact(int(item["artifact_id"]))
+                        filename, body = export_artifact(int(item["artifact_id"]), project_scope)
                         if "<html" in body.lower() or "<div" in body.lower() or "<section" in body.lower():
                             components.html(safe_preview_document(extract_preview_source(body) or body), height=360, scrolling=True)
                         st.markdown(body[:4000])
@@ -2088,7 +2093,7 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
         queued = [job_view(r) for r in list_jobs(project_scope, ("queued",), limit=50, kind=society.KIND_COMPANY) if job_view(r)["payload"].get("company_id") == company_id]
         if right.button("Pause chain (cancel queued cycles)", key=f"pause_{company_id}", use_container_width=True, disabled=not queued):
             for job in queued:
-                request_cancel(job["id"])
+                request_cancel(job["id"], project_scope)
             st.rerun()
         if queued:
             st.caption(f"{len(queued)} cycle(s) queued; next at {time.strftime('%H:%M UTC', time.gmtime(max(j['run_after'] for j in queued)))}.")
@@ -2158,7 +2163,7 @@ def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional
     queued = [job_view(r) for r in list_jobs(project_scope, ("queued",), limit=50, kind=society.KIND_ACADEMY)]
     if queued and st.button("Pause chain (cancel queued academy cycles)", key="pause_academy"):
         for job in queued:
-            request_cancel(job["id"])
+            request_cancel(job["id"], project_scope)
         st.rerun()
     st.number_input("Society size target", min_value=10, max_value=500, value=target, step=10, key="academy_target")
     with st.container(border=True):
@@ -2474,19 +2479,19 @@ with st.sidebar:
             st.caption("Disarmed. Nothing can be written to GitHub.")
     with st.expander("MCP servers (VM worker)", expanded=False):
         servers = mcp_client.load_servers()
-        self_hosted = os.environ.get("CHAT_JOHNSON_SELF_HOSTED", "").strip() == "1"
+        hosted = self_hosted()
         if not servers:
             st.caption("No servers declared. Add entries to `mcp_servers.yaml` on the VM; mission nodes call them with the `mcp.call` connector.")
         for server in servers:
             st.markdown(f"**{server['name']}** · `{server['command']} {' '.join(server['args'])}`" + (f" · {server['description']}" if server["description"] else ""))
-            if st.button("List tools", key=f"mcp_probe_{server['name']}", disabled=not self_hosted,
+            if st.button("List tools", key=f"mcp_probe_{server['name']}", disabled=not hosted,
                          help="Starts the server over stdio and lists its tools; available on the self-hosted VM only."):
                 probe = mcp_client.probe(server)
                 if probe["ok"]:
                     st.caption("Tools: " + (", ".join(probe["tools"]) or "none"))
                 else:
                     st.error(probe["error"])
-        if servers and not self_hosted:
+        if servers and not hosted:
             st.caption("Servers run inside the VM worker container; this deployment cannot start them.")
     st.divider()
     st.subheader("BYOK channels")
@@ -2503,7 +2508,7 @@ with st.sidebar:
         local = local_endpoint()
         if local is not None:
             st.caption(f"Registered: `{local.base_url}` · model `{endpoint_model(local)}` · the academy's cheap labour goes here first.")
-        if os.environ.get("CHAT_JOHNSON_SELF_HOSTED", "").strip() == "1":
+        if self_hosted():
             with st.form("local_endpoint_form"):
                 base_url = st.text_input("OpenAI-compatible base URL", value=local.base_url if local else "http://ollama:11434/v1")
                 model = st.text_input("Model", value=local.model if local else "llama3.1:8b")
@@ -2523,7 +2528,7 @@ with st.sidebar:
     )
     if artifacts:
         for artifact in artifacts:
-            filename, body = export_artifact(int(artifact["id"]))
+            filename, body = export_artifact(int(artifact["id"]), st.session_state.project_scope)
             st.caption(f"v{artifact['version']} · {artifact['name']} · {artifact['structural_summary'][:100]}")
             st.download_button(
                 f"⬇ {filename}",

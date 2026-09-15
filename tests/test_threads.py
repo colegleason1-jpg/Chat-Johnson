@@ -186,7 +186,7 @@ def test_delete_thread_removes_history_archive_and_summaries_only_for_that_threa
     db.switch_thread(first)
     assert db.active_thread(scope)["id"] == first
     counts = db.delete_thread(first)
-    assert counts == {"message_history": 4, "message_archive": 6, "summaries": 0}
+    assert counts == {"message_history": 4, "message_archive": 6, "summaries": 0, "mission_nodes": 0, "jobs": 0}
     assert db.thread_by_id(first) is None
     assert db.archived_messages(scope, 100, thread_id=first) == []
     assert db.active_thread(scope)["id"] == second

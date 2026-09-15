@@ -171,12 +171,37 @@ def parse_diff_blocks(text: str) -> List[str]:
     return [m.group("body") for m in DIFF_BLOCK_RE.finditer(text)]
 
 
+FORBIDDEN_SEGMENTS = frozenset({".git", ".orchestrator", ".hg", ".svn", ".orch_source"})
+# Git must never read hooks, fsmonitor, or external diff tools from a tree a model wrote into.
+GIT_SAFE = ("-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "-c", "diff.external=", "-c", "core.pager=cat")
+
+
 def _safe_relpath(path: str) -> bool:
-    """Reject absolute paths and traversal outside the sandbox."""
-    if not path or path.startswith(("/", "~")) or ".." in path.split("/"):
+    """Reject absolute paths, traversal, and anything under a VCS or orchestrator directory."""
+    if not path or path.startswith(("/", "~")):
+        return False
+    segments = path.replace("\\", "/").split("/")
+    if ".." in segments or any(segment.lower() in FORBIDDEN_SEGMENTS for segment in segments):
         return False
     drive = os.path.splitdrive(path)[0]
     return not drive
+
+
+_DIFF_PATH = re.compile(r"^(?:diff --git a/(?P<a>[^\t\n]+?) b/(?P<b>[^\t\n]+)|\+\+\+ (?P<plus>[^\t\n]+))", re.M)
+
+
+def diff_paths(diff: str) -> List[str]:
+    """Paths a unified diff touches (from ``diff --git`` and ``+++`` headers), for the syntax guardrail."""
+    seen: List[str] = []
+    for match in _DIFF_PATH.finditer(diff or ""):
+        path = (match.group("b") or match.group("plus") or "").strip()
+        if path in ("/dev/null", ""):
+            continue
+        if path.startswith(("a/", "b/")):
+            path = path[2:]
+        if path not in seen and _safe_relpath(path):
+            seen.append(path)
+    return seen
 
 
 def apply_file_blocks(root: str, patches: Dict[str, str]) -> List[str]:
@@ -197,7 +222,7 @@ def apply_unified_diffs(root: str, diffs: List[str]) -> Tuple[List[str], List[st
     failed: List[str] = []
     for i, diff in enumerate(diffs):
         proc = subprocess.run(
-            ["git", "apply", "--whitespace=fix", "-"],
+            ["git", *GIT_SAFE, "apply", "--whitespace=fix", "-"],
             cwd=root, input=diff, capture_output=True, text=True, timeout=60,
         )
         if proc.returncode == 0:
@@ -207,17 +232,24 @@ def apply_unified_diffs(root: str, diffs: List[str]) -> Tuple[List[str], List[st
     return applied, failed
 
 
+def is_git_sandbox(root: str) -> bool:
+    """A git checkout (``.git`` directory) or a worktree (``.git`` file pointing at the main repository)."""
+    return os.path.exists(os.path.join(root, ".git"))
+
+
 def changed_files(root: str) -> List[str]:
     """All files modified vs HEAD (git) — used to scope ast validation."""
-    if not os.path.isdir(os.path.join(root, ".git")):
+    if not is_git_sandbox(root):
         return []
     proc = subprocess.run(
-        ["git", "status", "--porcelain"],
+        ["git", *GIT_SAFE, "status", "--porcelain"],
         cwd=root, capture_output=True, text=True, timeout=60,
     )
     out = []
     for line in proc.stdout.splitlines():
-        if len(line) > 3 and line[2] != " ":
+        if len(line) > 3 and line[:2].strip():  # modified, added, renamed, or untracked (a diff can create files too)
             rel = line[3:].strip().strip('"')
+            if " -> " in rel:
+                rel = rel.split(" -> ", 1)[1].strip('"')
             out.append(rel)
     return out

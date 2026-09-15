@@ -83,7 +83,7 @@ def test_heartbeats_keep_live_jobs_and_reap_silent_ones(db):
     vault.claim_job("worker-b", ("hb",))
     with vault._open_database() as connection:
         connection.execute("UPDATE jobs SET claimed_at = ? WHERE id IN (?, ?)", (time.time() - 1000, live, dead))
-    assert vault.touch_heartbeat("worker-a") == 1
+    assert vault.touch_heartbeat([live]) == 1  # only the ids live threads hold are stamped
     assert vault.reap_stale_heartbeats("silent", older_than_seconds=180) == 1
     assert vault.job_by_id(live)["status"] == "running" and vault.job_by_id(dead)["status"] == "failed"
     assert vault.job_view(vault.job_by_id(dead))["result"] == {"error": "silent"}
@@ -130,7 +130,9 @@ def test_vm_kit_has_compose_worker_local_model_and_scripts():
     compose = files["docker-compose.yml"].body
     assert "orchestrator.jobs" in compose and '"--workers", "3"' in compose and "CHAT_JOHNSON_JOB_WORKERS: \"0\"" in compose
     assert "ollama/ollama" in compose and "CHAT_JOHNSON_LOCAL_MODEL: qwen2.5:7b" in compose and "caddy:2" in compose and "data:/data" in compose
-    assert files["Caddyfile"].body.startswith("studio.example.com {") and "reverse_proxy app:8501" in files["Caddyfile"].body
+    caddy = files["Caddyfile"].body
+    assert "{$DOMAIN::80} {" in caddy and "basic_auth" in caddy and "reverse_proxy app:8501" in caddy  # TLS from DOMAIN, auth from CADDY_USER/CADDY_HASH
+    assert "basic_auth" not in files["Caddyfile.open"].body and "    env_file:" not in compose.split("  worker:")[0]  # the app service never loads .env
     assert "WITH_BROWSER" in files["Dockerfile"].body and "USER app" in files["Dockerfile"].body
     assert "get.docker.com" in files["scripts/vm-bootstrap.sh"].body and "ollama pull \"qwen2.5:7b\"" in files["scripts/vm-update.sh"].body
     assert "vault-backup.db" in files["scripts/vm-backup.sh"].body
@@ -138,4 +140,4 @@ def test_vm_kit_has_compose_worker_local_model_and_scripts():
     assert "vm-update.sh" in runbook and "Always Free" in runbook and "24/7" in runbook
     assert not any(f.level == "error" for f in dk.validate_kit(list(files.values())))
     plain = {item.path: item for item in dk.generate_kit(dk.KitSpec(target="oracle-vm"))}
-    assert plain["Caddyfile"].body.startswith(":80 {")
+    assert "{$DOMAIN::80} {" in plain["Caddyfile"].body  # without a domain the site is :80 behind the localhost bind, never a bare :80 on the internet

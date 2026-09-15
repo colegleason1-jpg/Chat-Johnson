@@ -1,27 +1,32 @@
-"""Background job runner: missions (later pipelines and sub-agents) run off the script thread.
+"""Background job runner: missions, society cycles, and sub-agents run off the script thread.
 
 Rows live in the vault's ``jobs`` table so any process can claim them; this module adds an
 in-process pool of daemon threads for hosts without a separate worker container. A job can
 ask the operator a question (``waiting_input``) without stopping other work, and cancel is
 cooperative: handlers call ``check_cancel`` between steps.
 
-Secrets never touch the table. ``enqueue`` parks them in a process dict keyed by job id; the
-worker pops them when it claims the job, binds them as the session-key overlay of a fresh
-``contextvars.Context`` for that job only, and drops them when the job ends. A process restart
-therefore loses them, which is why ``reap_stale_jobs`` fails every unfinished row on start.
+Secrets never touch the ``jobs`` row. ``enqueue`` hands them over one of two ways: encrypted
+(``jobsecrets``, when ``CHAT_JOHNSON_JOB_KEY`` is set) as a blob the claiming worker deletes on
+claim, or in a process dict keyed by job id that ages out after an hour (only a worker thread in
+this same process can take it). Either way the worker binds them as the session-key overlay of a
+fresh ``contextvars.Context`` for that job only and drops them when the job ends. A process
+without workers and without the key cannot deliver secrets to anyone; ``secrets_deliverable``
+says so and the UI refuses nodes that need them.
 """
 from __future__ import annotations
 
 import contextvars
 import json
 import os
+import secrets as _secrets
 import socket
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, Tuple
 
-from . import vault
+from . import jobsecrets, vault
 from .config import bind_session_keys
 from .quota import QuotaLedger
 from .quota_registry import get_quota_ledger, get_request_lock
@@ -35,6 +40,7 @@ RESTART_NOTE = "the app restarted before this job finished (its session keys are
 STALE_NOTE = "the worker running this job stopped responding; launch it again"
 HEARTBEAT_SECONDS = 15.0
 STALE_AFTER_SECONDS = 180.0
+SECRET_TTL_SECONDS = 3600.0
 
 
 class JobCancelled(Exception):
@@ -90,7 +96,7 @@ class JobContext:
 
 Handler = Callable[[JobContext], Mapping[str, Any]]
 _HANDLERS: Dict[str, Handler] = {}
-_SECRETS: Dict[int, Dict[str, str]] = {}
+_SECRETS: Dict[int, Tuple[float, Dict[str, str]]] = {}
 _SECRETS_LOCK = threading.Lock()
 
 
@@ -102,35 +108,76 @@ def handler_kinds() -> Tuple[str, ...]:
     return tuple(_HANDLERS)
 
 
+def local_workers() -> int:
+    """Worker threads this process runs (the runner's count once started, else the environment's)."""
+    if _RUNNER is not None:
+        return _RUNNER.max_workers
+    value = os.environ.get("CHAT_JOHNSON_JOB_WORKERS", "")
+    return int(value) if value.strip().isdigit() else DEFAULT_WORKERS
+
+
+def secrets_deliverable() -> bool:
+    """Can a job enqueued here receive session secrets? Encrypted hand-off, or workers in this process."""
+    return jobsecrets.available() or local_workers() > 0
+
+
 def enqueue(
     project_scope: str, kind: str, payload: Mapping[str, Any], secrets: Mapping[str, str], thread_id: Optional[int] = None,
     run_after: float = 0.0,
 ) -> int:
-    """Queue a job; ``secrets`` (env-name → key) stay in memory and are bound for that job's context only.
+    """Queue a job; ``secrets`` (env-name → key) travel encrypted or in memory, never in the row.
 
     ``run_after`` delays the claim (epoch seconds): chained cycles use it as their scheduler.
     """
     if kind not in _HANDLERS:
         raise KeyError(f"no handler registered for job kind {kind!r}")
     job_id = vault.enqueue_job(project_scope, kind, payload, thread_id=thread_id, run_after=run_after)
-    with _SECRETS_LOCK:
-        _SECRETS[job_id] = {name: value for name, value in secrets.items() if value}
+    clean = {name: value for name, value in secrets.items() if value}
+    if not clean:
+        return job_id
+    blob = jobsecrets.encrypt(clean)
+    if blob is not None:
+        vault.store_job_secrets(job_id, blob)
+    else:
+        with _SECRETS_LOCK:
+            _purge_secrets_locked()  # bounded: entries older than SECRET_TTL_SECONDS leave on every enqueue
+            _SECRETS[job_id] = (time.time(), clean)
     return job_id
+
+
+def _purge_secrets_locked() -> None:
+    cutoff = time.time() - SECRET_TTL_SECONDS
+    for job_id in [job_id for job_id, (stamp, _) in _SECRETS.items() if stamp < cutoff]:
+        _SECRETS.pop(job_id, None)
 
 
 def secrets_held(job_id: int) -> bool:
     with _SECRETS_LOCK:
-        return job_id in _SECRETS
+        if job_id in _SECRETS:
+            return True
+    return vault.has_job_secrets(job_id)
 
 
 def _take_secrets(job_id: int) -> Dict[str, str]:
     with _SECRETS_LOCK:
-        return _SECRETS.pop(job_id, {})
+        entry = _SECRETS.pop(job_id, None)
+    if entry is not None:
+        return dict(entry[1])
+    return jobsecrets.decrypt(vault.take_job_secrets(job_id))
 
 
 def run_job(row: Any) -> None:
     """Execute one claimed row to completion in the calling thread, inside a fresh key context."""
     contextvars.Context().run(_run_in_context, row)
+
+
+def _finish(job_id: int, status: str, result: Mapping[str, Any]) -> None:
+    """Finish the row; one retry when SQLite is busy so a locked database never strands a job as running."""
+    try:
+        vault.finish_job(job_id, status, result)
+    except sqlite3.OperationalError:
+        time.sleep(1.0)
+        vault.finish_job(job_id, status, result)
 
 
 def _run_in_context(row: Any) -> None:
@@ -152,11 +199,11 @@ def _run_in_context(row: Any) -> None:
             raise RuntimeError(f"no handler registered for job kind {kind!r}")
         ctx.check_cancel()
         result = handler(ctx)
-        vault.finish_job(job_id, "done", dict(result or {}))
+        _finish(job_id, "done", dict(result or {}))
     except JobCancelled:
-        vault.finish_job(job_id, "cancelled", {"note": "cancelled by the operator"})
+        _finish(job_id, "cancelled", {"note": "cancelled by the operator"})
     except Exception as exc:  # the row carries the error; the worker thread must survive
-        vault.finish_job(job_id, "failed", {"error": str(exc)[:600], "type": type(exc).__name__})
+        _finish(job_id, "failed", {"error": str(exc)[:600], "type": type(exc).__name__})
     finally:
         secrets.clear()
         bind_session_keys({})
@@ -171,9 +218,17 @@ class JobRunner:
             max_workers = int(env_value) if env_value.strip().isdigit() else DEFAULT_WORKERS
         self.max_workers = max(0, int(max_workers))
         self.poll_seconds = float(poll_seconds)
-        self.worker_name = f"{socket.gethostname()}:{os.getpid()}"
+        self.host = socket.gethostname()
+        # A restarted container keeps its hostname and often its pid, so the name carries a random suffix.
+        self.worker_name = f"{self.host}:{os.getpid()}:{_secrets.token_hex(3)}"
         self._stop = threading.Event()
         self._threads: list = []
+        self._active: Set[int] = set()
+        self._active_lock = threading.Lock()
+
+    def active_jobs(self) -> Tuple[int, ...]:
+        with self._active_lock:
+            return tuple(sorted(self._active))
 
     def start(self, reap: Optional[bool] = None) -> "JobRunner":
         """Start the workers. With no workers (the app beside a worker container) nothing is reaped: the worker owns the rows."""
@@ -191,14 +246,19 @@ class JobRunner:
         return self
 
     def _housekeeping(self) -> None:
-        """Stamp this worker's rows and fail rows whose worker went silent (another container, a crashed thread)."""
+        """Stamp the rows live threads hold; fail rows whose worker went silent; restore ticks a dead worker dropped."""
         last_reap = time.monotonic()
         while not self._stop.wait(HEARTBEAT_SECONDS):
             try:
-                vault.touch_heartbeat(self.worker_name)
+                vault.touch_heartbeat(self.active_jobs())
                 if time.monotonic() - last_reap >= 60.0:
-                    vault.reap_stale_heartbeats(STALE_NOTE, STALE_AFTER_SECONDS)
+                    reaped = vault.reap_stale_heartbeats(STALE_NOTE, STALE_AFTER_SECONDS)
+                    vault.purge_job_secrets(SECRET_TTL_SECONDS)
+                    with _SECRETS_LOCK:
+                        _purge_secrets_locked()
                     last_reap = time.monotonic()
+                    if reaped:
+                        _restore_ticks()
             except Exception:  # housekeeping must never take a worker down
                 pass
 
@@ -212,7 +272,16 @@ class JobRunner:
             if row is None:
                 self._stop.wait(self.poll_seconds)
                 continue
-            run_job(row)
+            job_id = int(row["id"])
+            with self._active_lock:
+                self._active.add(job_id)
+            try:
+                run_job(row)
+            except Exception:  # a failure while finishing the row must not kill the pool
+                self._stop.wait(2.0)
+            finally:
+                with self._active_lock:
+                    self._active.discard(job_id)
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -222,6 +291,16 @@ class JobRunner:
     @property
     def alive(self) -> int:
         return sum(1 for thread in self._threads if thread.is_alive())
+
+
+def _restore_ticks() -> None:
+    """After a reap, re-queue society ticks whose chain died with the reaped worker."""
+    try:
+        from . import society
+
+        society.bootstrap_ticks()
+    except Exception:
+        pass
 
 
 def _sweep_staging() -> None:
@@ -288,8 +367,15 @@ def run_worker(argv: Optional[Sequence[str]] = None) -> int:
     local = register_local_endpoint_from_env()
     if local is not None:
         log.info("local model endpoint: %s (%s)", local.base_url, local.model)
-    runner = JobRunner(max_workers=args.workers, poll_seconds=args.poll).start(reap=False)
-    vault.reap_stale_heartbeats(STALE_NOTE, STALE_AFTER_SECONDS)
+    runner = JobRunner(max_workers=args.workers, poll_seconds=args.poll)
+    # Rows an earlier process of this container left running can never finish: fail them before serving.
+    orphaned = vault.fail_jobs_of_host(f"{runner.host}:", STALE_NOTE, except_worker=runner.worker_name)
+    runner.start(reap=False)
+    reaped = vault.reap_stale_heartbeats(STALE_NOTE, STALE_AFTER_SECONDS)
+    if orphaned or reaped:
+        log.info("failed %d orphaned and %d stale job row(s) from before this start", orphaned, reaped)
+    if not jobsecrets.available():
+        log.warning("%s is not set: session secrets (GitHub token, paid slot) cannot reach this worker", jobsecrets.KEY_ENV)
     if not args.no_bootstrap:
         restored = society.bootstrap_ticks()
         log.info("society ticks restored: %d", restored)

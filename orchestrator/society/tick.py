@@ -122,7 +122,7 @@ def bootstrap_ticks(scopes: Optional[List[str]] = None) -> int:
 def stop_tick(scope: str) -> int:
     stopped = 0
     for row in vault.list_jobs(scope, ACTIVE_STATUSES, limit=50, kind=KIND_TICK):
-        vault.request_cancel(int(row["id"]))
+        vault.request_cancel(int(row["id"]), scope)
         stopped += 1
     return stopped
 

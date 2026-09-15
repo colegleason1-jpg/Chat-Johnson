@@ -52,13 +52,23 @@ class KitSpec:
         spec.target = self.target if self.target in TARGETS else "docker-kubernetes"
         spec.language = self.language if self.language in LANGUAGES else "python"
         spec.cloud = self.cloud if self.cloud in CLOUDS else "none"
-        spec.port = int(self.port) if 1 <= int(self.port) <= 65535 else 8501
+        try:
+            port = int(self.port)
+        except (TypeError, ValueError):
+            port = 8501
+        spec.port = port if 1 <= port <= 65535 else 8501
         spec.registry = (self.registry or "ghcr.io/OWNER/REPO").strip().rstrip("/")
         spec.health_path = self.health_path.strip() or "/"
         spec.deploy_url = (self.deploy_url or "").strip().rstrip("/")
         spec.domain = (self.domain or "").strip().lower()
         spec.local_model = (self.local_model or "llama3.1:8b").strip()
-        spec.worker_threads = int(self.worker_threads) if 1 <= int(self.worker_threads) <= 16 else 2
+        try:
+            threads = int(self.worker_threads)
+        except (TypeError, ValueError):
+            threads = 2
+        spec.worker_threads = threads if 1 <= threads <= 16 else 2
+        if spec.target == "oracle-vm":
+            spec.language = "python"  # the VM image is the studio's own Python image; a Node spec would render a wrong Dockerfile
         return spec
 
 
@@ -135,9 +145,12 @@ services:
       context: .
       args:
         WITH_BROWSER: "0"
-    env_file: .env
+    # No env_file here on purpose: provider keys live in the worker only. The app gets the job key
+    # (to hand session secrets to the worker encrypted) and its own settings.
     environment:
       CHAT_JOHNSON_JOB_WORKERS: "0"            # the worker container owns every background job
+      CHAT_JOHNSON_JOB_KEY: ${CHAT_JOHNSON_JOB_KEY:-}
+      CHAT_JOHNSON_REPO_ROOTS: ${CHAT_JOHNSON_REPO_ROOTS:-}
       CHAT_JOHNSON_DB_PATH: /data/vault.db
       CHAT_JOHNSON_SELF_HOSTED: "1"
       CHAT_JOHNSON_LOCAL_ENDPOINT: http://ollama:11434/v1
@@ -158,6 +171,7 @@ services:
     env_file: .env
     environment:
       CHAT_JOHNSON_DB_PATH: /data/vault.db
+      CHAT_JOHNSON_SELF_HOSTED: "1"
       CHAT_JOHNSON_LOCAL_ENDPOINT: http://ollama:11434/v1
       CHAT_JOHNSON_LOCAL_MODEL: [[local_model]]
     volumes:
@@ -174,11 +188,17 @@ services:
     restart: unless-stopped
   caddy:
     image: caddy:2
+    # With DOMAIN set: 80/443 on the internet with automatic TLS and basic auth. Without one:
+    # 127.0.0.1:8080 only, reached through an SSH tunnel (never plain HTTP on the internet).
     ports:
-      - "80:80"
-      - "443:443"
+      - "${CADDY_BIND:-127.0.0.1:8080}:80"
+      - "${CADDY_BIND_TLS:-127.0.0.1:8443}:443"
+    environment:
+      DOMAIN: ${DOMAIN:-}
+      CADDY_USER: ${CADDY_USER:-operator}
+      CADDY_HASH: ${CADDY_HASH:-}
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./${CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
@@ -191,13 +211,25 @@ volumes:
   caddy_config: {}
 """
 
-_CADDYFILE = """[[site]] {
+_CADDYFILE = """# DOMAIN set in .env -> automatic TLS on that host; empty -> :80 behind the localhost bind in compose.
+# CADDY_USER/CADDY_HASH (bcrypt from `caddy hash-password`, with `$` doubled in .env) gate every request.
+{$DOMAIN::80} {
+    encode gzip
+    basic_auth {
+        {$CADDY_USER} {$CADDY_HASH}
+    }
+    reverse_proxy app:[[port]]
+}
+"""
+
+_CADDYFILE_OPEN = """# No basic auth: use only behind an SSH tunnel (CADDYFILE=Caddyfile.open in .env keeps the localhost bind).
+{$DOMAIN::80} {
     encode gzip
     reverse_proxy app:[[port]]
 }
 """
 
-_ENV_VM = """# Copy to .env on the VM. Keys here outlive browser sessions on purpose: the worker uses them 24/7.
+_ENV_VM = """# Copy to .env on the VM. Keys here reach the WORKER container only (the app has no env_file).
 # Free-tier vendor keys (any subset):
 GEMINI_API_KEY=
 GROQ_API_KEY=
@@ -206,6 +238,16 @@ NVIDIA_API_KEY=
 OPENROUTER_API_KEY=
 CEREBRAS_API_KEY=
 MISTRAL_API_KEY=
+# Edge: a domain turns on automatic TLS; CADDY_BIND opens 80/443 to the internet only then.
+DOMAIN=
+CADDY_BIND=127.0.0.1:8080
+CADDY_BIND_TLS=127.0.0.1:8443
+CADDY_USER=operator
+CADDY_HASH=            # bcrypt from `docker run --rm caddy:2 caddy hash-password --plaintext '<password>'`, every $ doubled
+# Session secrets (GitHub token, paid slot) travel app -> worker encrypted with this key (scripts/vm-bootstrap.sh generates it):
+CHAT_JOHNSON_JOB_KEY=
+# Local paths the Repository Work tab may read, colon-separated (empty = none):
+CHAT_JOHNSON_REPO_ROOTS=
 # Daily token caps per vendor (0 = uncapped), e.g. CHAT_JOHNSON_DAILY_GEMINI=2000000
 # Timeouts for slow local models: CHAT_JOHNSON_TIMEOUT=300
 """
@@ -232,8 +274,25 @@ if [ ! -d "[[app_name]]" ]; then
   git clone --branch "$BRANCH" "$REPO_URL" "[[app_name]]"
 fi
 cd "[[app_name]]"
-[ -f .env ] || cp .env.example .env
-echo "Edit .env with your keys, then run: bash scripts/vm-update.sh"
+if [ ! -f .env ]; then
+  cp .env.example .env
+  # The job key lets the app hand a session's GitHub token or paid key to the worker encrypted (Fernet: 32 url-safe base64 bytes).
+  JOB_KEY="$(openssl rand -base64 32 | tr '+/' '-_')"
+  sed -i "s|^CHAT_JOHNSON_JOB_KEY=.*|CHAT_JOHNSON_JOB_KEY=${JOB_KEY}|" .env
+  read -r -p "Domain for automatic TLS (blank = listen on 127.0.0.1:8080 only; reach it through an SSH tunnel): " DOMAIN
+  if [ -n "${DOMAIN}" ]; then
+    sed -i "s|^DOMAIN=.*|DOMAIN=${DOMAIN}|; s|^CADDY_BIND=.*|CADDY_BIND=0.0.0.0:80|; s|^CADDY_BIND_TLS=.*|CADDY_BIND_TLS=0.0.0.0:443|" .env
+  fi
+  read -r -p "Basic auth user [operator]: " CADDY_USER
+  CADDY_USER="${CADDY_USER:-operator}"
+  read -r -s -p "Basic auth password: " CADDY_PASS
+  echo
+  HASH="$(docker run --rm caddy:2 caddy hash-password --plaintext "${CADDY_PASS}")"
+  HASH_ESCAPED="${HASH//\\$/\\$\\$}"   # compose interpolation turns $$ back into $ before Caddy sees it
+  sed -i "s|^CADDY_USER=.*|CADDY_USER=${CADDY_USER}|; s|^CADDY_HASH=.*|CADDY_HASH=${HASH_ESCAPED}|" .env
+  chmod 600 .env
+fi
+echo "Add your provider keys to .env (they reach the worker container only), then run: bash scripts/vm-update.sh"
 """
 
 _VM_UPDATE_SH = """#!/usr/bin/env bash
@@ -244,18 +303,24 @@ git pull --ff-only
 docker compose up -d --build
 docker compose exec -T ollama ollama pull "[[local_model]]" || echo "ollama pull failed; the router falls back to cloud endpoints"
 docker compose ps
-echo "Health: $(curl -fsS http://127.0.0.1/?health=1 2>/dev/null | head -c 200 || echo 'not answering yet')"
+echo "Health: $(docker compose exec -T app python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:[[port]]/?health=1', timeout=10).read()[:200].decode())" 2>/dev/null || echo 'not answering yet')"
+DOMAIN_VALUE="$(grep -E '^DOMAIN=' .env | cut -d= -f2- || true)"
+if [ -n "${DOMAIN_VALUE}" ]; then echo "Open https://${DOMAIN_VALUE}/ (basic auth)"; else echo "No domain: ssh -L 8080:127.0.0.1:8080 <vm> then open http://127.0.0.1:8080/"; fi
 """
 
 _VM_BACKUP_SH = """#!/usr/bin/env bash
-# Copy the vault out of the data volume; keep the last 14 copies.
+# Copy the vault out of the data volume into a private directory outside the checkout; keep the last 14 copies.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-mkdir -p backups
+umask 077
+BACKUP_DIR="${BACKUP_DIR:-$HOME/[[app_name]]-backups}"
+mkdir -p "${BACKUP_DIR}"
 docker compose exec -T app python -c "import sqlite3; src=sqlite3.connect('/data/vault.db'); dst=sqlite3.connect('/data/vault-backup.db'); src.backup(dst); dst.close()"
-docker compose cp app:/data/vault-backup.db "backups/vault-$(date +%F-%H%M).db"
-ls -1t backups/vault-*.db | tail -n +15 | xargs -r rm --
-echo "backups:"; ls -1 backups
+docker compose cp app:/data/vault-backup.db "${BACKUP_DIR}/vault-$(date +%F-%H%M).db"
+docker compose exec -T app rm -f /data/vault-backup.db
+chmod 600 "${BACKUP_DIR}"/vault-*.db
+ls -1t "${BACKUP_DIR}"/vault-*.db | tail -n +15 | xargs -r rm --
+echo "backups in ${BACKUP_DIR}:"; ls -1 "${BACKUP_DIR}"
 """
 
 _DOCKERFILE_NODE = """# syntax=docker/dockerfile:1
@@ -1116,7 +1181,7 @@ def _runbook(spec: KitSpec, secrets: Sequence[Sequence[str]]) -> str:
                   "list, then `bash scripts/vm-bootstrap.sh <repo url> <branch>` on the VM and fill `.env` with the keys the worker will use.\n"
                   "2. Every deploy: `ssh` in and run `bash scripts/vm-update.sh` (pull, rebuild, restart, pull the local model `[[local_model]]`).\n"
                   "3. The app runs with no job workers; the `worker` container serves every job 24/7 and restores the society tick after a restart; "
-                  "`ollama` serves cheap labour (Producer tasks, leisure notes); Caddy terminates TLS for `[[domain]]` (blank = plain HTTP).")
+                  "`ollama` serves cheap labour (Producer tasks, leisure notes); Caddy terminates TLS for DOMAIN with basic auth; without a domain the stack listens on 127.0.0.1:8080 for an SSH tunnel.")
         rollback = ("1. `git checkout <previous commit>` on the VM and `docker compose up -d --build`; the vault volume is untouched.\n"
                     "2. `bash scripts/vm-backup.sh` before risky changes; restore by copying a backup over `/data/vault.db` with the stack stopped.")
     else:
@@ -1147,11 +1212,12 @@ def generate_kit(raw_spec: KitSpec) -> List[KitFile]:
         files.append(KitFile("Dockerfile", _render(_DOCKERFILE_VM, spec, {}), "dockerfile", "one image for app and worker (WITH_BROWSER=1 adds Chromium)"))
         files.append(KitFile(".dockerignore", _DOCKERIGNORE, "text", "keeps secrets, caches, and git out of the image"))
         files.append(KitFile("docker-compose.yml", _render(_COMPOSE_VM, spec, {}), "yaml", "app, 24/7 worker, Ollama, Caddy TLS, persistent vault volume"))
-        files.append(KitFile("Caddyfile", _render(_CADDYFILE, spec, {"site": spec.domain or ":80"}), "text", "reverse proxy with automatic TLS when a domain is set"))
+        files.append(KitFile("Caddyfile", _render(_CADDYFILE, spec, {}), "text", "reverse proxy: automatic TLS with DOMAIN, basic auth from CADDY_USER/CADDY_HASH"))
+        files.append(KitFile("Caddyfile.open", _render(_CADDYFILE_OPEN, spec, {}), "text", "the same without basic auth, for use behind an SSH tunnel only"))
         files.append(KitFile(".env.example", _ENV_VM, "text", "keys the worker uses around the clock (copy to .env on the VM)"))
         files.append(KitFile("scripts/vm-bootstrap.sh", _render(_VM_BOOTSTRAP_SH, spec, {}), "bash", "install Docker, open ports, clone"))
         files.append(KitFile("scripts/vm-update.sh", _render(_VM_UPDATE_SH, spec, {}), "bash", "pull, rebuild, restart, pull the local model"))
-        files.append(KitFile("scripts/vm-backup.sh", _VM_BACKUP_SH, "bash", "copy the vault out of the volume"))
+        files.append(KitFile("scripts/vm-backup.sh", _render(_VM_BACKUP_SH, spec, {}), "bash", "copy the vault out of the volume into a private backup directory"))
         files.append(KitFile(".github/workflows/ci.yml", _render(_CI_STREAMLIT, spec, {"setup_steps": setup}), "yaml", "lint and test on every push"))
         files.append(KitFile(".github/workflows/post-deploy-smoke.yml", _render(_SMOKE_WORKFLOW, spec, {}), "yaml", "health + build check against the live app"))
         files.append(KitFile("scripts/smoke_test.sh", _render(_SMOKE_SH, spec, {}), "bash", "post-deploy smoke test"))
@@ -1276,6 +1342,31 @@ def _check_workflow(path: str, data: Any) -> List[Finding]:
     return findings
 
 
+def _check_compose(path: str, document: Any) -> List[Finding]:
+    """The VM stack's two rules: provider keys never reach the app service, and nothing but Caddy publishes ports."""
+    if not isinstance(document, dict) or not isinstance(document.get("services"), dict):
+        return [Finding(path, "error", "no services mapping")]
+    services = document["services"]
+    findings: List[Finding] = []
+    app = services.get("app") or {}
+    if isinstance(app, dict) and app.get("env_file"):
+        findings.append(Finding(path, "error", "the app service must not load .env: provider keys belong to the worker only"))
+    for name, service in services.items():
+        if name != "caddy" and isinstance(service, dict) and service.get("ports"):
+            findings.append(Finding(path, "error", f"service {name} publishes ports; only caddy may face the network"))
+    return findings or [Finding(path, "ok", f"compose parses; app carries no env_file; services: {', '.join(services)}")]
+
+
+def _check_caddyfile(path: str, body: str) -> Finding:
+    """Plain ``:80`` on the internet is never generated: the site must come from DOMAIN or sit behind the localhost bind."""
+    stripped = body.strip()
+    if stripped.startswith(":80") and "{$DOMAIN" not in stripped:
+        return Finding(path, "error", "a bare :80 site serves plain HTTP to the internet; use {$DOMAIN::80} with the localhost bind")
+    if path.endswith("Caddyfile") and not path.endswith("Caddyfile.open") and "basic_auth" not in stripped:
+        return Finding(path, "warn", "no basic_auth block: only acceptable behind an SSH tunnel (Caddyfile.open)")
+    return Finding(path, "ok", "site comes from DOMAIN (TLS) or the localhost bind; auth present" if "basic_auth" in stripped else "open site for tunnel use")
+
+
 def validate_kit(files: Sequence[KitFile]) -> List[Finding]:
     """Offline checks only: parsers and structural rules, no tool that needs a cloud or a daemon."""
     yaml = _yaml_module()
@@ -1302,6 +1393,8 @@ def validate_kit(files: Sequence[KitFile]) -> List[Finding]:
                     findings.extend(found)
                     if not found:
                         findings.append(Finding(path, "ok", f"workflow parses; jobs: {', '.join(documents[0]['jobs'])}"))
+                elif path.endswith("docker-compose.yml"):
+                    findings.extend(_check_compose(path, documents[0] if documents else None))
                 else:
                     findings.append(Finding(path, "ok", f"YAML parses ({len(documents)} document(s))"))
             elif path.endswith(".json"):
@@ -1318,6 +1411,8 @@ def validate_kit(files: Sequence[KitFile]) -> List[Finding]:
                 if not problem and body.count('"') % 2:
                     problem = "unbalanced double quotes"
                 findings.append(Finding(path, "error" if problem else "ok", problem or "HCL braces, brackets, and quotes balanced"))
+            elif path.endswith("Caddyfile"):
+                findings.append(_check_caddyfile(path, body))
             else:
                 findings.append(Finding(path, "ok", "no parser applies"))
         except Exception as exc:  # a parser error is a finding, never a crash

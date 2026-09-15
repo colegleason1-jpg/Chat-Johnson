@@ -5,9 +5,12 @@ services:
       context: .
       args:
         WITH_BROWSER: "0"
-    env_file: .env
+    # No env_file here on purpose: provider keys live in the worker only. The app gets the job key
+    # (to hand session secrets to the worker encrypted) and its own settings.
     environment:
       CHAT_JOHNSON_JOB_WORKERS: "0"            # the worker container owns every background job
+      CHAT_JOHNSON_JOB_KEY: ${CHAT_JOHNSON_JOB_KEY:-}
+      CHAT_JOHNSON_REPO_ROOTS: ${CHAT_JOHNSON_REPO_ROOTS:-}
       CHAT_JOHNSON_DB_PATH: /data/vault.db
       CHAT_JOHNSON_SELF_HOSTED: "1"
       CHAT_JOHNSON_LOCAL_ENDPOINT: http://ollama:11434/v1
@@ -28,6 +31,7 @@ services:
     env_file: .env
     environment:
       CHAT_JOHNSON_DB_PATH: /data/vault.db
+      CHAT_JOHNSON_SELF_HOSTED: "1"
       CHAT_JOHNSON_LOCAL_ENDPOINT: http://ollama:11434/v1
       CHAT_JOHNSON_LOCAL_MODEL: llama3.1:8b
     volumes:
@@ -44,11 +48,17 @@ services:
     restart: unless-stopped
   caddy:
     image: caddy:2
+    # With DOMAIN set: 80/443 on the internet with automatic TLS and basic auth. Without one:
+    # 127.0.0.1:8080 only, reached through an SSH tunnel (never plain HTTP on the internet).
     ports:
-      - "80:80"
-      - "443:443"
+      - "${CADDY_BIND:-127.0.0.1:8080}:80"
+      - "${CADDY_BIND_TLS:-127.0.0.1:8443}:443"
+    environment:
+      DOMAIN: ${DOMAIN:-}
+      CADDY_USER: ${CADDY_USER:-operator}
+      CADDY_HASH: ${CADDY_HASH:-}
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./${CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:

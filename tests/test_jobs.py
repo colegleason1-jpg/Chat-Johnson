@@ -47,7 +47,7 @@ def test_enqueue_claim_run_done_with_progress_and_secret_hygiene(db):
         seen["secrets"] = dict(ctx.secrets)
         ctx.progress(step=1, total=2, text="half")
         ctx.progress(step=2)
-        return {"echo": ctx.payload["goal"], "ledger_is_shared": ctx.ledger is jobs.get_quota_ledger()}
+        return {"echo": ctx.payload["goal"], "ledger_is_shared": ctx.ledger._buckets["gemini"] is jobs.get_quota_ledger()._buckets["gemini"]}
 
     jobs.register_handler("echo", handler)
     job_id = jobs.enqueue("scope-a", "echo", {"goal": "hi", "token": "ghp_secret_should_be_redacted_123456"}, {"GEMINI_API_KEY": "AIza-test-key"}, thread_id=None)

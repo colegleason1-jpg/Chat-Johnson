@@ -122,11 +122,11 @@ def server():
 
 
 def test_check_url_reports_status_text_and_health(server):
-    result = webqa.check_url(server + "/", expect_text="Master Studio")
+    result = webqa.check_url(server + "/", expect_text="Master Studio", allow_private=True)
     assert result["ok"] and result["status"] == 200 and result["text_found"] is True and result["health"] is None and result["elapsed_ms"] >= 0
-    assert webqa.check_url(server + "/health").get("health") == {"status": "ok", "build": "abc1234"}
-    assert not webqa.check_url(server + "/missing")["ok"] and webqa.check_url(server + "/", expect_text="nope")["text_found"] is False
-    down = webqa.check_url("http://127.0.0.1:9/")
+    assert webqa.check_url(server + "/health", allow_private=True).get("health") == {"status": "ok", "build": "abc1234"}
+    assert not webqa.check_url(server + "/missing", allow_private=True)["ok"] and webqa.check_url(server + "/", expect_text="nope", allow_private=True)["text_found"] is False
+    down = webqa.check_url("http://127.0.0.1:9/", allow_private=True)
     assert not down["ok"] and down["error"]
     assert webqa.first_url("see https://a.example/x, then") == "https://a.example/x" and webqa.first_url("none") == ""
     assert "| status | 200 |" in webqa.check_markdown(result, {"available": False, "error": "no browser"}) and "unavailable" in webqa.check_markdown(result, {"available": False, "error": "no browser"})
@@ -134,7 +134,7 @@ def test_check_url_reports_status_text_and_health(server):
 
 def test_browser_check_is_honest_without_playwright(monkeypatch):
     monkeypatch.setattr(webqa, "browser_available", lambda: False)
-    result = webqa.browser_check("http://127.0.0.1:9/", [])
+    result = webqa.browser_check("http://127.0.0.1:9/", [], allow_private=True)
     assert result["available"] is False and not result["ok"] and "VM worker" in result["error"]
 
 

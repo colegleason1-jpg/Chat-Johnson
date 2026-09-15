@@ -58,7 +58,7 @@ _AUDIT_RE = re.compile(r"AUDIT\s*:\s*(.+)", re.I)
 
 
 def ensure_agent_thread(scope: str, agent: Dict[str, Any]) -> int:
-    if agent.get("thread_id") and vault.thread_by_id(int(agent["thread_id"])):
+    if agent.get("thread_id") and vault.thread_by_id(int(agent["thread_id"]), scope):
         return int(agent["thread_id"])
     thread_id = vault.create_thread(scope, title=f"Academy · {agent['name']}", workspace=WORKSPACE)
     store.update("agents", int(agent["id"]), thread_id=thread_id)

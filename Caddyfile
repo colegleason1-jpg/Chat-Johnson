@@ -1,4 +1,9 @@
-:80 {
+# DOMAIN set in .env -> automatic TLS on that host; empty -> :80 behind the localhost bind in compose.
+# CADDY_USER/CADDY_HASH (bcrypt from `caddy hash-password`, with `$` doubled in .env) gate every request.
+{$DOMAIN::80} {
     encode gzip
+    basic_auth {
+        {$CADDY_USER} {$CADDY_HASH}
+    }
     reverse_proxy app:8501
 }

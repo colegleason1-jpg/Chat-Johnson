@@ -33,7 +33,7 @@ def publish_work(scope: str, catalog_id: int) -> Optional[int]:
     if not cat:
         return None
     items = store.rows("work_items", scope, "catalog_id = ? AND artifact_id IS NOT NULL", (int(catalog_id),), order="updated_at DESC", limit=1)
-    body = vault.export_artifact(int(items[0]["artifact_id"]))[1] if items else f"# {cat['title']}\n\n(no deliverable was produced yet)\n"
+    body = vault.export_artifact(int(items[0]["artifact_id"]), scope)[1] if items else f"# {cat['title']}\n\n(no deliverable was produced yet)\n"
     from ..missions import deliverable_slug
 
     slug = deliverable_slug(cat["title"])

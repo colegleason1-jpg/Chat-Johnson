@@ -23,6 +23,8 @@ import requests
 from .github_push import API_ROOT, API_VERSION, parse_owner_repo
 
 MAX_TARBALL_BYTES = 200 * 1024 * 1024
+MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
+MAX_EXTRACTED_FILES = 40_000
 TEXT_LIMIT_BYTES = 2 * 1024 * 1024
 
 
@@ -126,13 +128,20 @@ def qualify_repository(value: str, login: str) -> str:
     return cleaned
 
 
-def list_repositories(token: str, limit: int = 100) -> List[str]:
-    """Repositories the token can see (owner, collaborator, org member), newest activity first, as owner/name."""
+def list_repositories(token: str, limit: int = 500) -> List[str]:
+    """Repositories the token can see (owner, collaborator, org member), newest activity first, as owner/name; paginated up to ``limit``."""
     if not (token or "").strip():
         raise GitHubRepoError("a token is required to list repositories")
-    data = _get(f"{API_ROOT}/user/repos?per_page={max(1, min(int(limit), 100))}&sort=updated&affiliation=owner,collaborator,organization_member", token).json()
-    names = [str(item.get("full_name") or "") for item in data if isinstance(item, dict)]
-    return [name for name in names if name]
+    names: List[str] = []
+    page = 1
+    while len(names) < max(1, int(limit)) and page <= 10:
+        data = _get(f"{API_ROOT}/user/repos?per_page=100&page={page}&sort=updated&affiliation=owner,collaborator,organization_member", token).json()
+        batch = [str(item.get("full_name") or "") for item in data if isinstance(item, dict)]
+        names.extend(name for name in batch if name)
+        if len(batch) < 100:
+            break
+        page += 1
+    return names[: max(1, int(limit))]
 
 
 def _safe_member(member: tarfile.TarInfo) -> Optional[str]:
@@ -145,8 +154,8 @@ def _safe_member(member: tarfile.TarInfo) -> Optional[str]:
     return "/".join(parts[1:])
 
 
-def extract_tarball(tar_bytes: bytes, dest: str) -> Tuple[int, int]:
-    """Extract safely, stripping the top directory. Returns (files, bytes)."""
+def extract_tarball(tar_bytes: bytes, dest: str, max_bytes: int = MAX_EXTRACTED_BYTES, max_files: int = MAX_EXTRACTED_FILES) -> Tuple[int, int]:
+    """Extract safely, stripping the top directory. Returns (files, bytes). Bounded on the decompressed side too."""
     files = size = 0
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as archive:
         for member in archive.getmembers():
@@ -159,12 +168,18 @@ def extract_tarball(tar_bytes: bytes, dest: str) -> Tuple[int, int]:
             if member.isdir():
                 os.makedirs(target, exist_ok=True)
                 continue
+            if files + 1 > max_files or size + int(member.size) > max_bytes:
+                raise GitHubRepoError(f"repository exceeds the extraction budget ({max_files} files / {max_bytes // (1024 * 1024)} MB)")
             os.makedirs(os.path.dirname(target), exist_ok=True)
             source = archive.extractfile(member)
             if source is None:
                 continue
             with open(target, "wb") as handle:
                 shutil.copyfileobj(source, handle)
+            try:
+                os.chmod(target, (member.mode & 0o777) or 0o644)  # keep the executable bit the tree carried
+            except OSError:
+                pass
             files += 1
             size += int(member.size)
     return files, size
@@ -212,7 +227,7 @@ def prune_staging(max_age_seconds: int = 6 * 3600) -> int:
     return removed
 
 
-_DIFF_HEADER = re.compile(r"^(?:diff --git a/(?P<a>\S+) b/(?P<b>\S+)|\+\+\+ (?P<plus>\S+))", re.M)
+_DIFF_HEADER = re.compile(r"^(?:diff --git a/(?P<a>[^\t\n]+?) b/(?P<b>[^\t\n]+)|\+\+\+ (?P<plus>[^\t\n]+))", re.M)  # paths may hold spaces; a tab starts a timestamp
 
 
 def changed_paths_from_diff(diff: str) -> List[str]:

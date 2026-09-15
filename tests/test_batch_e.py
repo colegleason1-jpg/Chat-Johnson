@@ -258,7 +258,7 @@ def test_mcp_call_node_runs_a_declared_server(db, tmp_path, monkeypatch):
     ]
     thread, view = run_plan("s", "MCP", plan)
     result = view["result"]
-    assert result["succeeded"] == 1 and result["failed"] == 1 and result["mcp_results"][0]["content"][0]["text"] == "3.0"
+    assert result["succeeded"] == 1 and result["failed"] == 1 and result["mcp_results"][0]["text"] == "3.0"
     assert "unknown tool" in result["failures"][0][1] and "ghp_abcdefghijklmnopqrstuvwxyz" not in json.dumps(result)
 
 
@@ -290,10 +290,10 @@ def test_heavy_stream_returns_an_unexhausted_synthesis_stream(monkeypatch):
     monkeypatch.setattr(router, "cortex_generate", fake_generate)
     monkeypatch.setattr(router, "CortexStream", FakeStream)
     stream, decision = router.heavy_stream("chat", [{"role": "user", "content": "q"}], None, max_tokens=900)
-    assert isinstance(stream, FakeStream) and log == ["chat", "reasoning"] and stream.text == ""
+    assert isinstance(stream.inner, FakeStream) and log == ["chat", "reasoning"] and stream.text == ""
     assert "".join(stream) == "final answer" and stream.text == "final answer" and stream.decision.finish == "stop"
     assert decision is stream.decision and "draft -> review(free) -> synthesis" in decision.reason
-    payload = json.loads(stream.messages[-1]["content"])
+    payload = json.loads(stream.inner.messages[-1]["content"])
     assert payload["candidate"] == "chat-text" and payload["review"] == "reasoning-text"
     text, decision = router.heavy_stream("explode", [{"role": "user", "content": "q"}], None, max_tokens=900)
     assert text == "explode-text" and "synthesis was unavailable" in decision.reason

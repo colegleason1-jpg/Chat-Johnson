@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from . import mcp_client, vault
 from .deploykit import KitSpec, generate_kit, summarize, validate_kit
+from .envsafe import self_hosted
 from .github_push import GitHubWriter, PushRecord, branch_name_for
 from .github_repo import fetch_tree
 from .webqa import browser_available, browser_check, check_markdown, check_url
@@ -47,11 +48,12 @@ def github_fetch(ctx: Any, config: Mapping[str, Any], outputs: Outputs, extras: 
     return f"Fetched {fetched.owner}/{fetched.repo} @ {fetched.ref} ({fetched.sha[:7]}): {fetched.files} file(s), {fetched.size_bytes} bytes" + (" · empty repository" if fetched.empty else "")
 
 
-def _files_for_push(config: Mapping[str, Any], outputs: Outputs, extras: Dict[str, Any]) -> List[Tuple[str, str]]:
+def _files_for_push(config: Mapping[str, Any], outputs: Outputs, extras: Dict[str, Any], scope: str = "") -> List[Tuple[str, str]]:
     files: List[Tuple[str, str]] = [(str(f["path"]), str(f["body"])) for f in config.get("files", []) or [] if isinstance(f, Mapping) and f.get("path")]
     for artifact_id in config.get("from_artifacts", []) or []:
-        filename, body = vault.export_artifact(int(artifact_id))
-        row = vault.artifact_by_id(int(artifact_id))
+        # Scoped reads: an artifact id from another visitor's scope raises instead of leaking.
+        filename, body = vault.export_artifact(int(artifact_id), scope or None)
+        row = vault.artifact_by_id(int(artifact_id), scope or None)
         files.append((str(row["file_path"]) if row is not None and row["file_path"] else filename, body))
     kit = config.get("from_kit")
     if kit and kit in extras.get("kit_files", {}):
@@ -63,7 +65,7 @@ def github_push(ctx: Any, config: Mapping[str, Any], outputs: Outputs, extras: D
     token = str(ctx.secrets.get("github_token", ""))
     if not token:
         raise ValueError("the push node needs the session GitHub token: arm GitHub push in the sidebar before launching")
-    files = _files_for_push(config, outputs, extras)
+    files = _files_for_push(config, outputs, extras, ctx.project_scope)
     if not files:
         raise ValueError("the push node has no files: give it files, from_artifacts, or from_kit")
     owner_repo = str(config["owner_repo"])
@@ -90,10 +92,15 @@ def repository_run(ctx: Any, config: Mapping[str, Any], outputs: Outputs, extras
     from .config import Settings
     from .executor import Orchestrator
 
+    if config.get("path") and not self_hosted():
+        raise ValueError("repository.run with a local path runs only on the self-hosted VM; use a github.fetch node here")
+    test_rounds = int(config.get("test_rounds", 0))
+    if test_rounds > 0 and not self_hosted():
+        raise ValueError("repository.run cannot execute a repository's tests on a shared host; test_rounds must be 0 here")
     repo_path = str(config.get("path") or extras.get("repo_path") or "")
     if not repo_path:
         raise ValueError("repository.run needs a fetched repository (a github.fetch node before it) or a path")
-    settings = Settings(max_test_rounds=int(config.get("test_rounds", 0)), max_output_tokens=int(config.get("max_tokens", 2048)))
+    settings = Settings(max_test_rounds=test_rounds, max_output_tokens=int(config.get("max_tokens", 2048)))
     report = Orchestrator(settings=settings, ledger=ctx.ledger).run(str(config["goal"]), repo_path=repo_path)
     extras["pipeline_report"] = {"branch": report.get("branch"), "failed_steps": report.get("failed_steps"), "steps": report.get("steps")}
     lines = [f"Pipeline on {repo_path}: {len(report.get('steps', []))} step(s), {report.get('failed_steps', 0)} failed."]
@@ -104,8 +111,8 @@ def repository_run(ctx: Any, config: Mapping[str, Any], outputs: Outputs, extras
 
 
 def vault_export_thread(ctx: Any, config: Mapping[str, Any], outputs: Outputs, extras: Dict[str, Any]) -> str:
-    thread_id = int(config.get("thread_id") or ctx.thread_id or 0)
-    filename, body = vault.thread_transcript(thread_id, "markdown")
+    thread_id = int(ctx.thread_id or 0)  # always this mission's own chat; a configured id could name another visitor's
+    filename, body = vault.thread_transcript(thread_id, "markdown", ctx.project_scope)
     return f"Transcript {filename} ({len(body)} chars):\n\n" + body[:8000]
 
 
@@ -132,10 +139,12 @@ def mcp_call(ctx: Any, config: Mapping[str, Any], outputs: Outputs, extras: Dict
     if isinstance(arguments, str):
         arguments = json.loads(arguments)
     result = mcp_client.call(str(config["server"]), str(config["tool"]), arguments)
-    extras.setdefault("mcp_results", []).append(result["result"])
+    text = vault.redact_secrets(str(result["text"] or ""))
+    # The job row keeps a bounded, redacted view of the result, never the raw payload.
+    extras.setdefault("mcp_results", []).append({"tool": str(config["tool"]), "text": text[:4000], "length": len(text), "is_error": bool(result["is_error"])})
     if result["is_error"]:
-        raise RuntimeError(f"MCP tool {config['tool']} reported an error: {result['text'][:300]}")
-    return result["text"] or "(the tool returned no text)"
+        raise RuntimeError(f"MCP tool {config['tool']} reported an error: {text[:300]}")
+    return text or "(the tool returned no text)"
 
 
 Connector = Callable[[Any, Mapping[str, Any], Outputs, Dict[str, Any]], str]
@@ -159,10 +168,18 @@ def run_connector(ctx: Any, name: str, config: Mapping[str, Any], outputs: Outpu
     return entry["fn"](ctx, config, outputs, extras)
 
 
-def validate_nodes(plan: Sequence[Mapping[str, Any]], push_armed: bool, mcp_servers: Optional[Sequence[str]] = None) -> List[str]:
-    """Reasons a plan cannot launch (empty when it can). Offline: no calls, no side effects."""
+def validate_nodes(
+    plan: Sequence[Mapping[str, Any]], push_armed: bool, mcp_servers: Optional[Sequence[str]] = None,
+    hosted: Optional[bool] = None, secrets_deliverable: bool = True,
+) -> List[str]:
+    """Reasons a plan cannot launch (empty when it can). Offline: no calls, no side effects.
+
+    ``hosted`` (default: the environment) gates code execution to the self-hosted VM;
+    ``secrets_deliverable`` is False when this process cannot hand a session token to any worker.
+    """
     from .missions import EXECUTORS, FAILURE_POLICIES, OUTPUTS
 
+    own_host = self_hosted() if hosted is None else bool(hosted)
     reasons: List[str] = []
     ids = {int(node.get("id", i + 1)) for i, node in enumerate(plan)}
     for index, node in enumerate(plan, start=1):
@@ -183,6 +200,13 @@ def validate_nodes(plan: Sequence[Mapping[str, Any]], push_armed: bool, mcp_serv
                 reasons.append(f"{label}: {name} needs {', '.join(missing)}")
             if entry["needs_token"] and not push_armed:
                 reasons.append(f"{label}: {name} needs the GitHub push slot armed in the sidebar")
+            elif entry["needs_token"] and not secrets_deliverable:
+                reasons.append(f"{label}: {name} needs a session token, but no worker here can receive one (set CHAT_JOHNSON_JOB_KEY on the VM)")
+            if name == "repository.run" and not own_host:
+                if config.get("path"):
+                    reasons.append(f"{label}: repository.run with a local path runs only on the self-hosted VM")
+                if int(config.get("test_rounds", 0) or 0) > 0:
+                    reasons.append(f"{label}: repository.run cannot run a repository's tests on a shared host (test_rounds must be 0)")
             if name == "mcp.call" and mcp_servers is not None and config.get("server") not in mcp_servers:
                 reasons.append(f"{label}: no MCP server named {config.get('server')!r} is declared")
         if executor == "sub_mission" and not str(config.get("statement") or "").strip():

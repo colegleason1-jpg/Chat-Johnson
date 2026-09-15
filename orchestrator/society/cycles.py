@@ -79,7 +79,7 @@ class CycleBudget:
 
 
 def ensure_seat_thread(scope: str, seat: Dict[str, Any], company: Dict[str, Any]) -> int:
-    if seat.get("thread_id") and vault.thread_by_id(int(seat["thread_id"])):
+    if seat.get("thread_id") and vault.thread_by_id(int(seat["thread_id"]), scope):
         return int(seat["thread_id"])
     thread_id = vault.create_thread(scope, title=f"{company['name']} · {seat['title']}", workspace=WORKSPACE)
     store.update("seats", int(seat["id"]), thread_id=thread_id)
@@ -407,7 +407,7 @@ def company_cycle(ctx: JobContext) -> Dict[str, Any]:
         passed_count = failed_count = 0
         if reviewer and reviewer_agent:
             for item in store.work_items_for(scope, company_id, ("review",), limit=6):
-                artifact = vault.export_artifact(int(item["artifact_id"]))[1] if item.get("artifact_id") else ""
+                artifact = vault.export_artifact(int(item["artifact_id"]), scope)[1] if item.get("artifact_id") else ""
                 check = evaluate.deterministic_check(item["brief"], artifact)
                 verdict = ask(reviewer_key, REVIEW_PROMPT.format(brief=item["brief"][:1200], body=artifact[:6000]), tokens=min(call_tokens, 500))
                 model_pass = verdict.strip().upper().startswith("PASS")

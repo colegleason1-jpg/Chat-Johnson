@@ -11,6 +11,7 @@ import subprocess
 import sys
 from typing import Tuple
 
+from .envsafe import minimal_env
 from .memory import TaskMemory
 from .patches import PATCH_INSTRUCTIONS, apply_file_blocks, parse_file_blocks, reject_snippets
 from .quota import QuotaLedger
@@ -26,6 +27,7 @@ def run_pytest(sandbox_path: str, timeout: int = 300) -> Tuple[bool, str]:
         proc = subprocess.run(
             [sys.executable, "-m", "pytest", "-x", "-q", "--no-header", "-p", "no:cacheprovider"],
             cwd=sandbox_path, capture_output=True, text=True, timeout=timeout,
+            env=minimal_env(),  # the repository's own tests never see the operator's keys
         )
     except subprocess.TimeoutExpired:
         return False, f"(pytest timed out after {timeout} s; the repository's tests may hang or need services)"

@@ -217,7 +217,7 @@ def run_mission_job(ctx: JobContext) -> Dict[str, Any]:
     succeeded, failed = state["succeeded"], state["failed"]
     if succeeded:
         # Pinned only once there is something to continue from; an all-failed launch leaves the next message free to be a new mission.
-        vault.set_thread_mission(thread_id, goal)
+        vault.set_thread_mission(thread_id, goal, scope)
     summary: Dict[str, Any] = {
         "thread_id": thread_id, "goal": goal, "steps": total, "succeeded": succeeded, "failed": failed,
         "truncated": state["truncated"], "failures": state["failures"], "stopped_at": stopped, **state["extras"],

@@ -1,16 +1,57 @@
 """Web QA: HTTP checks of a deployed URL anywhere, browser checks where Chromium exists (the VM worker)."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+import socket
+import tempfile
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
 URL_RE = re.compile(r"https?://[^\s<>\"')\]]+")
 TIMEOUT = 15
+MAX_REDIRECTS = 5
+_BLOCKED_SUFFIXES = (".internal", ".local", ".localhost", ".lan", ".home", ".corp")
+
+
+def unsafe_target(url: str, allow_private: bool = False) -> str:
+    """Why a URL must not be fetched from here ("" when it may be): only public http(s) hosts are checked.
+
+    A deployed app can reach the VM's own services (Ollama, the worker), cloud metadata, and the
+    loopback interface; a check pointed there would be a scanner, not QA.
+    """
+    try:
+        parts = urlsplit(str(url or "").strip())
+    except ValueError:
+        return "not a valid URL"
+    if parts.scheme not in ("http", "https"):
+        return f"only http(s) URLs are checked, not {parts.scheme or 'a bare path'}"
+    host = (parts.hostname or "").lower().rstrip(".")
+    if not host:
+        return "the URL has no host"
+    if not allow_private and (host == "localhost" or host.endswith(_BLOCKED_SUFFIXES) or "." not in host):
+        return f"{host} is a private or local name"
+    if parts.username or parts.password:
+        return "credentials in the URL are not allowed"
+    if allow_private:
+        return ""  # the operator's own VM may check its own services; tests use a loopback server
+    try:
+        infos = socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        return f"{host} does not resolve"
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved or address.is_multicast or address.is_unspecified:
+            return f"{host} resolves to a private or local address"
+    return ""
 
 
 def first_url(text: str) -> str:
@@ -18,12 +59,29 @@ def first_url(text: str) -> str:
     return match.group(0).rstrip(".,;") if match else ""
 
 
-def check_url(url: str, expect_status: int = 200, expect_text: str = "", timeout: int = TIMEOUT) -> Dict[str, Any]:
+def check_url(url: str, expect_status: int = 200, expect_text: str = "", timeout: int = TIMEOUT, allow_private: bool = False) -> Dict[str, Any]:
     """Status, latency, text presence, and the parsed health payload when the page is the ``?health=1`` view."""
     result: Dict[str, Any] = {"url": url, "ok": False, "status": None, "elapsed_ms": None, "text_found": None, "health": None, "error": ""}
+    reason = unsafe_target(url, allow_private)
+    if reason:
+        result["error"] = f"refused: {reason}"
+        return result
     started = time.perf_counter()
     try:
-        response = requests.get(url, timeout=timeout, headers={"User-Agent": "ChatJohnson-WebQA/1.0"})
+        current = url
+        response = None
+        for _ in range(MAX_REDIRECTS + 1):
+            # Redirects are followed by hand so every hop passes the same host check.
+            response = requests.get(current, timeout=timeout, headers={"User-Agent": "ChatJohnson-WebQA/1.0"}, allow_redirects=False)
+            location = response.headers.get("Location") if 300 <= response.status_code < 400 else None
+            if not location:
+                break
+            current = urljoin(current, location)
+            reason = unsafe_target(current, allow_private)
+            if reason:
+                result["error"] = f"refused redirect to {current}: {reason}"
+                return result
+        assert response is not None
     except requests.RequestException as exc:
         result["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
         return result
@@ -50,8 +108,19 @@ def browser_available() -> bool:
     return True
 
 
-def browser_check(url: str, steps: Sequence[Mapping[str, Any]], timeout: int = 60) -> Dict[str, Any]:
+def _screenshot_path(name: Any) -> str:
+    """Screenshots land under one temp directory, never at a path the step names."""
+    folder = os.path.join(tempfile.gettempdir(), "chat-johnson-webqa")
+    os.makedirs(folder, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(str(name)))[:80] or "page"
+    return os.path.join(folder, safe if safe.endswith(".png") else safe + ".png")
+
+
+def browser_check(url: str, steps: Sequence[Mapping[str, Any]], timeout: int = 60, allow_private: bool = False) -> Dict[str, Any]:
     """Drive a real browser through ``steps`` (goto, expect_text, click, fill, screenshot); honest when no browser exists."""
+    reason = unsafe_target(url, allow_private)
+    if reason:
+        return {"available": browser_available(), "ok": False, "steps": [], "error": f"refused: {reason}"}
     if not browser_available():
         return {"available": False, "ok": False, "steps": [], "error": "Playwright is not installed here; browser checks run on the VM worker"}
     from playwright.sync_api import sync_playwright
@@ -72,6 +141,9 @@ def browser_check(url: str, steps: Sequence[Mapping[str, Any]], timeout: int = 6
                 entry = {"step": dict(step), "ok": True}
                 try:
                     if "goto" in step:
+                        blocked = unsafe_target(str(step["goto"]), allow_private)
+                        if blocked:
+                            raise ValueError(f"refused: {blocked}")
                         page.goto(str(step["goto"]), wait_until="networkidle")
                     elif "expect_text" in step:
                         entry["ok"] = str(step["expect_text"]) in page.inner_text("body")
@@ -80,7 +152,7 @@ def browser_check(url: str, steps: Sequence[Mapping[str, Any]], timeout: int = 6
                     elif "fill" in step:
                         page.fill(str(step["fill"]), str(step.get("value", "")))
                     elif "screenshot" in step:
-                        page.screenshot(path=str(step["screenshot"]), full_page=True)
+                        page.screenshot(path=_screenshot_path(step["screenshot"]), full_page=True)
                 except Exception as exc:
                     entry["ok"] = False
                     entry["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"

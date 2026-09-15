@@ -20,6 +20,7 @@ from .patches import (
     PATCH_INSTRUCTIONS,
     apply_file_blocks,
     apply_unified_diffs,
+    diff_paths,
     parse_diff_blocks,
     parse_file_blocks, reject_snippets,
 )
@@ -151,8 +152,8 @@ class Orchestrator:
         written = apply_file_blocks(sandbox_path, file_blocks)
         applied, failed = apply_unified_diffs(sandbox_path, diffs) if diffs else ([], [])
 
-        # guardrail: every generated .py must parse
-        changed = written + changed_files(sandbox_path)
+        # guardrail: every generated .py must parse (files a diff touched included, whatever the sandbox mode)
+        changed = list(dict.fromkeys(written + changed_files(sandbox_path) + diff_paths("\n".join(diffs))))
         errors = sandbox.validate_python_files(sandbox_path, changed)
         if errors:
             return "FAILED: syntax guardrail:\n" + "\n".join(errors)

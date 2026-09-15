@@ -126,6 +126,8 @@ def test_initialize_repository_uses_contents_api_then_one_commit(monkeypatch):
     def fake_request(method, url, headers=None, json=None, timeout=None):
         path = url.replace(gp.API_ROOT, "")
         calls.append((method, path, json))
+        if method == "GET" and path.startswith("/repos/me/blank/git/ref/heads/"):
+            return FakeResponse(404, text="nope")  # still empty: no branch exists yet
         if method == "PUT" and path.startswith("/repos/me/blank/contents/"):
             return FakeResponse(201, {"commit": {"sha": "first111"}})
         if path.startswith("/repos/me/blank/git/commits/first111"):
@@ -146,7 +148,8 @@ def test_initialize_repository_uses_contents_api_then_one_commit(monkeypatch):
     assert record.kind == "init" and record.pr_number == 0 and record.pr_url.endswith("/tree/main")
     assert record.base_sha == "first111" and record.commit_sha == "second22" and record.branch == "main"
     methods = [(m, p) for m, p, _ in calls]
-    assert methods[0] == ("PUT", "/repos/me/blank/contents/README.md")
+    assert methods[0] == ("GET", "/repos/me/blank/git/ref/heads/main")  # still empty is re-checked right before the first write
+    assert methods[1] == ("PUT", "/repos/me/blank/contents/README.md")
     assert ("PATCH", "/repos/me/blank/git/refs/heads/main") == methods[-1]
     tree = next(j for m, p, j in calls if p.endswith("/git/trees"))
     assert {e["path"]: e["mode"] for e in tree["tree"]} == {"src/app.py": "100644", "run.sh": "100755"}

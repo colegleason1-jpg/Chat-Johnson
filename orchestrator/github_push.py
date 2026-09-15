@@ -7,6 +7,7 @@ pull request that restores or removes exactly the files it pushed.
 from __future__ import annotations
 
 import base64
+from urllib.parse import quote
 import hashlib
 import re
 from dataclasses import dataclass, field
@@ -103,7 +104,7 @@ class GitHubWriter:
         return str(data["tree"]["sha"])
 
     def blob_sha_at(self, path: str, ref: str) -> Optional[str]:
-        data = self._request("GET", self._repo(f"/contents/{path}?ref={ref}"))
+        data = self._request("GET", self._repo(f"/contents/{quote(path)}?ref={quote(ref, safe='')}"))
         return str(data["sha"]) if isinstance(data, dict) and data.get("sha") else None
 
     # ------------------------------------------------------------------ writes
@@ -159,6 +160,9 @@ class GitHubWriter:
         then one Git Data commit adds the rest. No pull request exists without a base to compare against."""
         if not files:
             raise GitHubPushError("nothing to push")
+        if self._request("GET", self._repo(f"/git/ref/heads/{quote(branch, safe='')}")) is not None:
+            # A commit landed since the repository was connected: this would write the default branch directly.
+            raise GitHubPushError(f"{self.owner}/{self.repo} is no longer empty ({branch} exists); reconnect it and push as a branch + pull request")
         first_path, first_body = files[0]
         first_sha = self.put_content(first_path, first_body, branch, message)
         head = first_sha or self.branch_sha(branch)

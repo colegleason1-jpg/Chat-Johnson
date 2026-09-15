@@ -20,5 +20,22 @@ if [ ! -d "chat-johnson" ]; then
   git clone --branch "$BRANCH" "$REPO_URL" "chat-johnson"
 fi
 cd "chat-johnson"
-[ -f .env ] || cp .env.example .env
-echo "Edit .env with your keys, then run: bash scripts/vm-update.sh"
+if [ ! -f .env ]; then
+  cp .env.example .env
+  # The job key lets the app hand a session's GitHub token or paid key to the worker encrypted (Fernet: 32 url-safe base64 bytes).
+  JOB_KEY="$(openssl rand -base64 32 | tr '+/' '-_')"
+  sed -i "s|^CHAT_JOHNSON_JOB_KEY=.*|CHAT_JOHNSON_JOB_KEY=${JOB_KEY}|" .env
+  read -r -p "Domain for automatic TLS (blank = listen on 127.0.0.1:8080 only; reach it through an SSH tunnel): " DOMAIN
+  if [ -n "${DOMAIN}" ]; then
+    sed -i "s|^DOMAIN=.*|DOMAIN=${DOMAIN}|; s|^CADDY_BIND=.*|CADDY_BIND=0.0.0.0:80|; s|^CADDY_BIND_TLS=.*|CADDY_BIND_TLS=0.0.0.0:443|" .env
+  fi
+  read -r -p "Basic auth user [operator]: " CADDY_USER
+  CADDY_USER="${CADDY_USER:-operator}"
+  read -r -s -p "Basic auth password: " CADDY_PASS
+  echo
+  HASH="$(docker run --rm caddy:2 caddy hash-password --plaintext "${CADDY_PASS}")"
+  HASH_ESCAPED="${HASH//\$/\$\$}"   # compose interpolation turns $$ back into $ before Caddy sees it
+  sed -i "s|^CADDY_USER=.*|CADDY_USER=${CADDY_USER}|; s|^CADDY_HASH=.*|CADDY_HASH=${HASH_ESCAPED}|" .env
+  chmod 600 .env
+fi
+echo "Add your provider keys to .env (they reach the worker container only), then run: bash scripts/vm-update.sh"

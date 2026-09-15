@@ -11,6 +11,7 @@ other kind phrases its steps around the deliverable rather than around the reque
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -248,6 +249,9 @@ EXECUTORS = ("model", "solver", "webqa", "connector", "sub_mission")
 OUTPUTS = ("chat", "artifact", "both")
 FAILURE_POLICIES = ("stop", "skip", "retry_once")
 MAX_NODES = 12
+MAX_BLOCK_CHARS = 20_000
+MAX_DESCRIPTION_CHARS = 4_000
+MAX_CONFIG_CHARS = 8_000
 _MISSION_BLOCK = re.compile(r"```mission\s*\n(?P<body>.*?)```", re.S | re.I)
 
 
@@ -260,10 +264,10 @@ def normalise_plan(plan: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for index, raw in enumerate(plan, start=1):
         node = dict(raw)
-        node["id"] = int(node.get("id") or index)
-        node["title"] = str(node.get("title") or f"Step {index}")
+        node["id"] = index  # ids are positions: a supplied id can neither collide nor point a node's inputs elsewhere
+        node["title"] = str(node.get("title") or f"Step {index}")[:200]
         node["type"] = str(node.get("type") or "chat")  # router task types plus the mission-only "writing"; unknown ones route as chat
-        node["description"] = str(node.get("description") or node.get("instruction") or "")
+        node["description"] = str(node.get("description") or node.get("instruction") or "")[:MAX_DESCRIPTION_CHARS]
         executor = str(node.get("executor") or "model")
         if executor not in EXECUTORS:
             raise MissionBlockError(f"step {index}: unknown executor {executor!r}")
@@ -271,8 +275,12 @@ def normalise_plan(plan: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         config = node.get("config") or {}
         if not isinstance(config, dict):
             raise MissionBlockError(f"step {index}: config must be a mapping")
+        if len(json.dumps(config, default=str)) > MAX_CONFIG_CHARS:
+            raise MissionBlockError(f"step {index}: config is larger than {MAX_CONFIG_CHARS} characters")
         node["config"] = config
         inputs = node.get("inputs") or []
+        if not isinstance(inputs, (list, tuple)):
+            raise MissionBlockError(f"step {index}: inputs must be a list of step numbers")
         try:
             node["inputs"] = [int(v) for v in inputs]
         except (TypeError, ValueError) as exc:
@@ -295,10 +303,15 @@ def parse_mission_block(text: str) -> Optional[Dict[str, Any]]:
     match = _MISSION_BLOCK.search(text or "")
     if not match:
         return None
+    body = match.group("body")
+    if len(body) > MAX_BLOCK_CHARS:
+        raise MissionBlockError(f"the mission block is larger than {MAX_BLOCK_CHARS} characters")
     try:
-        data = yaml.safe_load(match.group("body"))
+        data = yaml.safe_load(body)
     except yaml.YAMLError as exc:
         raise MissionBlockError(f"the mission block is not valid YAML: {str(exc)[:120]}") from exc
+    except Exception as exc:  # deeply nested documents exhaust the parser; that is a bad block, not a crash
+        raise MissionBlockError(f"the mission block could not be parsed: {type(exc).__name__}") from exc
     if not isinstance(data, dict) or not str(data.get("statement") or "").strip():
         raise MissionBlockError("a mission block needs a statement")
     nodes = data.get("nodes") or []

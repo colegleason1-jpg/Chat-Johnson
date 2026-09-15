@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import zlib
 from collections import deque
@@ -45,7 +46,8 @@ except ModuleNotFoundError as exc:  # Keep pure routing/math helpers importable 
 from . import discovery
 from . import providers as _providers
 from .config import PROVIDERS, Settings, get_settings, provider_model, resolve_secret
-from .quota import QuotaLedger
+from .quota import QuotaLedger, seconds_to_utc_midnight
+from .quota_registry import credential_fingerprint, get_quota_ledger
 
 # Preserve the original module-level import surface for callers/tests that
 # monkeypatch ``orchestrator.router.chat``.
@@ -78,32 +80,16 @@ BYOK_ENV_KEYS: Dict[str, Tuple[str, ...]] = {
 
 
 def refresh_byok_vault() -> Dict[str, Dict[str, Any]]:
-    """Read the current process environment into an in-memory BYOK schema.
+    """Which BYOK providers have a key in this context (session overlay first, then the environment).
 
-    The returned dictionary intentionally contains the key only in process
-    memory so the HTTP adapter can use it.  Callers should use
-    :func:`byok_status` when displaying state; it never returns key values.
+    Never holds key values: the HTTP adapter resolves a key at request time through
+    :func:`_endpoint_key`, so nothing plaintext lives in a module dictionary.
     """
     vault: Dict[str, Dict[str, Any]] = {}
     for provider, env_names in BYOK_ENV_KEYS.items():
-        selected_name = ""
-        selected_value = ""
-        for env_name in env_names:
-            value = resolve_secret(env_name)
-            if value:
-                selected_name = env_name
-                selected_value = value
-                break
-        vault[provider] = {
-            "provider": provider,
-            "env_key": selected_name or env_names[0],
-            "api_key": selected_value,
-            "configured": bool(selected_value),
-        }
+        selected_name = next((env_name for env_name in env_names if resolve_secret(env_name)), "")
+        vault[provider] = {"provider": provider, "env_key": selected_name or env_names[0], "configured": bool(selected_name)}
     return vault
-
-
-BYOK_VAULT: Dict[str, Dict[str, Any]] = refresh_byok_vault()
 
 
 def byok_status() -> Dict[str, Dict[str, Any]]:
@@ -135,11 +121,6 @@ class CortexEndpoint:
 
 # Shared with the legacy provider client: one live-id cache per vendor.
 _DISCOVERED_MODELS = discovery.DISCOVERED
-MODEL_PREFERENCES = {
-    "google_ai_studio": discovery.VENDOR_PREFERENCES["gemini"],
-    "groq": discovery.VENDOR_PREFERENCES["groq"],
-    "huggingface": discovery.VENDOR_PREFERENCES["huggingface"],
-}
 
 
 def endpoint_model(endpoint: "CortexEndpoint") -> str:
@@ -354,10 +335,6 @@ def generate_one_over_f_noise(
     )
 
 
-# Friendly alias for callers using the shorter research name.
-generate_pink_noise = generate_one_over_f_noise
-
-
 def advance_stochastic_project_seth_step(
     x_k: float,
     eta_k: float,
@@ -430,16 +407,24 @@ def simulate_project_seth_trajectory(
 ENDPOINT_TELEMETRY: Dict[str, Deque[Tuple[float, bool]]] = {}
 TELEMETRY_WINDOW = 50
 LATENCY_BASELINE_SECONDS = 2.0
+_TELEMETRY_LOCK = threading.Lock()
+
+
+def _telemetry_key(endpoint_name: str) -> str:
+    # Per credential: one visitor's rejected key must not lower another visitor's endpoint score.
+    return f"{endpoint_name}|{credential_fingerprint()}"
 
 
 def record_telemetry(endpoint_name: str, latency_seconds: float, ok: bool) -> None:
-    bucket = ENDPOINT_TELEMETRY.setdefault(endpoint_name, deque(maxlen=TELEMETRY_WINDOW))
-    bucket.append((max(0.0, float(latency_seconds)), bool(ok)))
+    with _TELEMETRY_LOCK:
+        bucket = ENDPOINT_TELEMETRY.setdefault(_telemetry_key(endpoint_name), deque(maxlen=TELEMETRY_WINDOW))
+        bucket.append((max(0.0, float(latency_seconds)), bool(ok)))
 
 
 def telemetry_snapshot(endpoint_name: str) -> Dict[str, float]:
     """Observed failure rate and latency ratio for an endpoint (zeros when unobserved)."""
-    bucket = ENDPOINT_TELEMETRY.get(endpoint_name)
+    with _TELEMETRY_LOCK:
+        bucket = list(ENDPOINT_TELEMETRY.get(_telemetry_key(endpoint_name)) or ())
     if not bucket:
         return {"observations": 0.0, "failure_rate": 0.0, "latency_ratio": 0.0}
     failures = sum(1 for _, ok in bucket if not ok)
@@ -665,22 +650,49 @@ def cortex_wait_seconds(ledger: Optional[QuotaLedger], messages: Sequence[Mappin
     return float(min(waits)) if waits else 0.0
 
 
+@dataclass(frozen=True)
+class EndpointUsage:
+    """What the capacity rows see for one endpoint: window use plus the effective ceilings and the daily cap."""
+
+    rpm_used: float = 0.0
+    tpm_used: float = 0.0
+    daily_used: float = 0.0
+    daily_limit: float = 0.0   # 0 = uncapped
+    rpm_limit: float = 0.0     # 0 = use the endpoint table
+    tpm_limit: float = 0.0
+
+    def rpm_ceiling(self, endpoint: CortexEndpoint) -> float:
+        return min(float(endpoint.rpm_limit), self.rpm_limit) if self.rpm_limit > 0 else float(endpoint.rpm_limit)
+
+    def tpm_ceiling(self, endpoint: CortexEndpoint) -> Optional[float]:
+        table = float(endpoint.tpm_limit) if endpoint.tpm_limit is not None else None
+        if self.tpm_limit > 0 and self.tpm_limit < 10**9:
+            return min(table, self.tpm_limit) if table is not None else self.tpm_limit
+        return table
+
+
+def _usage_from_row(row: Mapping[str, float]) -> EndpointUsage:
+    return EndpointUsage(
+        rpm_used=float(row.get("rpm_used", 0.0)), tpm_used=float(row.get("tpm_used", 0.0)),
+        daily_used=float(row.get("daily_tokens", 0.0)), daily_limit=float(row.get("daily_limit", 0.0)),
+        rpm_limit=float(row.get("rpm_limit", 0.0)), tpm_limit=float(row.get("tpm_limit", 0.0)),
+    )
+
+
 def _endpoint_usage(
     endpoint: CortexEndpoint,
     ledger: Optional[QuotaLedger],
     current_usage: Optional[Mapping[str, Mapping[str, float]]],
-) -> Tuple[float, float]:
+) -> EndpointUsage:
     for key in (endpoint.name, _vendor(endpoint)):
         if current_usage and key in current_usage:
-            row = current_usage[key]
-            return float(row.get("rpm_used", 0.0)), float(row.get("tpm_used", 0.0))
+            return _usage_from_row(current_usage[key])
     if ledger is not None:
         try:
-            row = ledger.usage(_vendor(endpoint))
-            return float(row.get("rpm_used", 0.0)), float(row.get("tpm_used", 0.0))
+            return _usage_from_row(ledger.usage(_vendor(endpoint)))
         except KeyError:
-            return 0.0, 0.0
-    return 0.0, 0.0
+            return EndpointUsage()
+    return EndpointUsage()
 
 
 def _utility_score(endpoint: CortexEndpoint, task_type: str, entropy_penalty: float) -> float:
@@ -699,37 +711,38 @@ def _utility_score(endpoint: CortexEndpoint, task_type: str, entropy_penalty: fl
     return float(raw + task_bonus - 0.30 * max(0.0, min(1.0, entropy_penalty)))
 
 
-def _feasible_endpoint(endpoint: CortexEndpoint, rpm_used: float, tpm_used: float, estimated_tokens: int) -> bool:
-    """Kept for callers/tests: the same capacity rows the solver enforces, evaluated in Python."""
-    return bool(_endpoint_key(endpoint)) and not _capacity_reasons(endpoint, rpm_used, tpm_used, estimated_tokens)
-
-
-def _capacity_reasons(endpoint: CortexEndpoint, rpm_used: float, tpm_used: float, estimated_tokens: int) -> List[str]:
-    """Human-readable reasons an endpoint cannot take this request right now."""
+def _capacity_reasons(endpoint: CortexEndpoint, usage: EndpointUsage, estimated_tokens: int) -> List[str]:
+    """Human-readable reasons an endpoint cannot take this request right now (the same rows the solver enforces)."""
     reasons: List[str] = []
-    if rpm_used + 1.0 > endpoint.rpm_limit:
-        reasons.append(f"{int(rpm_used)}/{endpoint.rpm_limit} requests used in the last minute")
-    if endpoint.tpm_limit is not None:
-        if estimated_tokens > endpoint.tpm_limit:
+    rpm_limit = usage.rpm_ceiling(endpoint)
+    if usage.rpm_used + 1.0 > rpm_limit:
+        reasons.append(f"{int(usage.rpm_used)}/{int(rpm_limit)} requests used in the last minute")
+    tpm_limit = usage.tpm_ceiling(endpoint)
+    if tpm_limit is not None:
+        if estimated_tokens > tpm_limit:
             reasons.append(
-                f"request needs ~{estimated_tokens} tokens but the ceiling is {endpoint.tpm_limit} TPM "
+                f"request needs ~{estimated_tokens} tokens but the ceiling is {int(tpm_limit)} TPM "
                 "(lower the output token budget or shorten the prompt)"
             )
-        elif tpm_used + estimated_tokens > endpoint.tpm_limit:
-            reasons.append(f"~{int(tpm_used)}+{estimated_tokens} tokens would exceed {endpoint.tpm_limit} TPM this minute")
+        elif usage.tpm_used + estimated_tokens > tpm_limit:
+            reasons.append(f"~{int(usage.tpm_used)}+{estimated_tokens} tokens would exceed {int(tpm_limit)} TPM this minute")
+    if usage.daily_limit > 0 and usage.daily_used + estimated_tokens > usage.daily_limit:
+        hours = max(1, int(seconds_to_utc_midnight() // 3600) + 1)
+        reasons.append(f"daily cap of {int(usage.daily_limit)} tokens reached ({int(usage.daily_used)} used); resets in about {hours} h")
     return reasons
 
 
 def _build_constraint_array(
     endpoints: Sequence[CortexEndpoint],
-    usage: Mapping[str, Tuple[float, float]],
+    usage: Mapping[str, EndpointUsage],
     estimated_tokens: int,
     enabled: Mapping[str, bool],
 ) -> Any:
-    """Constraint rows for scipy.milp: exclusivity, RPM capacity, TPM capacity, key/exclusion.
+    """Constraint rows for scipy.milp: exclusivity, RPM, TPM, daily cap, key/exclusion.
 
     These rows decide feasibility. ``enabled`` only encodes "has a key and is not
-    excluded"; the RPM/TPM ceilings are enforced here, by the solver.
+    excluded"; the RPM/TPM/daily ceilings are enforced here, by the solver, against the
+    tighter of the endpoint table and the ledger's own limits.
     """
     if np is None or LinearConstraint is None:
         return None
@@ -740,18 +753,25 @@ def _build_constraint_array(
     upper: List[float] = [1.0]
 
     for index, endpoint in enumerate(endpoints):
-        rpm_used, tpm_used = usage[endpoint.name]
+        use = usage[endpoint.name]
         row = array_lib.zeros(len(endpoints), dtype=float)
         row[index] = 1.0
         rows.append(row)
         lower.append(-array_lib.inf)
-        upper.append(float(max(0.0, endpoint.rpm_limit - rpm_used)))  # x_i <= remaining requests
-        if endpoint.tpm_limit is not None:
+        upper.append(float(max(0.0, use.rpm_ceiling(endpoint) - use.rpm_used)))  # x_i <= remaining requests
+        tpm_limit = use.tpm_ceiling(endpoint)
+        if tpm_limit is not None:
             row = array_lib.zeros(len(endpoints), dtype=float)
             row[index] = float(estimated_tokens)
             rows.append(row)
             lower.append(-array_lib.inf)
-            upper.append(float(max(0.0, endpoint.tpm_limit - tpm_used)))  # tokens * x_i <= remaining tokens
+            upper.append(float(max(0.0, tpm_limit - use.tpm_used)))  # tokens * x_i <= remaining tokens
+        if use.daily_limit > 0:
+            row = array_lib.zeros(len(endpoints), dtype=float)
+            row[index] = float(estimated_tokens)
+            rows.append(row)
+            lower.append(-array_lib.inf)
+            upper.append(float(max(0.0, use.daily_limit - use.daily_used)))  # tokens * x_i <= remaining today
         if not enabled.get(endpoint.name, False):
             row = array_lib.zeros(len(endpoints), dtype=float)
             row[index] = 1.0
@@ -797,7 +817,7 @@ def select_milp_endpoint(
         if not enabled[endpoint.name]:
             blocked[endpoint.name] = ["no key configured" if not _endpoint_key(endpoint) else "already tried this request"]
             continue
-        reasons = _capacity_reasons(endpoint, usage[endpoint.name][0], usage[endpoint.name][1], estimated_tokens)
+        reasons = _capacity_reasons(endpoint, usage[endpoint.name], estimated_tokens)
         if reasons:
             blocked[endpoint.name] = reasons
     feasible = [endpoint for endpoint in endpoints if endpoint.name not in blocked]
@@ -828,6 +848,9 @@ def select_milp_endpoint(
     if chosen is None:
         if not feasible:
             detail = "; ".join(f"{name}: {', '.join(reasons)}" for name, reasons in blocked.items())
+            keyed = [reasons for name, reasons in blocked.items() if enabled.get(name)]
+            if keyed and all(any("daily cap" in reason for reason in reasons) for reasons in keyed):
+                raise ProviderError(f"daily cap reached for every keyed vendor -> {detail}")
             raise ProviderError(f"Cortex 2 found no BYOK endpoint with headroom -> {detail}")
         chosen = max(feasible, key=lambda endpoint: (utilities[endpoint.name], -endpoints.index(endpoint)))
 
@@ -954,7 +977,7 @@ def _resilient_post(
     on a retired-id error, then up to two sibling models if still overloaded.
     """
     secret = _endpoint_key(selected)
-    key_override = os.environ.get(selected.model_env, "").strip() if selected.model_env else ""
+    key_override = resolve_secret(selected.model_env).strip() if selected.model_env else ""  # session or environment pin
     tried: List[str] = []
     model_id = endpoint_model(selected)
     rediscovered = False
@@ -1175,6 +1198,8 @@ def cortex_stream(
             if chunk:
                 emitted = True
                 yield chunk
+    except requests.RequestException as exc:  # a connection cut mid-answer is a provider failure, not a crash
+        raise ProviderError(f"{selected.name} stream failed after {'some' if emitted else 'no'} text: {type(exc).__name__}") from exc
     finally:
         response.close()
     if not emitted:
@@ -1182,13 +1207,13 @@ def cortex_stream(
 
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
-_THINK_OPEN = re.compile(r"^\s*<think>.*\Z", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN = re.compile(r"<think>.*\Z", re.DOTALL | re.IGNORECASE)
 
 
 def strip_reasoning_tags(text: str) -> str:
     """Remove <think>…</think> blocks reasoning models put in message content; never show hidden reasoning."""
     cleaned = _THINK_BLOCK.sub("", text or "")
-    cleaned = _THINK_OPEN.sub("", cleaned)  # an unterminated block means the answer never started
+    cleaned = _THINK_OPEN.sub("", cleaned)  # an unterminated block hides everything after it, as the live view does
     return cleaned.strip() if cleaned != text else text
 
 
@@ -1275,19 +1300,17 @@ def cortex_generate(
         attempted.append(endpoint.name)
         status: Dict[str, Any] = {}
         try:
-            chunks = cortex_stream(
-                endpoint,
-                messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system_prompt=system_prompt,
-                ledger=ledger,
-                status=status,
-            )
-            text = strip_reasoning_tags("".join(chunks))
-            tokens = _estimate_tokens(messages, text)
-            if ledger is not None:
-                ledger.record(_vendor(endpoint), tokens, count_request=False)
+            raw = ""
+            try:
+                for chunk in cortex_stream(
+                    endpoint, messages, max_tokens=max_tokens, temperature=temperature, system_prompt=system_prompt, ledger=ledger, status=status,
+                ):
+                    raw += chunk
+            finally:
+                # Charged on the raw text (hidden reasoning included) and even when the stream failed part-way.
+                if ledger is not None and raw:
+                    ledger.record(_vendor(endpoint), _estimate_tokens(messages, raw), count_request=False)
+            text = strip_reasoning_tags(raw)
             route_decision = RouteDecision(
                 finish=str(status.get("finish", "")),
                 provider=endpoint.name,
@@ -1356,23 +1379,14 @@ class CortexStream:
 
     def __iter__(self) -> Iterator[str]:
         # Hidden reasoning is filtered live, not only after the stream ends.
-        yield from _visible_chunks(self._raw())
-        self.text = strip_reasoning_tags(self.text)
-        self.decision.finish = str(self.status.get("finish", ""))
-        if self.ledger is not None:
-            self.ledger.record(_vendor(self.milp.endpoint), _estimate_tokens(self.messages, self.text), count_request=False)
-
-
-def stream_generation(
-    task_type: str,
-    messages: Sequence[Mapping[str, str]],
-    ledger: Optional[QuotaLedger] = None,
-    max_tokens: int = 4096,
-    temperature: float = 0.2,
-    system_prompt: str = "",
-) -> Iterator[str]:
-    """Select one endpoint with MILP and expose its live text stream."""
-    return iter(CortexStream(task_type, messages, ledger, max_tokens, temperature, system_prompt))
+        try:
+            yield from _visible_chunks(self._raw())
+        finally:
+            # Charged on the raw text, and charged even when the stream failed part-way.
+            if self.ledger is not None and self.text:
+                self.ledger.record(_vendor(self.milp.endpoint), _estimate_tokens(self.messages, self.text), count_request=False)
+            self.text = strip_reasoning_tags(self.text)
+            self.decision.finish = str(self.status.get("finish", ""))
 
 
 # =============================================================================
@@ -1479,7 +1493,7 @@ def probe_legacy_provider(name: str, timeout: int = 20, ledger: Optional[QuotaLe
         return result
     used = provider_model(cfg)
     result.update({"ok": True, "status": 200, "model": used,
-                   "detail": "reachable" + (f" (auto-switched to {used})" if used != cfg.default_model and not os.environ.get(cfg.model_env, "").strip() else "")})
+                   "detail": "reachable" + (f" (auto-switched to {used})" if used != cfg.default_model and not resolve_secret(cfg.model_env).strip() else "")})
     return result
 
 
@@ -1655,6 +1669,7 @@ def generate(
     tried: List[str] = []
     failures: Dict[str, str] = {}
     for name in candidates(normalized_type, settings_value.providers_available()):
+        ledger.tighten(discovery.vendor_for(name), PROVIDERS[name].rpm_limit, PROVIDERS[name].tpm_limit)  # a hand-built ledger may lack the bucket
         if PROVIDERS[name].context_window < estimated_tokens or not ledger.has_headroom(discovery.vendor_for(name), estimated_tokens):
             failures[name] = "skipped: no quota headroom or context too small"
             continue
@@ -1783,15 +1798,55 @@ def heavy_stream(
     """
     if not cortex_available():
         raise ProviderError("no Cortex endpoint is keyed; Heavy Mode streaming needs one")
+    draft: Dict[str, Any] = {}
 
     def one_pass(selected_type: str, selected_messages: List[dict], tokens: int) -> Tuple[str, RouteDecision]:
-        return cortex_generate(selected_type, selected_messages, ledger=ledger, max_tokens=tokens, temperature=temperature, system_prompt=system_prompt)
+        text, decision = cortex_generate(selected_type, selected_messages, ledger=ledger, max_tokens=tokens, temperature=temperature, system_prompt=system_prompt)
+        draft.setdefault("text", text)  # the first pass is the draft
+        draft.setdefault("decision", decision)
+        return text, decision
 
-    def final_pass(selected_type: str, selected_messages: List[dict], tokens: int) -> Tuple[CortexStream, RouteDecision]:
+    def final_pass(selected_type: str, selected_messages: List[dict], tokens: int) -> Tuple[HeavyStream, RouteDecision]:
         stream = CortexStream(selected_type, selected_messages, ledger, max_tokens=tokens, temperature=temperature, system_prompt=system_prompt)
-        return stream, stream.decision
+        wrapped = HeavyStream(stream, str(draft.get("text", "")), draft.get("decision"), task_type)
+        return wrapped, wrapped.decision
 
     return _heavy_pipeline(one_pass, task_type, messages, max_tokens, paid_slot=paid_slot, final_pass=final_pass)
+
+
+class HeavyStream:
+    """The synthesis stream of Heavy Mode with the draft in hand: a stream that fails mid-flight yields the draft instead.
+
+    ``text`` and ``decision`` are final once the stream is drained; the pipeline is never re-run.
+    """
+
+    def __init__(self, inner: CortexStream, draft: str, draft_decision: Optional[RouteDecision], task_type: str) -> None:
+        self.inner = inner
+        self.draft = draft
+        self.draft_decision = draft_decision
+        self.task_type = task_type
+        self.decision = inner.decision
+        self.text = ""
+        self.fell_back = False
+
+    def __iter__(self) -> Iterator[str]:
+        emitted = False
+        try:
+            for chunk in self.inner:
+                emitted = True
+                yield chunk
+            self.text = self.inner.text
+        except ProviderError as exc:
+            self.fell_back = True
+            base = self.draft_decision or self.inner.decision
+            if emitted and self.inner.text.strip():
+                self.text = strip_reasoning_tags(self.inner.text)
+                self.decision.reason = f"{self.decision.reason}; synthesis stream cut short: {str(exc)[:80]}"
+                self.decision.finish = "length"
+            else:
+                self.text = self.draft
+                self.decision = RouteDecision(base.provider, base.model, self.task_type, f"heavy draft returned; synthesis stream failed: {str(exc)[:80]}", base.solver, base.decision_vector)
+                yield self.draft
 
 
 def generate_heavy(
@@ -1915,5 +1970,5 @@ def pipeline_generate(
         wait = cortex_wait_seconds(ledger, messages, max_tokens)
         if 0 < wait <= max_wait:
             time.sleep(wait + 0.5)
-    ledger_value = ledger if ledger is not None else QuotaLedger({})
+    ledger_value = ledger if ledger is not None else get_quota_ledger()
     return generate_mode("normal", task_type, messages, ledger_value, max_tokens=max_tokens, temperature=temperature)

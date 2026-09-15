@@ -20,31 +20,43 @@
 2. Reboot from *Manage app* if the old build lingers. Verify as above.
 
 ## Self-hosted VM (Oracle Cloud Always Free or any Docker host)
-- `docker-compose.yml` runs four services: `app` (Streamlit, no job workers), `worker`
-  (`python -m orchestrator.jobs --worker`, Chromium included, serves every job 24/7 and restores the
-  society tick after a restart), `ollama` (the local model for Producer tasks and leisure notes),
-  and `caddy` (TLS for the domain in `Caddyfile`, plain HTTP on port 80 when none is set). The vault
-  lives on the `data` volume at `/data/vault.db` and survives deploys.
+- `docker-compose.yml` runs four services: `app` (Streamlit, no job workers, **no `.env`**), `worker`
+  (`python -m orchestrator.jobs --worker`, Chromium included, loads `.env`, serves every job 24/7 and
+  restores the society tick after a restart), `ollama` (the local model for Producer tasks and
+  leisure notes), and `caddy`. The vault lives on the `data` volume at `/data/vault.db` and survives deploys.
+- Edge: with `DOMAIN` in `.env`, Caddy binds 80/443 (`CADDY_BIND=0.0.0.0:80`, `CADDY_BIND_TLS=0.0.0.0:443`),
+  serves automatic TLS, and requires basic auth (`CADDY_USER`, `CADDY_HASH` from `caddy hash-password`,
+  every `$` doubled for compose). Without a domain the stack binds `127.0.0.1:8080` only: reach it with
+  `ssh -L 8080:127.0.0.1:8080 <vm>`. `Caddyfile.open` (set `CADDYFILE=Caddyfile.open`) drops the auth
+  for tunnel-only use; plain HTTP on the internet is never generated.
 - First time: create the instance (Ubuntu or Oracle Linux, ARM64 is fine), allow 80/443 in the VCN
-  security list, then `bash scripts/vm-bootstrap.sh <repo url> <branch>`; copy `.env.example` to
-  `.env` and fill the keys (decision: keys on the VM worker only, never in the vault).
+  security list only if you will set a domain, then `bash scripts/vm-bootstrap.sh <repo url> <branch>`:
+  it writes `.env` with a generated `CHAT_JOHNSON_JOB_KEY`, asks for the domain and the basic-auth
+  password, and sets `.env` to mode 600. Add the provider keys to `.env`; they reach the worker only.
+- Session secrets: a GitHub token or paid key pasted in the browser reaches the worker as a Fernet blob
+  in `job_secrets` (encrypted with `CHAT_JOHNSON_JOB_KEY`, deleted on claim); without the key the UI
+  refuses nodes that need a token. Local paths in Repository Work must sit under `CHAT_JOHNSON_REPO_ROOTS`.
 - Every deploy: `bash scripts/vm-update.sh` (pull, rebuild, restart, pull the local model). Roll
   back with `git checkout <previous>` and `docker compose up -d --build`. Back up with
   `bash scripts/vm-backup.sh` (keeps 14 copies under `backups/`).
-- Heartbeats: the worker stamps its rows every 15 s and fails rows silent for 3 minutes; the app
-  never reaps rows because the worker owns them.
+- Heartbeats: a worker stamps only the rows its threads are executing, every 15 s, and fails rows
+  silent for 3 minutes; on start it fails the rows an earlier process of the same container left
+  running; the app never reaps rows because the worker owns them. A reap re-queues society ticks.
 
 ## MCP servers (VM worker only)
 - Declare servers in `mcp_servers.yaml` (name, command, args, env; an env value `env:NAME` is read
-  from the worker's environment at call time, so tokens stay in `.env`). `CHAT_JOHNSON_MCP_SERVERS`
-  points at another file. The sidebar lists the servers; **List tools** probes one over stdio and is
+  from the worker's environment at call time, so tokens stay in `.env`). A server starts from a
+  minimal environment (`PATH`, `HOME`, `LANG`, `TMPDIR`, `PYTHONPATH`) plus exactly the `env:` entries
+  it declares; the worker's provider keys never reach it. Its stderr tail is kept for error messages.
+  `CHAT_JOHNSON_MCP_SERVERS` points at another file. The sidebar lists the servers; **List tools** probes one over stdio and is
   enabled only where `CHAT_JOHNSON_SELF_HOSTED=1`.
 - A mission node with `executor: connector` and `config: {connector: mcp.call, server, tool,
   arguments}` starts the server for that call, runs `initialize` → `tools/call`, and records the
   text content in the chat. Errors are redacted before they are stored; a server that does not
   answer within 30 s fails the node under its failure policy.
 - Mission nodes that push to GitHub take the session push token with the job (`github_token`,
-  memory only, never a row); Launch stays disabled while the slot is disarmed.
+  encrypted per job on the VM, process memory on a single-process host, never a plain row); Launch
+  stays disabled while the slot is disarmed or while no worker can receive the token.
 
 ## Data
 - The SQLite vault lives on the container's disk. On Streamlit Community Cloud that disk is
@@ -63,7 +75,9 @@
   `chat_johnson_worktrees`). Trees older than six hours and sandboxes older than two are removed
   when a pipeline run or the job runner starts; a finished run keeps its sandbox until then so the
   push flow can read the changed files. Running a fetched repository's tests executes its code in
-  the app's container; the box is off by default for GitHub sources.
+  the worker container on the VM (the box exists only when `CHAT_JOHNSON_SELF_HOSTED=1`; a shared
+  deployment never executes a repository's code) and starts from a minimal environment without the
+  worker's keys; the box is off by default for GitHub sources.
 
 ## Company cycles
 - A cycle is a `company_cycle` job. Its budget is the smaller of the cycle's hard cap and the

@@ -12,20 +12,39 @@ from typing import Dict, List, Tuple
 SKIP_DIRS = {
     ".git", ".orchestrator", "__pycache__", "node_modules", ".venv",
     "venv", ".mypy_cache", ".pytest_cache", "dist", "build", ".ruff_cache",
+    ".streamlit", "secrets", ".secrets", ".ssh", ".aws", ".gnupg",
 }
+# Secret-shaped files never enter a prompt, whatever directory they sit in.
+SKIP_FILES = {".env", "secrets.toml", "secrets.yaml", "secrets.yml", "secrets.json", ".netrc", ".npmrc", ".pypirc", "credentials", "credentials.json"}
+SKIP_FILE_PREFIXES = (".env.", "id_rsa", "id_ed25519", "id_ecdsa")
+SKIP_FILE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".jks")
+ALLOWED_FILE_KEEP = {".env.example", ".env.sample", ".env.template"}
 MAX_FILE_BYTES = 120_000
 
 TEXT_EXTS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".md", ".txt", ".yml",
     ".yaml", ".toml", ".cfg", ".ini", ".css", ".html", ".sh", ".sql",
-    ".env.example", "",
 }
+EXTENSIONLESS_TEXT = {"dockerfile", "makefile", "caddyfile", "procfile", "license", "readme", "notice", "authors", "changelog", "vagrantfile", "jenkinsfile"}
+
+
+def is_secret_file(name: str) -> bool:
+    """A file whose name says it holds credentials (``.env``, ``secrets.toml``, private keys, …)."""
+    lowered = name.lower()
+    if lowered in ALLOWED_FILE_KEEP:
+        return False
+    return lowered in SKIP_FILES or lowered.startswith(SKIP_FILE_PREFIXES) or lowered.endswith(SKIP_FILE_SUFFIXES)
 
 
 def _is_text(path: str) -> bool:
+    name = os.path.basename(path)
+    if is_secret_file(name):
+        return False
     ext = os.path.splitext(path)[1].lower()
-    if ext in TEXT_EXTS:
+    if ext in TEXT_EXTS or (not ext and name.lower() in EXTENSIONLESS_TEXT):
         return True
+    if not ext:
+        return False  # other extension-less files (secrets, binaries, unknown) stay out
     try:
         with open(path, "rb") as f:
             return b"\x00" not in f.read(2048)

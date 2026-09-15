@@ -11,12 +11,15 @@ import os
 import queue
 import subprocess
 import threading
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from collections import deque
+from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence
 
 from .config import resolve_secret
+from .envsafe import minimal_env
 from .vault import redact_secrets
 
 PROTOCOL_VERSION = "2024-11-05"
+STARTUP_TIMEOUT = 60.0  # first-run downloads (npx -y …) take longer than a tool call
 DEFAULT_SERVERS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mcp_servers.yaml")
 DEFAULT_TIMEOUT = 30.0
 
@@ -57,22 +60,26 @@ def _resolve_env(env: Mapping[str, str]) -> Dict[str, str]:
 class MCPSession:
     """One server process; use as a context manager."""
 
-    def __init__(self, server: Mapping[str, Any], timeout: float = DEFAULT_TIMEOUT) -> None:
+    def __init__(self, server: Mapping[str, Any], timeout: float = DEFAULT_TIMEOUT, startup_timeout: float = STARTUP_TIMEOUT) -> None:
         self.server = dict(server)
         self.timeout = float(timeout)
+        self.startup_timeout = float(startup_timeout)
         self._next_id = 0
         self._lines: "queue.Queue[Optional[str]]" = queue.Queue()
-        env = dict(os.environ)
-        env.update(_resolve_env(self.server.get("env") or {}))
+        self.stderr_tail: Deque[str] = deque(maxlen=40)
+        # A server starts from a minimal environment: only what its declaration names reaches it, never the worker's keys.
+        env = minimal_env(_resolve_env(self.server.get("env") or {}))
         try:
             self.process = subprocess.Popen(
                 [self.server["command"], *self.server.get("args", [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env,
+                stderr=subprocess.PIPE, text=True, bufsize=1, env=env,
             )
         except OSError as exc:
             raise MCPError(f"cannot start MCP server {self.server.get('name')}: {redact_secrets(str(exc))[:200]}") from exc
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
+        self._err_reader = threading.Thread(target=self._pump_stderr, daemon=True)
+        self._err_reader.start()
         self.server_info: Dict[str, Any] = {}
 
     def _pump(self) -> None:
@@ -80,6 +87,15 @@ class MCPSession:
         for line in self.process.stdout:
             self._lines.put(line)
         self._lines.put(None)
+
+    def _pump_stderr(self) -> None:
+        assert self.process.stderr is not None
+        for line in self.process.stderr:
+            self.stderr_tail.append(line.rstrip()[:300])
+
+    def _stderr_note(self) -> str:
+        tail = " | ".join(line for line in list(self.stderr_tail)[-5:] if line.strip())
+        return f" (server stderr: {redact_secrets(tail)[:400]})" if tail else ""
 
     def _send(self, message: Mapping[str, Any]) -> None:
         assert self.process.stdin is not None
@@ -92,17 +108,18 @@ class MCPSession:
     def notify(self, method: str, params: Optional[Mapping[str, Any]] = None) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": dict(params or {})})
 
-    def request(self, method: str, params: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    def request(self, method: str, params: Optional[Mapping[str, Any]] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
         self._next_id += 1
         request_id = self._next_id
+        wait = float(timeout if timeout is not None else self.timeout)
         self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": dict(params or {})})
         while True:
             try:
-                line = self._lines.get(timeout=self.timeout)
+                line = self._lines.get(timeout=wait)
             except queue.Empty as exc:
-                raise MCPError(f"MCP server {self.server.get('name')} did not answer {method} within {int(self.timeout)} s") from exc
+                raise MCPError(f"MCP server {self.server.get('name')} did not answer {method} within {int(wait)} s{self._stderr_note()}") from exc
             if line is None:
-                raise MCPError(f"MCP server {self.server.get('name')} exited during {method}")
+                raise MCPError(f"MCP server {self.server.get('name')} exited during {method}{self._stderr_note()}")
             line = line.strip()
             if not line:
                 continue
@@ -121,7 +138,7 @@ class MCPSession:
     def initialize(self) -> Dict[str, Any]:
         self.server_info = self.request("initialize", {
             "protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "chat-johnson", "version": "1.0"},
-        })
+        }, timeout=self.startup_timeout)
         self.notify("notifications/initialized")
         return self.server_info
 
@@ -144,7 +161,11 @@ class MCPSession:
                 pass
 
     def __enter__(self) -> "MCPSession":
-        self.initialize()
+        try:
+            self.initialize()
+        except BaseException:
+            self.close()  # a failed handshake must not leave the server process behind
+            raise
         return self
 
     def __exit__(self, *exc_info: Any) -> None:
@@ -172,16 +193,16 @@ def find_server(name: str, servers: Optional[Sequence[Mapping[str, Any]]] = None
     raise MCPError(f"no MCP server named {name!r} is declared")
 
 
-def call(server_name: str, tool: str, arguments: Optional[Mapping[str, Any]] = None, servers: Optional[Sequence[Mapping[str, Any]]] = None, timeout: float = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+def call(server_name: str, tool: str, arguments: Optional[Mapping[str, Any]] = None, servers: Optional[Sequence[Mapping[str, Any]]] = None, timeout: float = DEFAULT_TIMEOUT, startup_timeout: float = STARTUP_TIMEOUT) -> Dict[str, Any]:
     """Spawn the server, call one tool, close it; returns the raw result plus its joined text."""
-    with MCPSession(find_server(server_name, servers), timeout=timeout) as session:
+    with MCPSession(find_server(server_name, servers), timeout=timeout, startup_timeout=startup_timeout) as session:
         result = session.call_tool(tool, arguments)
     return {"result": result, "text": result_text(result), "is_error": bool(result.get("isError"))}
 
 
 def probe(server: Mapping[str, Any], timeout: float = 15.0) -> Dict[str, Any]:
     try:
-        with MCPSession(server, timeout=timeout) as session:
+        with MCPSession(server, timeout=timeout, startup_timeout=max(timeout, 30.0)) as session:
             tools = session.list_tools()
         return {"ok": True, "tools": [str(t.get("name", "")) for t in tools], "error": ""}
     except MCPError as exc:

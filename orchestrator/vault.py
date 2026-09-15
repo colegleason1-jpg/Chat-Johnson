@@ -164,6 +164,19 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_scope_status ON jobs(project_scope, status, id DESC);
+CREATE TABLE IF NOT EXISTS job_secrets (
+    job_id INTEGER PRIMARY KEY,
+    blob BLOB NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS quota_usage (
+    key TEXT NOT NULL,
+    day TEXT NOT NULL,
+    tokens INTEGER NOT NULL DEFAULT 0,
+    requests INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (key, day)
+);
 """
 
 
@@ -185,6 +198,19 @@ def _ensure_column(connection: sqlite3.Connection, table: str, column: str, ddl:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
+class ScopeMismatch(ValueError):
+    """A row exists but belongs to another visitor's scope; the caller must never see it."""
+
+
+def _check_scope(connection: sqlite3.Connection, table: str, row_id: int, project_scope: Optional[str]) -> None:
+    """Defence in depth for id-addressed rows: when a scope is given, the row must carry it."""
+    if project_scope is None:
+        return
+    row = connection.execute(f"SELECT project_scope FROM {table} WHERE id = ?", (int(row_id),)).fetchone()
+    if row is not None and str(row["project_scope"]) != str(project_scope).strip():
+        raise ScopeMismatch(f"{table} {int(row_id)} belongs to another scope")
+
+
 def initialize_database() -> None:
     """Create the local schema idempotently and migrate older vaults to threads."""
     with _open_database() as connection:
@@ -200,6 +226,7 @@ def initialize_database() -> None:
         )
         _ensure_column(connection, "jobs", "run_after", "REAL NOT NULL DEFAULT 0")
         _ensure_column(connection, "jobs", "heartbeat_at", "REAL")
+        _ensure_column(connection, "mission_nodes", "project_scope", "TEXT NOT NULL DEFAULT ''")
         from .society.store import SOCIETY_SCHEMA_SQL  # local import: the society package imports this module
 
         connection.executescript(SOCIETY_SCHEMA_SQL)
@@ -260,8 +287,9 @@ def active_thread(project_scope: str, workspace: Optional[str] = None) -> sqlite
         return connection.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
 
 
-def thread_by_id(thread_id: int) -> Optional[sqlite3.Row]:
+def thread_by_id(thread_id: int, project_scope: Optional[str] = None) -> Optional[sqlite3.Row]:
     with _open_database() as connection:
+        _check_scope(connection, "threads", thread_id, project_scope)
         return connection.execute("SELECT * FROM threads WHERE id = ?", (int(thread_id),)).fetchone()
 
 
@@ -303,7 +331,7 @@ def create_thread(
         count = int(connection.execute(
             "SELECT COUNT(*) FROM threads WHERE project_scope = ? AND workspace = ?", (scope, ws)
         ).fetchone()[0])
-        safe_title = (title.strip() or f"Thread {count + 1}")[:120]
+        safe_title = redact_secrets(title.strip() or f"Thread {count + 1}")[:120]
         cursor = connection.execute(
             """
             INSERT INTO threads (project_scope, title, status, parent_thread_id, generation, workspace, created_at, updated_at)
@@ -315,31 +343,35 @@ def create_thread(
         return int(cursor.lastrowid)
 
 
-def switch_thread(thread_id: int) -> None:
+def switch_thread(thread_id: int, project_scope: Optional[str] = None) -> None:
     """Make ``thread_id`` the workspace's current thread without touching its status.
 
     A migrated thread stays labelled migrated (its digest chain is not forked);
     it simply becomes the one the workspace reads and appends to.
     """
     with _open_database() as connection:
+        _check_scope(connection, "threads", thread_id, project_scope)
         connection.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (time.time(), int(thread_id)))
 
 
-def rename_thread(thread_id: int, title: str) -> None:
+def rename_thread(thread_id: int, title: str, project_scope: Optional[str] = None) -> None:
     with _open_database() as connection:
-        connection.execute("UPDATE threads SET title = ? WHERE id = ?", ((title.strip() or "Untitled")[:120], int(thread_id)))
+        _check_scope(connection, "threads", thread_id, project_scope)
+        connection.execute("UPDATE threads SET title = ? WHERE id = ?", (redact_secrets(title.strip() or "Untitled")[:120], int(thread_id)))
 
 
-def set_thread_mission(thread_id: int, goal: str) -> None:
+def set_thread_mission(thread_id: int, goal: str, project_scope: Optional[str] = None) -> None:
     """Pin the Task Finder mission to the thread so it outlives window eviction and migration."""
     with _open_database() as connection:
-        connection.execute("UPDATE threads SET mission = ? WHERE id = ?", ((goal or "").strip()[:2000], int(thread_id)))
+        _check_scope(connection, "threads", thread_id, project_scope)
+        connection.execute("UPDATE threads SET mission = ? WHERE id = ?", (redact_secrets((goal or "").strip())[:2000], int(thread_id)))
 
 
-def set_thread_status(thread_id: int, status: str) -> None:
+def set_thread_status(thread_id: int, status: str, project_scope: Optional[str] = None) -> None:
     if status not in {"active", "migrated", "archived"}:
         raise ValueError("invalid thread status")
     with _open_database() as connection:
+        _check_scope(connection, "threads", thread_id, project_scope)
         connection.execute("UPDATE threads SET status = ?, updated_at = ? WHERE id = ?", (status, time.time(), int(thread_id)))
 
 
@@ -347,11 +379,12 @@ def _touch_thread(connection: sqlite3.Connection, thread_id: int) -> None:
     connection.execute("UPDATE threads SET updated_at = ? WHERE id = ?", (time.time(), int(thread_id)))
 
 
-def clear_thread(thread_id: int) -> int:
+def clear_thread(thread_id: int, project_scope: Optional[str] = None) -> int:
     """Move every active message of the thread to the archive (raw text kept). Keys are untouched."""
     now = time.time()
     with _open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        _check_scope(connection, "threads", thread_id, project_scope)
         rows = connection.execute("SELECT * FROM message_history WHERE thread_id = ?", (int(thread_id),)).fetchall()
         connection.executemany(
             """
@@ -375,7 +408,7 @@ def clear_thread(thread_id: int) -> int:
         return len(rows)
 
 
-def delete_thread(thread_id: int) -> Dict[str, int]:
+def delete_thread(thread_id: int, project_scope: Optional[str] = None) -> Dict[str, int]:
     """Remove a thread with its live window, archive, and summaries. Locked artifacts are project-level and stay.
 
     Clear keeps history in the archive; this is the operator's explicit "forget it" and is the only
@@ -386,10 +419,19 @@ def delete_thread(thread_id: int) -> Dict[str, int]:
         if connection.execute("SELECT id FROM threads WHERE id = ?", (int(thread_id),)).fetchone() is None:
             connection.rollback()
             raise ValueError(f"thread {int(thread_id)} does not exist")
+        _check_scope(connection, "threads", thread_id, project_scope)
         counts: Dict[str, int] = {}
-        for table in ("message_history", "message_archive", "summaries"):
+        for table in ("message_history", "message_archive", "summaries", "mission_nodes"):
             cursor = connection.execute(f"DELETE FROM {table} WHERE thread_id = ?", (int(thread_id),))
             counts[table] = int(cursor.rowcount)
+        # Finished jobs of the chat go with it; an active one keeps its row so the worker can end it cleanly.
+        finished = connection.execute(
+            "SELECT id FROM jobs WHERE thread_id = ? AND status IN ('done', 'failed', 'cancelled')", (int(thread_id),)
+        ).fetchall()
+        for job in finished:
+            connection.execute("DELETE FROM job_secrets WHERE job_id = ?", (int(job["id"]),))
+            connection.execute("DELETE FROM jobs WHERE id = ?", (int(job["id"]),))
+        counts["jobs"] = len(finished)
         connection.execute("UPDATE threads SET parent_thread_id = NULL WHERE parent_thread_id = ?", (int(thread_id),))
         connection.execute("DELETE FROM threads WHERE id = ?", (int(thread_id),))
         connection.commit()
@@ -817,8 +859,9 @@ def save_artifact(
         return int(cursor.lastrowid), version
 
 
-def artifact_by_id(artifact_id: int) -> Optional[sqlite3.Row]:
+def artifact_by_id(artifact_id: int, project_scope: Optional[str] = None) -> Optional[sqlite3.Row]:
     with _open_database() as connection:
+        _check_scope(connection, "artifact_store", artifact_id, project_scope)
         return connection.execute("SELECT * FROM artifact_store WHERE id = ?", (int(artifact_id),)).fetchone()
 
 
@@ -856,9 +899,10 @@ def search_messages(project_scope: str, thread_id: int, query: str, limit: int =
         ).fetchall())
 
 
-def messages_around(thread_id: int, message_id: int, before: int = 10, after: int = 10) -> List[sqlite3.Row]:
+def messages_around(thread_id: int, message_id: int, before: int = 10, after: int = 10, project_scope: Optional[str] = None) -> List[sqlite3.Row]:
     """The messages surrounding one message in its thread, oldest first (the navigator's jump target)."""
     with _open_database() as connection:
+        _check_scope(connection, "threads", thread_id, project_scope)
         earlier = connection.execute(
             "SELECT * FROM message_history WHERE thread_id = ? AND id <= ? ORDER BY id DESC LIMIT ?", (int(thread_id), int(message_id), int(before) + 1)
         ).fetchall()
@@ -868,9 +912,10 @@ def messages_around(thread_id: int, message_id: int, before: int = 10, after: in
     return list(reversed(earlier)) + list(later)
 
 
-def thread_outline(thread_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+def thread_outline(thread_id: int, limit: int = 200, project_scope: Optional[str] = None) -> List[Dict[str, Any]]:
     """One line per turn for the navigator: id, role, first words."""
     with _open_database() as connection:
+        _check_scope(connection, "threads", thread_id, project_scope)
         rows = connection.execute(
             "SELECT id, role, content, timestamp FROM message_history WHERE thread_id = ? ORDER BY id ASC LIMIT ?", (int(thread_id), int(limit))
         ).fetchall()
@@ -881,21 +926,25 @@ def thread_outline(thread_id: int, limit: int = 200) -> List[Dict[str, Any]]:
     return outline
 
 
-def save_mission_nodes(thread_id: int, plan: Sequence[Mapping[str, Any]]) -> int:
+def save_mission_nodes(thread_id: int, plan: Sequence[Mapping[str, Any]], project_scope: Optional[str] = None) -> int:
     """Store a chat's node graph (replacing the previous one) so it can be reopened and re-run."""
     now = time.time()
     with _open_database() as connection:
+        _check_scope(connection, "threads", thread_id, project_scope)
+        owner = connection.execute("SELECT project_scope FROM threads WHERE id = ?", (int(thread_id),)).fetchone()
+        scope = str(project_scope or (owner["project_scope"] if owner else "") or "")
         connection.execute("DELETE FROM mission_nodes WHERE thread_id = ?", (int(thread_id),))
         for position, node in enumerate(plan):
             connection.execute(
-                "INSERT INTO mission_nodes (thread_id, position, node, created_at) VALUES (?, ?, ?, ?)",
-                (int(thread_id), position, redact_secrets(json.dumps(dict(node), default=str)), now),
+                "INSERT INTO mission_nodes (thread_id, position, node, created_at, project_scope) VALUES (?, ?, ?, ?, ?)",
+                (int(thread_id), position, redact_secrets(json.dumps(dict(node), default=str)), now, scope),
             )
     return len(plan)
 
 
-def mission_nodes_for(thread_id: int) -> List[Dict[str, Any]]:
+def mission_nodes_for(thread_id: int, project_scope: Optional[str] = None) -> List[Dict[str, Any]]:
     with _open_database() as connection:
+        _check_scope(connection, "threads", thread_id, project_scope)
         rows = connection.execute("SELECT node FROM mission_nodes WHERE thread_id = ? ORDER BY position ASC", (int(thread_id),)).fetchall()
     nodes = []
     for row in rows:
@@ -906,9 +955,9 @@ def mission_nodes_for(thread_id: int) -> List[Dict[str, Any]]:
     return nodes
 
 
-def export_artifact(artifact_id: int) -> Tuple[str, str]:
+def export_artifact(artifact_id: int, project_scope: Optional[str] = None) -> Tuple[str, str]:
     """Return (suggested_filename, body) for a download or copy-out."""
-    row = artifact_by_id(artifact_id)
+    row = artifact_by_id(artifact_id, project_scope)
     if row is None:
         raise KeyError(f"artifact {artifact_id} not found")
     filename = row["file_path"].split("/")[-1] if row["file_path"] else row["name"]
@@ -1059,7 +1108,7 @@ def claim_job(worker: str, kinds: Sequence[str]) -> Optional[sqlite3.Row]:
 
 
 def update_job_progress(job_id: int, fields: Mapping[str, Any]) -> None:
-    """Merge ``fields`` into the job's progress JSON."""
+    """Merge ``fields`` into the job's progress JSON (redacted like every persisted string)."""
     with _open_database() as connection:
         row = connection.execute("SELECT progress FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
         if row is None:
@@ -1067,7 +1116,7 @@ def update_job_progress(job_id: int, fields: Mapping[str, Any]) -> None:
         progress = _job_json(row["progress"])
         progress.update(dict(fields))
         connection.execute(
-            "UPDATE jobs SET progress = ?, updated_at = ? WHERE id = ?", (json.dumps(progress, default=str), time.time(), int(job_id))
+            "UPDATE jobs SET progress = ?, updated_at = ? WHERE id = ?", (redact_secrets(json.dumps(progress, default=str)), time.time(), int(job_id))
         )
 
 
@@ -1075,13 +1124,14 @@ def ask_job_question(job_id: int, question: str) -> None:
     with _open_database() as connection:
         connection.execute(
             "UPDATE jobs SET status = 'waiting_input', question = ?, answer = NULL, updated_at = ? WHERE id = ? AND status = 'running'",
-            (str(question)[:2000], time.time(), int(job_id)),
+            (redact_secrets(str(question))[:2000], time.time(), int(job_id)),
         )
 
 
-def answer_job(job_id: int, answer: str) -> bool:
+def answer_job(job_id: int, answer: str, project_scope: Optional[str] = None) -> bool:
     """Operator's reply; True when the job was actually waiting."""
     with _open_database() as connection:
+        _check_scope(connection, "jobs", job_id, project_scope)
         cursor = connection.execute(
             "UPDATE jobs SET status = 'running', answer = ?, updated_at = ? WHERE id = ? AND status = 'waiting_input'",
             (redact_secrets(str(answer)), time.time(), int(job_id)),
@@ -1097,10 +1147,11 @@ def job_answer(job_id: int) -> Optional[str]:
     return str(row["answer"])
 
 
-def request_cancel(job_id: int) -> None:
+def request_cancel(job_id: int, project_scope: Optional[str] = None) -> None:
     """Cooperative cancel: a queued job ends now, a running one at its next check."""
     now = time.time()
     with _open_database() as connection:
+        _check_scope(connection, "jobs", job_id, project_scope)
         connection.execute(
             "UPDATE jobs SET status = 'cancelled', cancel_requested = 1, finished_at = ?, updated_at = ? WHERE id = ? AND status = 'queued'",
             (now, now, int(job_id)),
@@ -1125,11 +1176,59 @@ def finish_job(job_id: int, status: str, result: Mapping[str, Any]) -> None:
             "UPDATE jobs SET status = ?, result = ?, finished_at = ?, updated_at = ? WHERE id = ?",
             (final, redact_secrets(json.dumps(dict(result), default=str)), now, now, int(job_id)),
         )
+        connection.execute("DELETE FROM job_secrets WHERE job_id = ?", (int(job_id),))
 
 
-def job_by_id(job_id: int) -> Optional[sqlite3.Row]:
+def job_by_id(job_id: int, project_scope: Optional[str] = None) -> Optional[sqlite3.Row]:
     with _open_database() as connection:
+        _check_scope(connection, "jobs", job_id, project_scope)
         return connection.execute("SELECT * FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+
+
+def store_job_secrets(job_id: int, blob: bytes) -> None:
+    """Ciphertext only (see ``jobsecrets``); deleted when the worker claims the job or the job ends."""
+    with _open_database() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO job_secrets (job_id, blob, created_at) VALUES (?, ?, ?)", (int(job_id), sqlite3.Binary(bytes(blob)), time.time())
+        )
+
+
+def take_job_secrets(job_id: int) -> Optional[bytes]:
+    """Read and delete the blob in one transaction; None when there is none."""
+    with _open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT blob FROM job_secrets WHERE job_id = ?", (int(job_id),)).fetchone()
+        connection.execute("DELETE FROM job_secrets WHERE job_id = ?", (int(job_id),))
+        connection.commit()
+    return bytes(row["blob"]) if row is not None else None
+
+
+def has_job_secrets(job_id: int) -> bool:
+    with _open_database() as connection:
+        return connection.execute("SELECT 1 FROM job_secrets WHERE job_id = ?", (int(job_id),)).fetchone() is not None
+
+
+def purge_job_secrets(older_than_seconds: float = 3600.0) -> int:
+    """Blobs nobody claimed (a job that never ran) are dropped after an hour."""
+    with _open_database() as connection:
+        cursor = connection.execute("DELETE FROM job_secrets WHERE created_at < ?", (time.time() - float(older_than_seconds),))
+        return int(cursor.rowcount)
+
+
+def quota_usage_load(key: str, day: str) -> Tuple[int, int]:
+    with _open_database() as connection:
+        row = connection.execute("SELECT tokens, requests FROM quota_usage WHERE key = ? AND day = ?", (str(key), str(day))).fetchone()
+    return (int(row["tokens"]), int(row["requests"])) if row is not None else (0, 0)
+
+
+def quota_usage_add(key: str, day: str, tokens: int, requests: int) -> None:
+    with _open_database() as connection:
+        connection.execute(
+            "INSERT INTO quota_usage (key, day, tokens, requests, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(key, day) DO UPDATE SET tokens = tokens + excluded.tokens, requests = requests + excluded.requests, updated_at = excluded.updated_at",
+            (str(key), str(day), int(tokens), int(requests), time.time()),
+        )
+        connection.execute("DELETE FROM quota_usage WHERE updated_at < ?", (time.time() - 3 * 86_400.0,))
 
 
 def list_jobs(
@@ -1172,11 +1271,27 @@ def reap_stale_jobs(note: str, queued_before: Optional[float] = None) -> int:
         return int(cursor.rowcount)
 
 
-def touch_heartbeat(worker: str) -> int:
-    """A live worker stamps its running and waiting rows; stale stamps let another process reap them."""
+def touch_heartbeat(job_ids: Sequence[int]) -> int:
+    """A live worker stamps only the rows its threads are executing right now; stale stamps let another process reap them."""
+    ids = [int(value) for value in job_ids]
+    if not ids:
+        return 0
+    marks = ",".join("?" for _ in ids)
     with _open_database() as connection:
         cursor = connection.execute(
-            "UPDATE jobs SET heartbeat_at = ? WHERE worker = ? AND status IN ('running', 'waiting_input')", (time.time(), worker)
+            f"UPDATE jobs SET heartbeat_at = ? WHERE id IN ({marks}) AND status IN ('running', 'waiting_input')", (time.time(), *ids)
+        )
+        return int(cursor.rowcount)
+
+
+def fail_jobs_of_host(host_prefix: str, note: str, except_worker: str = "") -> int:
+    """Fail rows an earlier process of this host left running (a restarted container reuses its hostname)."""
+    now = time.time()
+    with _open_database() as connection:
+        cursor = connection.execute(
+            "UPDATE jobs SET status = 'failed', result = ?, finished_at = ?, updated_at = ? "
+            "WHERE status IN ('running', 'waiting_input') AND worker LIKE ? AND worker != ?",
+            (json.dumps({"error": note}), now, now, f"{host_prefix}%", except_worker),
         )
         return int(cursor.rowcount)
 
@@ -1216,12 +1331,12 @@ def health_check() -> Dict[str, Any]:
         return {"ok": False, "path": str(database_path()), "threads": 0, "messages": 0, "artifacts": 0, "error": f"{type(exc).__name__}: {exc}"[:200]}
 
 
-def export_thread(thread_id: int) -> Dict[str, Any]:
+def export_thread(thread_id: int, project_scope: Optional[str] = None) -> Dict[str, Any]:
     """Everything one chat holds, for review or hand-off: thread row, archived + live messages in order, summaries, digest.
 
     Nothing is written; content was redacted when it was stored, so an export never carries a key.
     """
-    thread = thread_by_id(int(thread_id))
+    thread = thread_by_id(int(thread_id), project_scope)
     if thread is None:
         raise ValueError(f"thread {int(thread_id)} does not exist")
     scope = str(thread["project_scope"])
@@ -1259,9 +1374,9 @@ def _stamp(value: Any) -> str:
         return "-"
 
 
-def thread_transcript(thread_id: int, fmt: str = "markdown") -> Tuple[str, str]:
+def thread_transcript(thread_id: int, fmt: str = "markdown", project_scope: Optional[str] = None) -> Tuple[str, str]:
     """Return (filename, body) for a chat download: ``markdown`` for reading, ``json`` for tooling."""
-    payload = export_thread(thread_id)
+    payload = export_thread(thread_id, project_scope)
     thread = payload["thread"]
     stem = f"chat-{_workspace(thread.get('workspace'))}-{int(thread['id'])}"
     if fmt == "json":

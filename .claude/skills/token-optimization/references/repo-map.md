@@ -9,18 +9,18 @@ Consult this map instead of sweeping the tree. Read only the files named for the
 | `orchestrator/discovery.py` | vendor model lists, preference order, retired/transient/unusable rules, backoff, validated discovery | vendor_for, discovered, looks_like_retired_model, is_transient, retry_delay, sleep, list_models, rank_models, looks_like_unusable_model, discover, alternates |
 | `orchestrator/providers.py` | legacy OpenAI-compatible + Gemini client with retries, model recovery, key redaction | ProviderError, metered, body_text, chat |
 | `orchestrator/config.py` | legacy provider registry, session key overlay (ContextVar), Settings, provider_model resolution | session_keys, bind_session_keys, set_session_key, clear_session_keys, resolve_secret, ProviderConfig, provider_api_key, daily_cap, provider_model, Settings, get_settings |
-| `orchestrator/quota.py` | QuotaLedger: RPM/TPM windows, tighten, record_attempt, record | Bucket, QuotaLedger |
-| `orchestrator/vault.py` | SQLite: threads per workspace, messages, window/texturize/archive, summaries, artifacts, health sweep, vision digest, migration | database_path, initialize_database, active_thread, thread_by_id, list_threads, create_thread, switch_thread, rename_thread, set_thread_mission, set_thread_status, clear_thread, delete_thread, estimate_tokens, redact_secrets |
+| `orchestrator/quota.py` | QuotaLedger: RPM/TPM windows, tighten, record_attempt, record | utc_day, seconds_to_utc_midnight, DailyStore, Bucket, QuotaLedger |
+| `orchestrator/vault.py` | SQLite: threads per workspace, messages, window/texturize/archive, summaries, artifacts, health sweep, vision digest, migration | database_path, ScopeMismatch, initialize_database, active_thread, thread_by_id, list_threads, create_thread, switch_thread, rename_thread, set_thread_mission, set_thread_status, clear_thread, delete_thread, estimate_tokens |
 | `orchestrator/missions.py` | deterministic mission classification + workstream templates for Task Finder | classify_mission, parse_length_target, words_per_step, writing_sections, mission_hints, task_plan, deliverable_slug, assemble_deliverable, text_measure, MissionBlockError, normalise_plan, parse_mission_block, mission_block |
 | `orchestrator/preview.py` | nh3 allowlist sanitizer + preview document + markup extraction | sanitize_markup, looks_like_markup, extract_preview_source, safe_preview_document |
 | `orchestrator/github_auth.py` | signed, time-limited OAuth state |  |
 | `orchestrator/connectors.py` | local SQLite connector + roadmap stubs (not enable-able) | ConnectorHealth, Connector, LocalSQLiteConnector, connector_status |
 | `orchestrator/executor.py` | repository pipeline: decompose → sandbox → patches → AST/pytest → diff | Orchestrator |
-| `orchestrator/sandbox.py` | git worktree / copy-mode sandbox, copy-mode difflib diff, AST guardrail | SandboxError, create_worktree, commit_sandbox, diff_vs_base, cleanup_worktree, prune_staging, validate_python_files |
-| `orchestrator/patches.py` | FILE-block / unified-diff parsing and safe application, changed_files | parse_file_blocks, looks_like_snippet, reject_snippets, parse_diff_blocks, apply_file_blocks, apply_unified_diffs, changed_files |
+| `orchestrator/sandbox.py` | git worktree / copy-mode sandbox, copy-mode difflib diff, AST guardrail | SandboxError, sandbox_source, create_worktree, commit_sandbox, diff_vs_base, cleanup_worktree, prune_staging, validate_python_files |
+| `orchestrator/patches.py` | FILE-block / unified-diff parsing and safe application, changed_files | parse_file_blocks, looks_like_snippet, reject_snippets, parse_diff_blocks, diff_paths, apply_file_blocks, apply_unified_diffs, is_git_sandbox, changed_files |
 | `orchestrator/decomposer.py` | LLM JSON step planner for the repository pipeline | decompose |
 | `orchestrator/test_loop.py` | pytest + traceback repair loop | run_pytest, repair_loop |
-| `orchestrator/repo_ingest.py` | token-budgeted repository serialization | walk_repo, serialize_repo, repo_prompt_context |
+| `orchestrator/repo_ingest.py` | token-budgeted repository serialization | is_secret_file, walk_repo, serialize_repo, repo_prompt_context |
 | `orchestrator/memory.py` | task memory JSON for the repository pipeline | StepRecord, TaskMemory |
 | `research/project_seth_phase3.py` | isolated Phase 3 research engine (no routing dependency) | ProjectSethConfig, TrajectoryResult, TrackSummary, PairedDelta, SweepAggregate, validate_config, confidence_interval_95, format_float, control_coefficient, drift, noise_gate, quintic_smootherstep, transition_fraction, transition_rate |
 | `cli.py` | status / chat / run commands | cmd_status, cmd_chat, cmd_run, main |
