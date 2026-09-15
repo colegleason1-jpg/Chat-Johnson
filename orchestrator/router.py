@@ -513,6 +513,8 @@ class MILPDecision:
     reason: str
     runner_up: str = ""                      # the feasible endpoint that would have served without the winner
     chaos: Dict[str, Any] = field(default_factory=dict)  # gain, profile, step, jitter of the winner (empty when no wave is active)
+    explored: bool = False                   # the wave sent this request to a runner-up to keep the estimates honest
+    learned: Dict[str, Any] = field(default_factory=dict)  # the learner's inputs for the chosen endpoint (empty when off)
 
 
 def _vendor(endpoint: "CortexEndpoint") -> str:
@@ -698,7 +700,18 @@ def _endpoint_usage(
     return EndpointUsage()
 
 
-def _utility_score(endpoint: CortexEndpoint, task_type: str, entropy_penalty: float) -> float:
+QUALITY_WEIGHT = 0.30  # learned quality shifts utility by QUALITY_WEIGHT * (posterior mean - 0.5): at most +-0.15
+
+
+def _utility_score(
+    endpoint: CortexEndpoint, task_type: str, entropy_penalty: float,
+    speed: Optional[float] = None, quality: Optional[float] = None, modulation: float = 0.0,
+) -> float:
+    """Task fit from speed and context ability, plus the task bonus, minus the bounded entropy penalty.
+
+    ``speed`` is the learner's measured value when one exists (the table value otherwise); ``quality``
+    is the learned posterior mean (0.5 is neutral); ``modulation`` is the dynamics layer's bounded term.
+    """
     context_weight = {
         "context_load": 0.92,
         "reasoning": 0.72,
@@ -707,11 +720,13 @@ def _utility_score(endpoint: CortexEndpoint, task_type: str, entropy_penalty: fl
         "quick_text": 0.12,
         "chat": 0.35,
     }.get(task_type, 0.35)
-    raw = (1.0 - context_weight) * endpoint.speed_score + context_weight * endpoint.context_score
+    speed_value = float(endpoint.speed_score if speed is None else speed)
+    raw = (1.0 - context_weight) * speed_value + context_weight * endpoint.context_score
     task_bonus = 0.10 if task_type in endpoint.strengths else 0.0
+    quality_term = QUALITY_WEIGHT * (max(0.0, min(1.0, float(quality))) - 0.5) if quality is not None else 0.0
     # Higher channel entropy is a bounded penalty, not a scientific claim that
     # the random realization measures provider quality.
-    return float(raw + task_bonus - 0.30 * max(0.0, min(1.0, entropy_penalty)))
+    return float(raw + task_bonus + quality_term + float(modulation) - 0.30 * max(0.0, min(1.0, entropy_penalty)))
 
 
 def _capacity_reasons(endpoint: CortexEndpoint, usage: EndpointUsage, estimated_tokens: int) -> List[str]:
@@ -841,7 +856,21 @@ def select_milp_endpoint(
     jitter = chaos.routing_jitter([endpoint.name for endpoint in endpoints], step=chaos_step) if chaos is not None else {}
     if jitter:
         penalties = {name: min(1.0, value + jitter.get(name, 0.0)) for name, value in penalties.items()}
-    utilities = {endpoint.name: _utility_score(endpoint, task_type, penalties[endpoint.name]) for endpoint in endpoints}
+    # The learner (measured speed, Bayesian quality, dynamics modulation) replaces the table constants when a scope is active.
+    from . import learner as learner_module  # local import: the learner reads this module lazily
+
+    active_learner = learner_module.current()
+    scores = active_learner.learned_scores(task_type, endpoints) if active_learner is not None else {}
+    physics = active_learner.modulation(endpoints, usage) if active_learner is not None else {}
+    utilities = {
+        endpoint.name: _utility_score(
+            endpoint, task_type, penalties[endpoint.name],
+            speed=scores[endpoint.name].speed if scores else None,
+            quality=scores[endpoint.name].quality_mean if scores else None,
+            modulation=physics.get(endpoint.name, 0.0),
+        )
+        for endpoint in endpoints
+    }
     feasible = [endpoint for endpoint in endpoints if endpoint.name not in blocked]
 
     decision_vector: Dict[str, int]
@@ -877,13 +906,33 @@ def select_milp_endpoint(
         # Equal utilities: the wave breaks the tie (lowest jitter first) instead of table order.
         chosen = max(feasible, key=lambda endpoint: (utilities[endpoint.name], -jitter.get(endpoint.name, 0.0), -endpoints.index(endpoint)))
 
-    decision_vector = {endpoint.name: int(endpoint.name == chosen.name) for endpoint in endpoints}
-    chaos_note = f"; chaos={chaos.profile('routing')} jitter={jitter.get(chosen.name, 0.0):.4f}" if jitter else ""
+    # Pink-wave exploration: on the steps the wave marks, a feasible runner-up inside the regret bound serves instead,
+    # so the quality priors of the endpoints that rarely win keep being measured. The capacity rows are untouched.
     others = [endpoint for endpoint in feasible if endpoint.name != chosen.name]
     runner_up = max(others, key=lambda endpoint: (utilities[endpoint.name], -endpoints.index(endpoint))).name if others else ""
+    explored = False
+    explore_rate = 0.0
+    winner_name = chosen.name
+    if active_learner is not None and chaos is not None and jitter:
+        explore_rate = active_learner.explore_rate(chaos.gain)
+        if chaos.explore(chaos_step, explore_rate):
+            alternative = active_learner.choose_exploration(feasible, utilities, chosen.name, task_type)
+            if alternative is not None:
+                chosen, explored, runner_up = alternative, True, winner_name
+    decision_vector = {endpoint.name: int(endpoint.name == chosen.name) for endpoint in endpoints}
+    chaos_note = f"; chaos={chaos.profile('routing')} jitter={jitter.get(chosen.name, 0.0):.4f}" if jitter else ""
     chaos_state = (
         {"gain": chaos.gain, "profile": chaos.profile("routing"), "step": chaos_step, "jitter": jitter.get(chosen.name, 0.0)} if jitter else {}
     )
+    learned: Dict[str, Any] = {}
+    if scores:
+        score = scores[chosen.name]
+        learned = {
+            "speed": round(score.speed, 4), "p50_ms": score.p50_ms, "quality": round(score.quality_mean, 4), "quality_std": round(score.quality_std, 4),
+            "modulation": physics.get(chosen.name, 0.0), "explore_rate": round(explore_rate, 4),
+        }
+    learned_note = f"; learner speed={learned['speed']} quality={learned['quality']} modulation={learned['modulation']:+.3f}" if learned else ""
+    explored_note = f"; explored runner-up (rate {explore_rate:.3f}, winner was {winner_name})" if explored else ""
     return MILPDecision(
         endpoint=chosen,
         decision_vector=decision_vector,
@@ -893,10 +942,12 @@ def select_milp_endpoint(
         reason=(
             f"selected {chosen.name}; utility={utilities[chosen.name]:.4f}; "
             f"entropy_penalty={penalties[chosen.name]:.4f}; binary={decision_vector}{chaos_note}"
-            + (f"; runner_up={runner_up}" if runner_up else "")
+            + (f"; runner_up={runner_up}" if runner_up else "") + learned_note + explored_note
         ),
         runner_up=runner_up,
         chaos=chaos_state,
+        explored=explored,
+        learned=learned,
     )
 
 
@@ -1353,6 +1404,7 @@ def cortex_generate(
                 decision_vector=decision.decision_vector,
                 runner_up=decision.runner_up,
                 chaos=dict(decision.chaos),
+                explored=decision.explored,
             )
             return text, route_decision
         except ProviderError as exc:
@@ -1396,6 +1448,7 @@ class CortexStream:
             decision_vector=self.milp.decision_vector,
             runner_up=self.milp.runner_up,
             chaos=dict(self.milp.chaos),
+            explored=self.milp.explored,
         )
         self.text = ""
         self.status: Dict[str, Any] = {}
@@ -1648,6 +1701,7 @@ class RouteDecision:
     finish: str = ""  # "length" when the output budget cut the answer, "filtered" when the vendor did, else vendor value
     runner_up: str = ""  # what Cortex 2 would have chosen instead (the counterfactual for the outcome log)
     chaos: Dict[str, Any] = field(default_factory=dict)  # the pink-wave state behind this decision
+    explored: bool = False  # the wave routed this send to a runner-up on purpose
 
 
 def classify(text: str) -> str:

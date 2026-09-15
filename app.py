@@ -51,7 +51,7 @@ from orchestrator.discovery import vendor_for
 from orchestrator.envsafe import self_hosted
 from orchestrator.errors import plain_error
 from orchestrator.executor import Orchestrator
-from orchestrator import pinkwave, proctor
+from orchestrator import dynamics, learner, pinkwave, proctor
 from orchestrator.society import economy as society_economy
 from orchestrator import mission_runner  # noqa: F401  (registers the mission job handler)
 from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner, secrets_deliverable
@@ -1123,6 +1123,7 @@ def log_route(
             str(st.session_state.get("project_scope", "chat-johnson")), workspace or "", task_type, route, mode, elapsed_ms, finish, reason,
             runner_up=getattr(decision, "runner_up", "") if decision is not None else "",
             chaos=getattr(decision, "chaos", None) if decision is not None else None, message_id=message_id, fragility=fragility,
+            explored=bool(getattr(decision, "explored", False)) if decision is not None else False,
         )
     except Exception:  # telemetry must never break a send
         pass
@@ -2457,6 +2458,29 @@ def render_routing_log() -> None:
             st.caption("p10 is the early tail (one path in ten caps by then); early cappers are paths that cap two hours before the median: the bursts to smooth.")
     else:
         st.caption("Add a Cortex key (Gemini, Groq, or Hugging Face) to simulate routing and forecast the day's budget.")
+    st.markdown("#### Cortex learner")
+    if cortex_available():
+        try:
+            learned = learner.report(scope, list(TASK_TYPES))
+        except Exception as exc:
+            learned = None
+            st.warning(plain_error(exc))
+        if learned:
+            exploration = learned["exploration"]
+            st.caption(
+                f"Learner {'on' if learned['settings'].enabled else 'off'} · laws: {', '.join(learned['settings'].laws) or 'none'} · "
+                f"exploration configured {exploration['configured_rate']:.1%} vs observed {exploration['observed_rate']:.1%} over "
+                f"{exploration['sends_with_wave']} wave-on send(s), {exploration['explored']} explored · last used: {learned['last_used'] or 'none'}"
+            )
+            st.dataframe(learned["rows"], hide_index=True, use_container_width=True)
+        dependency = dynamics.pairwise_statistics(dynamics.endpoint_series(scope), prefer_pyspi=True)
+        if dependency.pairs:
+            st.caption(f"Pairwise latency dependencies ({dependency.backend}, {dependency.bins} five-minute bins): correlation, lagged cross-correlation, transfer entropy.")
+            st.dataframe(dependency.rows(), hide_index=True, use_container_width=True)
+        else:
+            st.caption("Pairwise dependencies appear once two endpoints have answered sends in at least eight five-minute bins of the last day.")
+    else:
+        st.caption("The learner reports once a Cortex key is set.")
     if recent_routes(scope, limit=1):
         st.download_button(
             "⬇ Routing log (.csv, up to 5000 rows)", data=routes_csv(scope), file_name=f"routing-log-{scope}.csv", mime="text/csv",
@@ -2630,6 +2654,24 @@ with st.sidebar:
                 st.success("Saved for this project; the worker reads the same settings.")
         preview = pinkwave.Chaos(st.session_state.project_scope, chaos_settings).preview()
         st.caption(" · ".join(f"{f}: {v['profile']} step {v['step']} → {v['unit']:.2f}" for f, v in preview.items()))
+    with st.expander("Cortex learner (measured speed, quality priors, exploration)", expanded=False):
+        learner_settings = learner.settings_for(st.session_state.project_scope)
+        st.caption(
+            "Cortex 2 scores endpoints from measurements: speed from the recorded p50 latency, quality from a Beta prior per "
+            "endpoint and task type that your thumbs and locked artifacts update, plus bounded constraint-law terms "
+            "(dissipation, friction, momentum, coupling). At gain g the pink wave sends explore_max x g of requests to a feasible "
+            "runner-up inside the regret bound. Capacity rows, keys, and timeouts are never touched."
+        )
+        with st.form("learner_form"):
+            learner_on = st.checkbox("Learner on", value=learner_settings.enabled, key="learner_enabled")
+            explore_max = st.slider("Exploration share at gain 1 (%)", 0, 50, int(round(learner_settings.explore_max * 100)), key="learner_explore")
+            laws = st.multiselect("Constraint laws", list(dynamics.LAWS), default=list(learner_settings.laws), key="learner_laws")
+            if st.form_submit_button("Save learner settings"):
+                learner.save_settings(st.session_state.project_scope, learner_on, explore_max / 100, laws)
+                st.success("Saved for this project; the worker reads the same settings.")
+        if st.button("Rebuild quality priors from the outcome log", key="learner_rebuild"):
+            folded = learner.rebuild_priors(st.session_state.project_scope)
+            st.caption(f"{folded} verdict(s) folded into the priors.")
     st.subheader("Thread health agent")
     st.checkbox(
         "Auto-migrate heavy threads",

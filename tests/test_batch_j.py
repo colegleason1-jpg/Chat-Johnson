@@ -146,4 +146,4 @@ def test_route_log_keeps_the_fragility_and_the_comparison_averages_it(db):
     vault.record_route(db, "normal_chat", "chat", "groq/m", "normal", 100, "", "r", message_id=3)
     comparison = {r["setting"]: r for r in vault.chaos_comparison(db)}
     assert comparison["chaos on"]["mean_fragility"] == 0.5 and comparison["chaos off"]["mean_fragility"] is None
-    assert vault.routes_csv(db).splitlines()[0].endswith(",outcome,fragility") and ",0.25" in vault.routes_csv(db)
+    assert ",outcome,fragility" in vault.routes_csv(db).splitlines()[0] and ",0.25" in vault.routes_csv(db)

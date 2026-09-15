@@ -133,7 +133,19 @@ CREATE TABLE IF NOT EXISTS route_log (
     jitter REAL NOT NULL DEFAULT 0,
     outcome TEXT NOT NULL DEFAULT '',
     message_id INTEGER,
-    fragility REAL
+    fragility REAL,
+    explored INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS quality_priors (
+    project_scope TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    alpha REAL NOT NULL DEFAULT 2,
+    beta REAL NOT NULL DEFAULT 2,
+    observations INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (project_scope, endpoint, task_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_route_log_scope_time
@@ -257,6 +269,7 @@ def initialize_database() -> None:
         for column, ddl in (
             ("runner_up", "TEXT NOT NULL DEFAULT ''"), ("chaos_gain", "REAL NOT NULL DEFAULT 0"), ("chaos_profile", "TEXT NOT NULL DEFAULT ''"),
             ("jitter", "REAL NOT NULL DEFAULT 0"), ("outcome", "TEXT NOT NULL DEFAULT ''"), ("message_id", "INTEGER"), ("fragility", "REAL"),
+            ("explored", "INTEGER NOT NULL DEFAULT 0"),
         ):
             _ensure_column(connection, "route_log", column, ddl)
         _ensure_recall_index(connection)
@@ -1304,6 +1317,7 @@ ROUTE_OUTCOMES = ("up", "down", "locked")
 def record_route(
     project_scope: str, workspace: str, task_type: str, route: str, mode: str, ms: int, finish: str = "", reason: str = "",
     runner_up: str = "", chaos: Optional[Mapping[str, Any]] = None, message_id: Optional[int] = None, fragility: Optional[float] = None,
+    explored: bool = False,
 ) -> int:
     """One row per send: where it went, how long it took, how it ended, why the solver chose it, what it would have chosen
     otherwise (``runner_up``), and the pink-wave state (``chaos``: gain, profile, jitter); ``message_id`` lets an outcome
@@ -1314,13 +1328,13 @@ def record_route(
         cursor = connection.execute(
             """
             INSERT INTO route_log (timestamp, project_scope, workspace, task_type, route, mode, ms, finish, reason,
-                                   runner_up, chaos_gain, chaos_profile, jitter, message_id, fragility)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   runner_up, chaos_gain, chaos_profile, jitter, message_id, fragility, explored)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (time.time(), scope, (workspace or "")[:40], (task_type or "")[:40], (route or "")[:120], (mode or "normal")[:40],
              max(0, int(ms)), (finish or "")[:40], redact_secrets(reason or "")[:300], str(runner_up or "")[:120],
              float(chaos.get("gain", 0.0) or 0.0), str(chaos.get("profile", "") or "")[:20], float(chaos.get("jitter", 0.0) or 0.0),
-             int(message_id) if message_id is not None else None, float(fragility) if fragility is not None else None),
+             int(message_id) if message_id is not None else None, float(fragility) if fragility is not None else None, int(bool(explored))),
         )
         connection.commit()
         return int(cursor.lastrowid)
@@ -1335,8 +1349,69 @@ def set_route_outcome(project_scope: str, message_id: int, outcome: str) -> int:
         cursor = connection.execute(
             "UPDATE route_log SET outcome = ? WHERE project_scope = ? AND message_id = ?", (outcome, scope, int(message_id))
         )
+        rows = connection.execute(
+            "SELECT route, task_type FROM route_log WHERE project_scope = ? AND message_id = ?", (scope, int(message_id))
+        ).fetchall()
         connection.commit()
-        return int(cursor.rowcount)
+    from . import learner  # local import: the learner reads this module lazily
+
+    for row in rows:
+        learner.observe_outcome(scope, str(row["route"]).split("/")[0], str(row["task_type"]), outcome)
+    return int(cursor.rowcount)
+
+
+def quality_priors_for(project_scope: str) -> Dict[Tuple[str, str], Tuple[float, float, int]]:
+    scope = project_scope.strip() or "default"
+    with _open_database() as connection:
+        rows = connection.execute("SELECT endpoint, task_type, alpha, beta, observations FROM quality_priors WHERE project_scope = ?", (scope,)).fetchall()
+    return {(str(r["endpoint"]), str(r["task_type"])): (float(r["alpha"]), float(r["beta"]), int(r["observations"])) for r in rows}
+
+
+def quality_prior_update(project_scope: str, endpoint: str, task_type: str, delta_alpha: float, delta_beta: float) -> Tuple[float, float, int]:
+    """Fold one verdict into a Beta(alpha, beta) prior; returns the posterior parameters and the count."""
+    scope = project_scope.strip() or "default"
+    with _open_database() as connection:
+        connection.execute(
+            "INSERT INTO quality_priors (project_scope, endpoint, task_type, alpha, beta, observations, updated_at) VALUES (?, ?, ?, 2, 2, 0, ?) "
+            "ON CONFLICT(project_scope, endpoint, task_type) DO NOTHING",
+            (scope, endpoint[:60], task_type[:40], time.time()),
+        )
+        connection.execute(
+            "UPDATE quality_priors SET alpha = alpha + ?, beta = beta + ?, observations = observations + 1, updated_at = ? "
+            "WHERE project_scope = ? AND endpoint = ? AND task_type = ?",
+            (float(delta_alpha), float(delta_beta), time.time(), scope, endpoint[:60], task_type[:40]),
+        )
+        row = connection.execute(
+            "SELECT alpha, beta, observations FROM quality_priors WHERE project_scope = ? AND endpoint = ? AND task_type = ?", (scope, endpoint[:60], task_type[:40])
+        ).fetchone()
+        connection.commit()
+    return float(row["alpha"]), float(row["beta"]), int(row["observations"])
+
+
+def quality_priors_reset(project_scope: str) -> int:
+    with _open_database() as connection:
+        cursor = connection.execute("DELETE FROM quality_priors WHERE project_scope = ?", (project_scope.strip() or "default",))
+        connection.commit()
+    return int(cursor.rowcount)
+
+
+def endpoint_latency_stats(project_scope: str, hours: float = 72.0) -> Dict[str, Dict[str, float]]:
+    """Per endpoint (the route's provider part), the number of answered sends and their p50 latency over the window."""
+    buckets: Dict[str, List[int]] = {}
+    for row in recent_routes(project_scope, limit=5000, hours=hours):
+        route = str(row["route"])
+        if route == "failed":
+            continue
+        buckets.setdefault(route.split("/")[0], []).append(int(row["ms"]))
+    return {name: {"n": len(values), "p50_ms": float(_percentile(values, 0.5))} for name, values in buckets.items()}
+
+
+def exploration_stats(project_scope: str, hours: float = 168.0) -> Dict[str, Any]:
+    """How often the learner explored over the window, against the sends made with the wave on."""
+    rows = recent_routes(project_scope, limit=5000, hours=hours)
+    with_wave = [r for r in rows if "chaos_gain" in r.keys() and float(r["chaos_gain"] or 0.0) > 0.0 and str(r["route"]) != "failed"]
+    explored = sum(1 for r in with_wave if "explored" in r.keys() and int(r["explored"] or 0))
+    return {"sends_with_wave": len(with_wave), "explored": explored, "observed_rate": round(explored / len(with_wave), 4) if with_wave else 0.0}
 
 
 def chaos_comparison(project_scope: str, hours: float = 168.0) -> List[Dict[str, Any]]:
@@ -1346,8 +1421,9 @@ def chaos_comparison(project_scope: str, hours: float = 168.0) -> List[Dict[str,
     for row in rows:
         keys = row.keys()
         gain = float(row["chaos_gain"]) if "chaos_gain" in keys and row["chaos_gain"] is not None else 0.0
-        bucket = buckets.setdefault("chaos on" if gain > 0 else "chaos off", {"sends": 0, "failed": 0, "truncated": 0, "ms": [], "up": 0, "down": 0, "locked": 0, "runner_up_differs": 0, "fragility": []})
+        bucket = buckets.setdefault("chaos on" if gain > 0 else "chaos off", {"sends": 0, "failed": 0, "truncated": 0, "ms": [], "up": 0, "down": 0, "locked": 0, "runner_up_differs": 0, "fragility": [], "explored": 0})
         bucket["sends"] += 1
+        bucket["explored"] += int(row["explored"] or 0) if "explored" in keys else 0
         if "fragility" in keys and row["fragility"] is not None:
             bucket["fragility"].append(float(row["fragility"]))
         bucket["failed"] += int(str(row["route"]) == "failed")
@@ -1371,6 +1447,7 @@ def chaos_comparison(project_scope: str, hours: float = 168.0) -> List[Dict[str,
             "good_rate": round((bucket["up"] + bucket["locked"]) / sends, 3), "down_rate": round(bucket["down"] / sends, 3),
             "runner_up_differs": bucket["runner_up_differs"],
             "mean_fragility": round(sum(bucket["fragility"]) / len(bucket["fragility"]), 3) if bucket["fragility"] else None,
+            "explored": bucket["explored"],
         })
     return out
 
@@ -1430,13 +1507,13 @@ def route_stats(project_scope: str, hours: float = 24.0) -> List[Dict[str, Any]]
 
 
 def routes_csv(project_scope: str, limit: int = 5000) -> str:
-    header = "id,timestamp_utc,workspace,task_type,route,mode,ms,finish,reason,runner_up,chaos_gain,chaos_profile,jitter,outcome,fragility"
+    header = "id,timestamp_utc,workspace,task_type,route,mode,ms,finish,reason,runner_up,chaos_gain,chaos_profile,jitter,outcome,fragility,explored"
     lines = [header]
     for row in reversed(recent_routes(project_scope, limit=limit)):
         keys = row.keys()
         reason = str(row["reason"]).replace('"', "'").replace("\n", " ")
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(row["timestamp"])))
-        extra = ",".join(str(row[k] if k in keys and row[k] is not None else "") for k in ("runner_up", "chaos_gain", "chaos_profile", "jitter", "outcome", "fragility"))
+        extra = ",".join(str(row[k] if k in keys and row[k] is not None else "") for k in ("runner_up", "chaos_gain", "chaos_profile", "jitter", "outcome", "fragility", "explored"))
         lines.append(f"{row['id']},{stamp},{row['workspace']},{row['task_type']},{row['route']},{row['mode']},{row['ms']},{row['finish']},\"{reason}\",{extra}")
     return "\n".join(lines) + "\n"
 

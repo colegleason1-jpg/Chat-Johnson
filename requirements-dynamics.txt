@@ -1,0 +1,4 @@
+# Optional: pyspi (Python toolkit of Statistics for Pairwise Interactions) for the learner's pairwise
+# dependency table. It is heavy (scikit-learn, statsmodels, optional Java for JIDT estimators) and never
+# needed on the free tier: without it orchestrator/dynamics.py uses its built-in numpy estimators.
+pyspi>=1.0

@@ -83,6 +83,9 @@ def test_routing_jitter_never_moves_a_clear_winner_or_a_blocked_endpoint(db, mon
     monkeypatch.setenv("GEMINI_API_KEY", "AIza-fake")
     monkeypatch.setenv("GROQ_API_KEY", "gsk-fake")
     zero = {name: 0.0 for name in CORTEX_ENDPOINTS}
+    from orchestrator import learner
+
+    learner.save_settings(db, False, 0.1, ())  # this test is about the jitter alone; the learner's exploration is covered in batch L
     pinkwave.activate(db, pinkwave.ChaosSettings(gain=1.0))
     for _ in range(12):
         decision = select_milp_endpoint("context_load", 2_000, entropy_by_endpoint=zero)

@@ -91,6 +91,17 @@ def unit(feature: str, step: int, profile: str = "pink", seed: Optional[int] = N
     return 0.5 * (1.0 + math.tanh(signal(feature, step, profile, seed) / 2.0))
 
 
+@lru_cache(maxsize=64)
+def explore_threshold(profile: str, rate: float) -> float:
+    """The unit level above which exactly ``round(rate * LENGTH)`` steps of one walk fall (the exploration gate)."""
+    if rate <= 0.0:
+        return float("inf")
+    seed = zlib.crc32(b"explore") & 0xFFFFFFFF
+    units = sorted(0.5 * (1.0 + math.tanh(v / 2.0)) for v in _series(profile if profile in PROFILES else "pink", seed))
+    index = max(0, min(len(units) - 1, len(units) - int(round(rate * len(units)))))
+    return units[index] if rate < 1.0 else -1.0
+
+
 def settings_for(project_scope: str) -> ChaosSettings:
     from . import vault  # local import: vault is imported lazily so this module stays import-light
 
@@ -149,6 +160,13 @@ class Chaos:
         value = self.unit("heavy", step)
         draft = min(1.0, float(base_temperature) + self.gain * HEAVY_DRAFT_SPREAD * value)
         return (round(draft, 3), HEAVY_CRITIQUE_TEMPERATURE, float(base_temperature))
+
+    def explore(self, step: int, rate: float) -> bool:
+        """True on the steps the wave marks for exploration: a share ``rate`` of one walk, clustered by the 1/f correlation."""
+        if rate <= 0.0 or self.gain <= 0.0:
+            return False
+        profile = self.profile("routing")
+        return unit("explore", int(step), profile) >= explore_threshold(profile, float(rate))
 
     def recall_share(self, step: Optional[int] = None) -> float:
         """Fraction of the prompt budget for long-distance recall: the base share plus a bounded wave term."""

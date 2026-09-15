@@ -53,6 +53,8 @@ approved reconstruction plan.
 | `orchestrator/memory.py` | Task memory persisted to disk (one file per project scope) |
 | `orchestrator/pinkwave.py` | Controlled chaos: the 1/f signal walked per use at three frequency profiles; bounded nudges for routing, Heavy Mode, recall, digests |
 | `orchestrator/proctor.py` | Monte Carlo proctor: routing fragility over pink-wave realizations, bursty budget forecast, the tick's deferral rule |
+| `orchestrator/learner.py` | Cortex 2 as a learner: measured speed, Bayesian quality priors from verdicts, pink-wave exploration, per-scope settings |
+| `orchestrator/dynamics.py` | Pairwise statistics between endpoint latency series (built-in or pyspi) and the bounded constraint-law modulation |
 | `orchestrator/society/` | Two companies on Traction/EOS (cycles, EOS scorecard, release waves, manuscripts) and the agent society (academy, tick, leisure) |
 | `research/project_seth_phase3.py` | Project Seth Phase 3 distribution and bias-sweep engine (research only) |
 | `docs/` | Bible, recovery audit, implementation plan, strategic outline |
@@ -187,6 +189,7 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | Self-Correcting Execution Sandbox for chat output | Roadmap · exists only inside the repository pipeline |
 | Cross-thread semantic search | Implemented as long-distance memory: FTS5/BM25 over the project's other chats (summaries, digests, missions, artifact summaries) with recency decay and superseding, in every prompt and every vision digest; no embedding index |
 | Controlled chaos: the validated 1/f signal applied across routing, Heavy Mode, memory recall, and migration | Implemented · bounded nudges only, per-project gain and frequency profiles, gain 0 is deterministic |
+| Cortex 2 as an empirical learner: measured speed, Bayesian quality from verdicts, pink-wave exploration, constraint-law dynamics | Implemented · bounded terms, hard limits untouched, exploration rate verified in the outcome log |
 | Society: per-project product briefs, per-company release waves, every seat's title/roles/KPIs and every persona editable | Implemented |
 | Capability card in every prompt (what the app can and cannot do) and memory as real chat turns | Implemented |
 | Repository Work hub connector: fetch a GitHub repository through the API (public, or private with the armed token) into a temporary sandbox, run the pipeline, download the patch, push the change as a branch plus pull request; four tabs (Work, Deploy Kit, GitHub, Directions) | Implemented · tests of the fetched repository run only when ticked |
@@ -292,6 +295,17 @@ HTTP status, key fingerprint, and any auto-switch. Probes count toward the vendo
   cold critique, base synthesis); the long-distance recall share and the digest's cross-chat section
   grow with the wave. Gain and profiles are per project (sidebar → Controlled chaos) and shared with
   the worker; gain 0 is fully deterministic. A bounded signal, never an optimization claim.
+- **Cortex learner** (`orchestrator/learner.py`, `orchestrator/dynamics.py`): Cortex 2's hand-tuned
+  speed constant is replaced by the recorded p50 latency per endpoint (blended toward the table while
+  observations are few), and a Beta prior per endpoint and task type, updated by thumbs and locked
+  artifacts, shifts utility by at most ±0.15. Constraint-law analogies (dissipation, friction,
+  momentum, coupling) add a bounded ±0.10 from load, telemetry, and the pairwise statistics of the
+  endpoints' latency series (Pearson, lagged cross-correlation, transfer entropy; `pyspi` when
+  installed, built-in estimators otherwise). Exploration is the pink wave's job: at gain g a share
+  `explore_max × g` of sends goes to the feasible runner-up whose quality is least certain, inside a
+  regret bound and never for context-heavy requests; the outcome log records every exploration so
+  the observed rate is checked against the configured one. Every capacity row, key, timeout, and
+  daily cap is evaluated before any of this and is never moved by it.
 - **Monte Carlo proctor** (`orchestrator/proctor.py`): statistics a single run cannot give, never a
   decision by itself. *Routing fragility* re-runs Cortex 2 over 2,048 pink-wave realizations at 1×, 2×, 4×,
   and 8× chaos (the selector's own capacity rows, evaluated once, then an exact argmax per path) and

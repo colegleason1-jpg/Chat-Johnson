@@ -136,6 +136,19 @@
   and runner-up disagreements between sends made at gain > 0 and at gain 0. Run a week at each
   setting before changing the bounds; `docs/MONTE_CARLO_PROCTOR.md` lists the next candidates.
 
+## Cortex learner
+- Sidebar → *Cortex learner*: on/off, the exploration share at gain 1 (default 10 %), the constraint
+  laws in force. Settings live per project scope (`settings` table); the worker reads them.
+- Speed: p50 latency per endpoint from `route_log` over 72 h, blended toward the table value with
+  weight n/(n+10). Quality: `quality_priors` (Beta, prior 2/2) updated by thumbs and locks through
+  `set_route_outcome`; *Rebuild quality priors from the outcome log* recomputes them.
+- Exploration: `route_log.explored` marks the sends the wave routed to a runner-up; the routing
+  expander shows configured vs observed rate (over a full walk of the wave the two match exactly; over
+  a short window the 1/f clustering makes them differ). No exploration for `context_load`, none when
+  the runner-up trails by more than 0.25 utility, none at gain 0.
+- Dynamics: the pairwise table needs two endpoints with sends in at least eight five-minute bins of
+  the last day; `pip install -r requirements-dynamics.txt` switches the estimators to pyspi.
+
 ## Monte Carlo proctor
 - Routing expander → *Run routing fragility report*: 2,048 paths per amplification (x1/x2/x4/x8) for a
   task type; win rates per endpoint, decision entropy in bits against the maximum the feasible set allows,
