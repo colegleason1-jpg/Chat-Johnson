@@ -70,6 +70,20 @@
   inside the app process (`CHAT_JOHNSON_JOB_WORKERS`, default 2). A reboot fails every unfinished
   job with a "restarted" note, since its session keys died with the process; launch it again.
 
+## Vault snapshots (Supabase Storage)
+- Supabase project → Storage → a **private** bucket `chat-johnson-vault`; Project Settings → API → the
+  service key. On Streamlit Cloud put `CHAT_JOHNSON_SUPABASE_URL` and `CHAT_JOHNSON_SUPABASE_KEY` in
+  the app secrets; on the VM put them in `.env` (the worker uploads, the app restores).
+- Startup: a fresh vault (no threads, no artifacts) is replaced by the bucket's snapshot before the
+  first query; a vault that holds work is never overwritten automatically. Sidebar → *Vault snapshots*
+  shows the last upload and restore, *Snapshot now* uploads at once, *Restore from bucket* needs the
+  confirmation box and a page reload afterwards.
+- The uploader runs every `CHAT_JOHNSON_VAULT_SNAPSHOT_MINUTES` (default 10) and only when the vault
+  changed; a failed upload is shown in the sidebar and never blocks the app. The snapshot holds every
+  visitor's chats: keep the bucket private and the key a service key.
+- A free Supabase project pauses after a week without database activity; unpause it in the dashboard
+  (the Storage API is down while paused, and the app keeps running on its local vault meanwhile).
+
 ## Repository sandboxes
 - Fetched GitHub trees and pipeline sandboxes live under the temp directory (`chatjohnson-repos`,
   `chat_johnson_worktrees`). Trees older than six hours and sandboxes older than two are removed

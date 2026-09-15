@@ -54,6 +54,7 @@ approved reconstruction plan.
 | `orchestrator/pinkwave.py` | Controlled chaos: the 1/f signal walked per use at three frequency profiles; bounded nudges for routing, Heavy Mode, recall, digests |
 | `orchestrator/proctor.py` | Monte Carlo proctor: routing fragility over pink-wave realizations, bursty budget forecast, the tick's deferral rule |
 | `orchestrator/learner.py` | Cortex 2 as a learner: measured speed, Bayesian quality priors from verdicts, pink-wave exploration, per-scope settings |
+| `orchestrator/vaultsync.py` | Vault snapshots to Supabase Storage: restore on an empty start, upload on change; the VM's offsite backup |
 | `orchestrator/dynamics.py` | Pairwise statistics between endpoint latency series (built-in or pyspi) and the bounded constraint-law modulation |
 | `orchestrator/society/` | Two companies on Traction/EOS (cycles, EOS scorecard, release waves, manuscripts) and the agent society (academy, tick, leisure) |
 | `research/project_seth_phase3.py` | Project Seth Phase 3 distribution and bias-sweep engine (research only) |
@@ -383,6 +384,15 @@ and Normal mode never uses it. Close the tab and it is gone.
 - Dependencies come from the lowercase `requirements.txt`; `.python-version` requests 3.12.
 - Keys pasted in the sidebar are scoped to your own browser session. Other visitors to the same
   app URL do not see them and must paste their own.
+- **The vault survives redeploys** when the app secrets carry `CHAT_JOHNSON_SUPABASE_URL` and
+  `CHAT_JOHNSON_SUPABASE_KEY` (a service key for a private Storage bucket, default
+  `chat-johnson-vault`): a fresh container restores the last gzip snapshot before its first query,
+  and a daemon uploads a consistent SQLite backup every ten minutes when the vault changed, plus
+  *Snapshot now* and a confirmed *Restore from bucket* in the sidebar. Chats, artifacts, the recall
+  index, the outcome log, and the learner's priors carry over. Set `CHAT_JOHNSON_DEMO=1` to show the
+  banner that says this copy is the front door, not the 24/7 studio.
+- **Keepalive**: the `keepalive` workflow pings `?health=1` every five minutes when the `DEPLOY_URL`
+  repository variable is set, so the in-process worker keeps ticking while session keys are held.
 
 ## Development
 

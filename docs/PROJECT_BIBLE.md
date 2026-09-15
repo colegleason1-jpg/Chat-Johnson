@@ -555,7 +555,7 @@ a parenthetical. Keep this table current in the same commit that changes the cod
 | Heavy Mode (draft, review, synthesis) | built | Bounded three-pass pipeline, paid slot for the review pass only, synthesis streamed, pink-wave temperature schedule. |
 | Quintessence gradient, fractal memory bridge | not built | No code footprint; the terms describe the memory layer below in aspirational language. |
 | Memory context layer: rolling 200-chat cache texturized into compressed context nodes | narrowed | 200-message windows per chat, extractive summaries, thread-health migration into a vision digest, long-distance recall (FTS5, decay, superseding). Cut: Supabase offload; the "nodes" are summaries and digests in SQLite. |
-| Historical logs offloaded to Supabase buckets / Upstash rolling cache | not built | SQLite is the only store; connector rows are stubs that cannot be enabled. |
+| Historical logs offloaded to Supabase buckets / Upstash rolling cache | narrowed | `orchestrator/vaultsync.py` snapshots the whole SQLite vault to a private Supabase Storage bucket and restores it on an empty start (Cloud survives redeploys; the VM gets an offsite backup). Cut: Upstash; per-record offload; SQLite stays the only live store. |
 | Cross-thread semantic search | narrowed | FTS5/BM25 keyword recall across the project's chats with recency decay and superseding. Cut: embeddings. |
 | 10-cloud connector matrix (Supabase, Neon, Upstash, Mongo, Pinecone, D1, PlanetScale, DynamoDB, BigQuery, Toro) | not built | Listed as stubs in the sidebar and the capability card so the model never claims them. |
 | BYOK key panel, session-only keys, seven providers | built | Keys live in session memory (env keys on the VM worker only); encrypted per-job hand-off to the worker. |

@@ -159,7 +159,26 @@ from orchestrator.vault import (
     thread_transcript,
 )
 
+from orchestrator import vaultsync  # noqa: E402
+
+
+def _secrets_to_env() -> None:
+    """Streamlit Cloud keeps secrets in st.secrets; the vault sync and the demo flag read the environment."""
+    for name in (vaultsync.ENV_URL, vaultsync.ENV_KEY, vaultsync.ENV_BUCKET, vaultsync.ENV_OBJECT, vaultsync.ENV_INTERVAL, "CHAT_JOHNSON_DEMO"):
+        if os.environ.get(name):
+            continue
+        try:
+            value = st.secrets.get(name, "")  # raises when no secrets file exists at all
+        except Exception:
+            return
+        if value:
+            os.environ[name] = str(value)
+
+
+_secrets_to_env()
+VAULT_RESTORE_NOTE = vaultsync.restore_if_fresh()  # before the first connection: an empty container gets the last snapshot
 initialize_database()
+vaultsync.start_background()  # uploads a consistent gzip snapshot when the vault changed; no-op when not configured
 register_local_endpoint_from_env()  # a self-hosted box declares its local model in the environment
 # Background workers start once per process (CHAT_JOHNSON_JOB_WORKERS=0 keeps them idle, as the tests do).
 get_runner()
@@ -2635,6 +2654,30 @@ with st.sidebar:
                 st.rerun()
             st.warning("Scope ids use letters, digits, dots, dashes, or underscores (up to 64 characters).")
 
+    with st.expander("Vault snapshots (Supabase Storage)", expanded=False):
+        sync = vaultsync.status()
+        if not sync["configured"]:
+            st.caption(
+                "Not configured. Set CHAT_JOHNSON_SUPABASE_URL and CHAT_JOHNSON_SUPABASE_KEY (a service key; the bucket stays private) "
+                "in the app secrets or the environment and the vault survives redeploys: restored on an empty start, uploaded when it changes."
+            )
+        else:
+            fmt = lambda stamp: time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(stamp)) if stamp else "never"  # noqa: E731
+            st.caption(
+                f"Bucket {sync['bucket']} · object {sync['object']} · last upload {fmt(sync['last_upload_at'])} ({sync['last_upload_bytes']} bytes, "
+                f"{sync['uploads']} this process) · last restore {fmt(sync['last_restore_at'])} · uploader {'running' if sync['running'] else 'stopped'}"
+                + (" · unsaved changes" if sync["dirty"] else "") + f" · startup: {VAULT_RESTORE_NOTE}"
+            )
+            if sync["last_error"]:
+                st.warning(sync["last_error"])
+            left, right = st.columns(2)
+            if left.button("Snapshot now", key="vault_snapshot_now", use_container_width=True):
+                result = vaultsync.snapshot_now()
+                (st.success if result.get("ok") else st.warning)(f"Snapshot: {result.get('bytes', result.get('note'))}")
+            confirm = right.checkbox("I understand: restore replaces this vault", key="vault_restore_confirm")
+            if right.button("Restore from bucket", key="vault_restore_now", disabled=not confirm, use_container_width=True):
+                result = vaultsync.restore_now()
+                (st.success if result.get("ok") else st.warning)(f"Restore: {result.get('bytes', result.get('note'))}; reload the page.")
     with st.expander("Controlled chaos (pink-wave signal)", expanded=False):
         chaos_settings = pinkwave.settings_for(st.session_state.project_scope)
         st.caption(
@@ -2820,6 +2863,12 @@ with st.sidebar:
 
 st.markdown("<div class='eyebrow'>Sovereign local-first execution workspace</div>", unsafe_allow_html=True)
 st.title("Chat Johnson Master Studio")
+if os.environ.get("CHAT_JOHNSON_DEMO", "").strip() == "1":
+    st.info(
+        "Demo deployment: this copy runs on Streamlit Community Cloud. Keys are session-only, background work runs only while a "
+        "session is open, and there is no local model. The 24/7 studio runs on the self-hosted VM (docs/RUNBOOK.md)."
+        + (" The vault is snapshotted to Supabase Storage, so chats and learning survive redeploys." if vaultsync.configured() else " Without vault snapshots configured, every redeploy starts empty.")
+    )
 st.caption(
     "A CVO workbench for routing focused work, preserving project context, and keeping every code handoff reviewable. "
     "Project Seth's stochastic signal is an experimental routing feature only; it does not establish propulsion, lift, "

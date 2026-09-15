@@ -364,7 +364,11 @@ def run_worker(argv: Optional[Sequence[str]] = None) -> int:
     from . import mission_runner, society  # noqa: F401  (register the mission, company, academy, and tick handlers)
     from .router import register_local_endpoint_from_env
 
+    from . import vaultsync
+
+    logging.info("vault: %s", vaultsync.restore_if_fresh())
     vault.initialize_database()
+    vaultsync.start_background()
     local = register_local_endpoint_from_env()
     if local is not None:
         log.info("local model endpoint: %s (%s)", local.base_url, local.model)
