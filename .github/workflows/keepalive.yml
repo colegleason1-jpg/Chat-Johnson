@@ -18,8 +18,10 @@ jobs:
           DEPLOY_URL: ${{ vars.DEPLOY_URL }}
         run: |
           if [ -z "$DEPLOY_URL" ]; then echo "::notice::DEPLOY_URL is not set; nothing to ping."; exit 0; fi
-          # Follow Cloud's redirects so the request reaches the app itself; the code printed is the final answer.
-          code=$(curl -s -L --max-redirs 5 -o /tmp/health.json -w "%{http_code}" --max-time 90 "${DEPLOY_URL%/}/?health=1")
+          # Cloud answers the first request with a 303 that sets a cookie and points back at the app, so the
+          # ping keeps a cookie jar and follows the redirects; a curl failure is reported, never a red run.
+          jar=$(mktemp)
+          code=$(curl -s -L --max-redirs 10 -c "$jar" -b "$jar" -o /tmp/health.out -w "%{http_code}" --max-time 90 "${DEPLOY_URL%/}/?health=1" || echo "curl-exit-$?")
           echo "health=$code"
-          head -c 300 /tmp/health.json; echo
-          case "$code" in 2*) exit 0;; *) echo "::warning::health returned HTTP $code"; exit 0;; esac
+          head -c 300 /tmp/health.out 2>/dev/null; echo
+          case "$code" in 2*) exit 0;; *) echo "::warning::health returned $code"; exit 0;; esac
