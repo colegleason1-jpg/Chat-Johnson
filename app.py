@@ -2549,6 +2549,7 @@ if _query_value("health") == "1":
                 "streamlit": st.__version__,
                 "python": platform.python_version(),
                 "vault": vault_state,
+                "snapshots": {**vaultsync.status(), "startup": VAULT_RESTORE_NOTE, "demo": os.environ.get("CHAT_JOHNSON_DEMO", "").strip() == "1"},
                 "keyed_vendors": configured_provider_names(),
                 "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             },
