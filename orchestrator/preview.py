@@ -91,15 +91,44 @@ def looks_like_markup(source: str) -> bool:
     return bool(re.search(r"<\s*(?:!doctype|html|body|main|section|div|article|style|button|table|form|ul|h[1-6])\b", source, re.I))
 
 
+_BARE_LINK = re.compile(r"^(?:\[[^\]]*\]\()?<?(?:https?://|www\.)\S+>?\)?[.,;:]?$", re.I)
+
+
+def looks_like_link(source: str) -> bool:
+    """A pasted URL or markdown link on its own: the canvas never fetches it, so the app says so instead of showing a blank shell."""
+    value = source.strip()
+    return bool(value) and not looks_like_markup(value) and bool(_BARE_LINK.match(value))
+
+
+_FENCE = re.compile(r"```(?P<language>[^\n`]*)\n(?P<body>.*?)```", re.DOTALL)
+_OPEN_FENCE = re.compile(r"```(?P<language>[^\n`]*)\n(?P<body>.*)\Z", re.DOTALL)
+
+
+def _fence_source(language: str, body: str) -> str:
+    normalized = language.strip().lower()
+    if normalized.startswith(("html", "htm")) or looks_like_markup(body):
+        return body.strip()
+    if normalized.startswith("css"):
+        return f"<style>{body.strip()}</style><div class='preview-shell'><h1>CSS preview</h1><button type='button'>Example control</button></div>"
+    return ""
+
+
 def extract_preview_source(text: str) -> str:
-    """Pull the first HTML/CSS fence (or bare markup) out of a model answer; '' when there is none."""
-    blocks = re.findall(r"```(?P<language>[^\n`]*)\n(?P<body>.*?)```", text, flags=re.DOTALL)
-    for language, body in blocks:
-        normalized = language.strip().lower()
-        if normalized.startswith(("html", "htm")) or looks_like_markup(body):
-            return body.strip()
-        if normalized.startswith("css"):
-            return f"<style>{body.strip()}</style><div class='preview-shell'><h1>CSS preview</h1><button type='button'>Example control</button></div>"
+    """Pull the first HTML/CSS fence (or bare markup) out of a model answer; '' when there is none.
+
+    An answer cut off at the output budget leaves its fence open; that markup is taken up to the end of
+    the text, so a long mockup still reaches the canvas (partial, but rendered) instead of vanishing.
+    """
+    for language, body in _FENCE.findall(text):
+        found = _fence_source(language, body)
+        if found:
+            return found
+    tail = text[text.rfind("```") :] if "```" in text else ""
+    unclosed = _OPEN_FENCE.match(tail) if tail.count("```") == 1 else None
+    if unclosed:
+        found = _fence_source(unclosed.group("language"), unclosed.group("body"))
+        if found:
+            return found
     if looks_like_markup(text):
         return text.strip()
     return ""

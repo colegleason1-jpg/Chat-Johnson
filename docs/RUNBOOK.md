@@ -201,3 +201,8 @@
 - `retired model` messages: discovery will replace the id on the next call; if it persists set
   `CORTEX_GEMINI_MODEL` / `CORTEX_GROQ_MODEL` explicitly.
 - Blank streamed answers: the vendor filtered or truncated; the chat shows a notice with the finish reason.
+- Preview canvas empty after a mockup: the canvas fills from the chat's latest answer that holds HTML/CSS,
+  including an answer cut off at the output budget (its open fence is taken to the end), and it refills
+  after a reload. A pasted link renders as text with a note: the canvas is a no-network sandbox and never
+  fetches pages; paste the markup itself. An emptied box stays empty until the chat makes new markup.
+  A bad paste shows a warning inside the canvas and never takes the page down.

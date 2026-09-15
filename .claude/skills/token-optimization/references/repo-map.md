@@ -12,7 +12,7 @@ Consult this map instead of sweeping the tree. Read only the files named for the
 | `orchestrator/quota.py` | QuotaLedger: RPM/TPM windows, tighten, record_attempt, record | utc_day, seconds_to_utc_midnight, DailyStore, Bucket, QuotaLedger |
 | `orchestrator/vault.py` | SQLite: threads per workspace, messages, window/texturize/archive, summaries, artifacts, health sweep, vision digest, migration | database_path, ScopeMismatch, initialize_database, recall_index_available, rebuild_recall_index, active_thread, thread_by_id, list_threads, create_thread, switch_thread, rename_thread, set_thread_mission, set_thread_status, clear_thread |
 | `orchestrator/missions.py` | deterministic mission classification + workstream templates for Task Finder | classify_mission, parse_length_target, words_per_step, writing_sections, mission_hints, task_plan, deliverable_slug, assemble_deliverable, text_measure, MissionBlockError, normalise_plan, parse_mission_block, mission_block |
-| `orchestrator/preview.py` | nh3 allowlist sanitizer + preview document + markup extraction | sanitize_markup, looks_like_markup, extract_preview_source, safe_preview_document |
+| `orchestrator/preview.py` | nh3 allowlist sanitizer + preview document + markup extraction | sanitize_markup, looks_like_markup, looks_like_link, extract_preview_source, safe_preview_document |
 | `orchestrator/github_auth.py` | signed, time-limited OAuth state |  |
 | `orchestrator/connectors.py` | local SQLite connector + roadmap stubs (not enable-able) | ConnectorHealth, Connector, LocalSQLiteConnector, connector_status |
 | `orchestrator/executor.py` | repository pipeline: decompose → sandbox → patches → AST/pytest → diff | memory_path_for, Orchestrator |

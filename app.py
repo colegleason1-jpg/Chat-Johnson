@@ -117,7 +117,7 @@ from orchestrator.missions import (
 )
 from orchestrator.connectors_nodes import CONNECTORS, validate_nodes
 from orchestrator import mcp_client
-from orchestrator.preview import extract_preview_source, safe_preview_document
+from orchestrator.preview import extract_preview_source, looks_like_link, safe_preview_document
 from orchestrator.vault import (
     MESSAGE_WINDOW,
     WORKSPACES as VAULT_WORKSPACES,
@@ -471,8 +471,26 @@ def send_plan_to_task_finder(project_scope: str, parsed: Dict[str, Any]) -> int:
     return thread_id
 
 
-def render_preview_panel() -> None:
+def last_markup_in_chat(project_scope: str, workspace: str) -> str:
+    """The newest assistant answer with HTML/CSS in the current chat, so the canvas survives a reload or a crashed run."""
+    try:
+        rows = recent_messages(project_scope, 24, workspace=workspace)
+    except Exception:  # the canvas is a convenience; the vault never blocks the page over it
+        return ""
+    for row in reversed(rows):
+        if str(row["role"]) == "assistant":
+            found = extract_preview_source(str(row["content"] or ""))
+            if found:
+                return found
+    return ""
+
+
+def render_preview_panel(fallback_source: str = "") -> None:
     st.caption("HTML/CSS mockups are isolated and sanitized before rendering.")
+    if not st.session_state.get("preview_source") and fallback_source:
+        st.session_state.preview_source = fallback_source
+        if not st.session_state.get("preview_editor"):  # set before the widget is created in this run, never after
+            st.session_state.preview_editor = fallback_source
     if "preview_editor" not in st.session_state:
         st.session_state.preview_editor = st.session_state.get("preview_source", "")
     source = st.text_area(
@@ -485,8 +503,17 @@ def render_preview_panel() -> None:
     render_clicked = st.button("Render sanitized preview", key="render_preview", type="secondary")
     if render_clicked:
         st.session_state.preview_source = source
+        st.session_state.preview_cleared = not source.strip()  # an emptied box stays empty until the chat makes new markup
     effective_source = st.session_state.get("preview_source", "") or source
-    st.components.v1.html(safe_preview_document(effective_source), height=410, scrolling=True)
+    if looks_like_link(effective_source):
+        st.info("That is a link, not markup. The canvas never fetches pages (it is a no-network sandbox); paste the HTML/CSS itself, "
+                "or ask the chat for the mockup and it lands here on its own.")
+    try:
+        document = safe_preview_document(effective_source)
+    except Exception as exc:  # a bad paste must never take the page down with it
+        st.warning(f"The canvas could not render that markup ({plain_error(exc)}). Paste HTML/CSS, or clear the box.")
+        return
+    st.components.v1.html(document, height=410, scrolling=True)
 
 
 # =============================================================================
@@ -1300,6 +1327,7 @@ def run_generation(
     if extracted:  # never wipe what the operator typed into the canvas
         st.session_state.preview_source = extracted
         st.session_state.preview_editor = extracted
+        st.session_state.preview_cleared = False
     st.session_state.last_decision = decision
     return assistant_id
 
@@ -2891,8 +2919,9 @@ WORKSPACE_RENDERERS[workspace](scope, ledger, submission)
 
 st.divider()
 # One column: a side panel squeezed the chat to a sliver at iPad width. The canvas opens itself when markup arrives.
-with st.expander("Live preview canvas", expanded=bool(st.session_state.get("preview_source") or st.session_state.get("scene_preview"))):
-    render_preview_panel()
+canvas_fallback = "" if (st.session_state.get("preview_source") or st.session_state.get("preview_cleared")) else last_markup_in_chat(scope, workspace)
+with st.expander("Live preview canvas", expanded=bool(st.session_state.get("preview_source") or canvas_fallback or st.session_state.get("scene_preview"))):
+    render_preview_panel(canvas_fallback)
     if st.session_state.get("scene_preview"):
         st.caption("Last resolved scene (from a spatial mission).")
         components.html(scene_preview_document(st.session_state["scene_preview"]), height=440, scrolling=False)

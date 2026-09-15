@@ -46,3 +46,16 @@ def test_extract_prefers_html_fences_and_returns_empty_otherwise():
     assert extract_preview_source("```python\nprint(1)\n```") == ""
     assert extract_preview_source("no markup here") == ""
     assert "<style>" in extract_preview_source("```css\nbody{color:red}\n```")
+
+
+def test_extract_takes_an_unclosed_fence_from_a_truncated_answer():
+    from orchestrator.preview import looks_like_link
+
+    cut = "Here is the mockup:\n```html\n<main><h1>Dash</h1><button>Go</button>"
+    assert extract_preview_source(cut) == "<main><h1>Dash</h1><button>Go</button>"
+    assert extract_preview_source("```python\nprint(1)") == ""  # an open code fence is not markup
+    assert extract_preview_source("```html\n<div>closed</div>\n```\n\n```html\n<p>open") == "<div>closed</div>"
+    assert looks_like_link("https://chat-johnson.streamlit.app/?ws=normal_chat&scope=v1#conversation")
+    assert looks_like_link("[open it](https://example.com/mockup.html)") and looks_like_link("<https://example.com>")
+    assert not looks_like_link("<a href='https://example.com'>x</a>") and not looks_like_link("plain words") and not looks_like_link("")
+    assert "<pre>https://example.com</pre>" in safe_preview_document("https://example.com")

@@ -383,3 +383,27 @@ def test_rerun_reopens_stored_nodes_and_launch_stores_them(app, monkeypatch):
     assert not app.exception
     assert any("Mission from the chat" in m.value for m in app.markdown)
     assert app.session_state["pending_plans"][thread]["plan"][0]["title"] == stored[0]["title"]
+
+
+def test_canvas_shows_the_chats_last_mockup_after_a_reload_and_explains_a_pasted_link(app):
+    from orchestrator import vault
+    app.query_params["scope"] = "visitor-canvas"
+    app.run()
+    thread = int(vault.active_thread("visitor-canvas", "normal_chat")["id"])
+    vault.append_message("visitor-canvas", "user", "make me a dashboard", thread_id=thread, workspace="normal_chat")
+    vault.append_message("visitor-canvas", "assistant", "Sure:\n```html\n<main><h1>Dash</h1><button>Go</button>\n```\nOpen it at https://example.com/dash", thread_id=thread, workspace="normal_chat")
+    app.run()  # a fresh session (a reload after a crashed run) still finds the mockup in the chat
+    assert not app.exception
+    assert app.session_state["preview_source"] == "<main><h1>Dash</h1><button>Go</button>"
+    editor = next(t for t in app.text_area if t.key == "preview_editor")
+    assert editor.value == "<main><h1>Dash</h1><button>Go</button>"
+    editor.set_value("https://example.com/dash").run()
+    next(b for b in app.button if b.key == "render_preview").click().run()
+    assert not app.exception
+    assert any("never fetches pages" in i.value for i in app.info)
+    editor = next(t for t in app.text_area if t.key == "preview_editor")
+    editor.set_value("").run()
+    next(b for b in app.button if b.key == "render_preview").click().run()
+    assert not app.exception and app.session_state["preview_source"] == "" and app.session_state["preview_cleared"] is True
+    app.run()
+    assert app.session_state["preview_source"] == ""  # an emptied canvas is not refilled from the chat behind the operator's back
