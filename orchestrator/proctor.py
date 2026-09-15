@@ -62,6 +62,11 @@ class RoutingReport:
         feasible = sum(1 for name in self.win_rates.get(next(iter(self.win_rates), ""), {}) if name not in self.blocked)
         return math.log2(feasible) if feasible > 1 else 0.0
 
+    @property
+    def fragility_se(self) -> float:
+        """Standard error of the fragility (a proportion over ``paths`` realizations): how precise the number is."""
+        return proportion_standard_error(self.fragility, self.paths)
+
     def rows(self) -> List[Dict[str, Any]]:
         names = sorted({name for rates in self.win_rates.values() for name in rates})
         return [
@@ -75,7 +80,7 @@ class RoutingReport:
         strongest = f"x{max(self.amplifications):g}"
         return (
             f"{self.task_type}: {self.deterministic} wins {1 - self.fragility:.1%} of {self.paths} paths at production strength "
-            f"(fragility {self.fragility:.3f}, {self.fragility_amplified:.3f} at {strongest}); decision entropy "
+            f"(fragility {self.fragility:.3f} ± {self.fragility_se:.3f}, {self.fragility_amplified:.3f} at {strongest}); decision entropy "
             f"{self.entropy_bits.get('x1', 0.0):.2f} -> {self.entropy_bits.get(strongest, 0.0):.2f} of {self.max_entropy_bits:.2f} bits; outliers: {outliers}"
         )
 
@@ -213,6 +218,11 @@ class BudgetReport:
     p10_cap_hour: Optional[float] = None   # the early tail: one path in ten caps by this hour
     p50_cap_hour: Optional[float] = None
     early_cappers: int = 0                  # paths capping more than EARLY_MARGIN_HOURS before the median
+    p50_cap_hour_se: Optional[float] = None  # precision of the median cap hour from this many capping paths (None when too few)
+
+    @property
+    def p_cap_today_se(self) -> float:
+        return proportion_standard_error(self.p_cap_today, self.paths)
 
     @property
     def remaining(self) -> int:
@@ -221,9 +231,10 @@ class BudgetReport:
     def row(self) -> Dict[str, Any]:
         return {
             "vendor": self.vendor, "cap": self.cap, "used": self.used, "remaining": self.remaining if self.cap > 0 else "uncapped",
-            "rate/h": int(self.rate_per_hour), "p(cap today)": round(self.p_cap_today, 2),
+            "rate/h": int(self.rate_per_hour), "p(cap today)": round(self.p_cap_today, 2), "± p": round(self.p_cap_today_se, 3),
             "p10 cap hour (UTC)": None if self.p10_cap_hour is None else round(self.p10_cap_hour, 1),
             "p50 cap hour (UTC)": None if self.p50_cap_hour is None else round(self.p50_cap_hour, 1),
+            "± h": None if self.p50_cap_hour_se is None else round(self.p50_cap_hour_se, 2),
             "early cappers": self.early_cappers,
         }
 
@@ -242,6 +253,31 @@ def _percentile(values: Sequence[float], fraction: float) -> Optional[float]:
     ordered = sorted(values)
     index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
     return float(ordered[index])
+
+
+def proportion_standard_error(fraction: float, count: int) -> float:
+    """``sqrt(p (1 - p) / n)``: the precision of a win rate, a fragility, or a cap probability from ``count`` paths."""
+    p = max(0.0, min(1.0, float(fraction)))
+    return math.sqrt(p * (1.0 - p) / count) if count > 0 else 0.0
+
+
+def percentile_standard_error(values: Sequence[float], fraction: float, minimum: int = 100) -> Optional[float]:
+    """Asymptotic standard error of a sample quantile: ``sqrt(p (1 - p) / n) / f(x_p)`` with the density estimated
+    from the spacing of the order statistics around the quantile (the supply-chain engine's estimator, ported).
+    None below ``minimum`` samples, where the estimate is not meaningful; 0 when the neighbourhood is flat."""
+    n = len(values)
+    if n < minimum:
+        return None
+    p = max(0.0, min(1.0, float(fraction)))
+    ordered = sorted(float(v) for v in values)
+    index = min(n - 1, max(0, int(round(p * (n - 1)))))
+    window = max(1, int(0.02 * n))
+    low, high = max(0, index - window), min(n - 1, index + window)
+    spread = ordered[high] - ordered[low]
+    if spread <= 0.0:
+        return 0.0
+    density = (high - low) / n / spread
+    return math.sqrt(p * (1.0 - p) / n) / density
 
 
 def forecast_budget(
@@ -283,6 +319,7 @@ def forecast_budget(
     report.p_cap_today = len(cap_hours) / report.paths
     report.p10_cap_hour = _percentile(cap_hours, 0.10)
     report.p50_cap_hour = _percentile(cap_hours, 0.50)
+    report.p50_cap_hour_se = percentile_standard_error(cap_hours, 0.50)
     if report.p50_cap_hour is not None:
         report.early_cappers = sum(1 for h in cap_hours if h < report.p50_cap_hour - EARLY_MARGIN_HOURS)
     return report

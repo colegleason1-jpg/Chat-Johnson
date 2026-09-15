@@ -139,6 +139,26 @@
   Library, Hacker News); a blocked source is logged as an error on the inquiry and costs the agent
   its leisure fee only. Stop the tick before a redeploy if you want a clean cycle log.
 
+## Plan of the day (token treasury)
+- Academy workspace → *Plan of the day*: the day's activities (chat reserve, each company, academy,
+  leisure, queued missions) as nodes with tokens at full scale and goal points; the budget is the
+  keyed vendors' remaining daily tokens; the chat reserve is always funded in full. The engine buys
+  the most value today's tokens allow (they expire at midnight, so nothing is saved but the reserve)
+  and checks the goal in target mode: a short day says by how many tokens, an unreachable goal says
+  it is beyond the ceiling; the allocation stands either way. The
+  tick reads the plan every interval: an unfunded activity is skipped (`skipped_by_plan` in the tick's
+  cycle row), the rest run at the planned size (a company's or the academy's `max_tokens`, the
+  leisure budget). Sliders: goal share and chat reserve; *Plan now* solves on demand.
+- Engine: `pip install -r requirements-supply.txt` (Python 3.12+; pinned to an audited commit of
+  `colegleason1-jpg/supply-chain-resilience-engine`). Without it the panel says so and the fixed
+  treasury shares apply; nothing else changes. Solves take 15–70 ms; never per chat send.
+- Tail risk line: P50/P90 and expected shortfall of delivered points under correlated lognormal
+  shocks (σ from the route log's failure share, ρ from the endpoint coupling); a large negative bias
+  means the baseline clip is binding, so read P50 with that in mind.
+- Vendor stress: a failure elasticity to load fitted per vendor from hourly route-log bins (refused
+  below 24 bins or with no relationship); current load above the anchor scales value per token down,
+  never the hard limits. Audit: `docs/SUPPLY_CHAIN_ENGINE_AUDIT.md`.
+
 ## Controlled chaos (pink-wave signal)
 - Sidebar → *Controlled chaos*: gain 0–100 % and a frequency profile per feature (routing, heavy,
   memory, migration). Settings are stored per project scope in the vault (`settings` table) and the

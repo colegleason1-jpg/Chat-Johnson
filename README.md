@@ -56,6 +56,7 @@ approved reconstruction plan.
 | `orchestrator/learner.py` | Cortex 2 as a learner: measured speed, Bayesian quality priors from verdicts, pink-wave exploration, per-scope settings |
 | `orchestrator/vaultsync.py` | Vault snapshots to Supabase Storage: restore on an empty start, upload on change; the VM's offsite backup |
 | `orchestrator/dynamics.py` | Pairwise statistics between endpoint latency series (built-in or pyspi) and the bounded constraint-law modulation |
+| `orchestrator/treasury_plan.py` | Plan of the day: the daily token treasury allocated by the supply-chain resilience engine (`scrcae`, optional): most value within today's tokens, goal checked in target mode with the shortfall named, saturation budget, correlated tail risk, vendor stress fitted from the route log; fixed shares without it |
 | `orchestrator/society/` | Two companies on Traction/EOS (cycles, EOS scorecard, release waves, manuscripts) and the agent society (academy, tick, leisure) |
 | `research/project_seth_phase3.py` | Project Seth Phase 3 distribution and bias-sweep engine (research only) |
 | `docs/` | Bible, recovery audit, implementation plan, strategic outline |
@@ -191,6 +192,7 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | Cross-thread semantic search | Implemented as long-distance memory: FTS5/BM25 over the project's other chats (summaries, digests, missions, artifact summaries) with recency decay and superseding, in every prompt and every vision digest; no embedding index |
 | Controlled chaos: the validated 1/f signal applied across routing, Heavy Mode, memory recall, and migration | Implemented · bounded nudges only, per-project gain and frequency profiles, gain 0 is deterministic |
 | Cortex 2 as an empirical learner: measured speed, Bayesian quality from verdicts, pink-wave exploration, constraint-law dynamics | Implemented · bounded terms, hard limits untouched, exploration rate verified in the outcome log |
+| Supply-chain planning of the token treasury: activities as nodes, tokens as capital, a verified MILP with diagnosis and tail risk | Implemented (Batch Q, optional engine) · the tick runs each activity at the planned size; per-request routing and pacing unchanged |
 | Society: per-project product briefs, per-company release waves, every seat's title/roles/KPIs and every persona editable | Implemented |
 | Capability card in every prompt (what the app can and cannot do) and memory as real chat turns | Implemented |
 | Repository Work hub connector: fetch a GitHub repository through the API (public, or private with the armed token) into a temporary sandbox, run the pipeline, download the patch, push the change as a branch plus pull request; four tabs (Work, Deploy Kit, GitHub, Directions) | Implemented · tests of the fetched repository run only when ticked |

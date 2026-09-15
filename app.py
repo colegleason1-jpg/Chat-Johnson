@@ -51,7 +51,7 @@ from orchestrator.discovery import vendor_for
 from orchestrator.envsafe import self_hosted
 from orchestrator.errors import plain_error
 from orchestrator.executor import Orchestrator
-from orchestrator import dynamics, learner, pinkwave, proctor
+from orchestrator import dynamics, learner, pinkwave, proctor, treasury_plan
 from orchestrator.society import economy as society_economy
 from orchestrator import mission_runner  # noqa: F401  (registers the mission job handler)
 from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner, secrets_deliverable
@@ -2353,6 +2353,60 @@ def parse_custom_sources(text: str) -> List[Dict[str, str]]:
     return sources
 
 
+def render_plan_of_the_day(project_scope: str, ledger: QuotaLedger) -> None:
+    """The daily treasury as an allocation: what the tick funds today, at what size, and why."""
+    with st.expander("Plan of the day (token treasury)", expanded=False):
+        installed = treasury_plan.available()
+        st.caption(
+            "Each activity of the day is a node (tokens at full scale, goal points, a minimum worthwhile size); the day's remaining tokens "
+            "are the budget; the chat reserve is always funded in full. The supply-chain engine buys the most value today's tokens allow, "
+            "checks the goal and names the shortfall when it is out of reach, and the tick runs each activity at the planned size."
+            + ("" if installed else " Engine not installed here (requirements-supply.txt, Python 3.12+): the fixed treasury shares apply.")
+        )
+        config = treasury_plan.config_for(project_scope)
+        c1, c2 = st.columns(2)
+        goal_fraction = c1.slider("Goal: share of the day's full value to ask for", 10, 100, int(config["goal_fraction"] * 100), 5, key="plan_goal_fraction")
+        reserve = c2.slider("Chat reserve (% of today's tokens)", 0, 60, int(config["chat_reserve_fraction"] * 100), 5, key="plan_chat_reserve")
+        b1, b2 = st.columns(2)
+        if b1.button("Save plan settings", key="plan_save", use_container_width=True):
+            treasury_plan.save_config(project_scope, goal_fraction / 100, reserve / 100)
+            st.success("Plan settings saved; the next tick plans with them.")
+        if b2.button("Plan now", key="plan_now", use_container_width=True):
+            treasury_plan.save_config(project_scope, goal_fraction / 100, reserve / 100)
+            with st.spinner("Planning the day…"):
+                treasury_plan.plan_day(project_scope, ledger)
+        plan = treasury_plan.latest(project_scope)
+        if not plan:
+            st.caption("No plan yet: press Plan now, or start the tick (it plans every interval).")
+            return
+        badge = {"optimal": st.success, "short": st.warning, "ceiling": st.warning}.get(str(plan.get("status")), st.info)
+        badge(f"{plan.get('status')} · {plan.get('spend_tokens', 0):,} of {plan.get('budget_tokens', 0):,} tokens for {plan.get('value_points', 0):.0f} of "
+              f"{plan.get('full_value_points', 0):.0f} points (goal {plan.get('goal_points', 0):.0f}) · {plan.get('ms', 0)} ms · {plan.get('day')}")
+        if plan.get("diagnosis"):
+            st.caption(f"Diagnosis: {plan['diagnosis']}")
+        if plan.get("lines"):
+            st.dataframe(
+                [{"activity": line["label"], "size": f"{float(line['scale']):.0%}", "tokens": int(line["tokens"]), "points": round(float(line["value_points"]), 1)} for line in plan["lines"]],
+                use_container_width=True, hide_index=True,
+            )
+        if plan.get("saturation_budget"):
+            st.caption(f"Recommended daily share: {float(plan.get('recommended_share', 0)):.0%} of today's tokens ({int(plan['saturation_budget']):,}) buys everything worth buying; more buys nothing.")
+        if plan.get("stress", 1.0) < 1.0:
+            st.caption(f"Vendor stress {float(plan['stress']):.2f}: value per token is scaled down while keyed vendors run above their load anchor (fitted, not typed).")
+        if plan.get("stress_rows"):
+            st.dataframe(plan["stress_rows"], use_container_width=True, hide_index=True)
+        tail = plan.get("tail") or {}
+        if tail:
+            st.caption(
+                f"Delivered value under correlated vendor failure (σ {tail.get('sigma')}, ρ {tail.get('rho')}, {int(tail.get('iterations', 0)):,} draws): "
+                f"P50 {tail.get('p50_points')} · P90 {tail.get('p90_points')} · expected shortfall {tail.get('expected_shortfall_points')} points; bias {tail.get('bias_points')} pts."
+            )
+        for note in plan.get("notes") or []:
+            st.caption(note)
+        if plan.get("engine"):
+            st.caption(f"Engine scrcae {plan['engine']} · input {plan.get('input_hash', '')[:23]} · output {plan.get('output_hash', '')[:23]}")
+
+
 def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
     st.subheader("Academy")
     st.caption(
@@ -2410,6 +2464,7 @@ def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional
             st.caption(f"Running · next tick at {time.strftime('%H:%M UTC', time.gmtime(state['next_run_after']))} · it stops with the app process; the VM worker keeps it 24/7.")
         else:
             st.caption("Stopped. Cycles can still be run by hand from the Company and Academy workspaces.")
+    render_plan_of_the_day(project_scope, ledger)
     classes, evals, personnel, dreams, cycle_tab = st.tabs(["Classes", "Evaluations", "Personnel log", "Dream bank", "Academy cycles"])
     with classes:
         if agents:

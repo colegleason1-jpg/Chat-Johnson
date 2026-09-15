@@ -1,0 +1,5 @@
+# Optional: the supply-chain resilience engine (scrcae) for the plan of the day: the daily token treasury
+# allocated by a verified mixed-integer solver with a correlated Monte Carlo and an infeasibility diagnosis.
+# Python 3.12 or newer (numpy/pulp wheels); without it orchestrator/treasury_plan.py falls back to the
+# fixed treasury shares and the panel says so. Pinned to a commit of the audited engine.
+scrcae @ git+https://github.com/colegleason1-jpg/supply-chain-resilience-engine@ed03d4b#subdirectory=engine

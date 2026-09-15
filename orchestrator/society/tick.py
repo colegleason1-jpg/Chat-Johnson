@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .. import proctor, vault
+from .. import proctor, treasury_plan, vault
 from ..jobs import ACTIVE_STATUSES, JobCancelled, JobContext, enqueue, register_handler
 from . import academy, cycles, economy, leisure, store
 
@@ -64,20 +64,32 @@ def society_tick(ctx: JobContext) -> Dict[str, Any]:
     queued: List[str] = []
     call_tokens = int(payload.get("call_tokens") or cycles.DEFAULT_CALL_TOKENS)
     deferred = budget_deferral(ctx.ledger, call_tokens)
+    # The plan of the day sizes every activity (the engine when installed, today's fixed shares otherwise);
+    # an activity the plan leaves unfunded is skipped with the plan's reason, the rest run at the planned scale.
+    plan = day_plan(scope, ctx.ledger, now)
+    skipped: List[str] = []
     # Companies whose interval has passed and that have no cycle queued or running, unless the budget forecast says wait.
     for company in store.companies_for(scope):
         cid = int(company["id"])
         if deferred:
             break
         if _due(scope, "company", cid, float(company["interval_s"]), now) and not _company_job_active(scope, cid):
-            cycles.run_now(scope, cid, ctx.secrets, mode=mode, call_tokens=call_tokens, chain=False)
+            scale = plan.scale_for(f"company:{cid}")
+            if scale <= 0.0:
+                skipped.append(str(company["name"]))
+                continue
+            cycles.run_now(scope, cid, ctx.secrets, mode=mode, call_tokens=call_tokens, chain=False, max_tokens=max(call_tokens * 2, int(cycles.DEFAULT_MAX_TOKENS * scale)))
             queued.append(company["name"])
     if not deferred and store.agents_for(scope) and _due(scope, "academy", None, academy_interval, now) and not _academy_job_active(scope):
-        academy.run_now(scope, ctx.secrets, mode=mode, call_tokens=min(int(payload.get("call_tokens") or 900), 900), chain=False)
-        queued.append("academy")
+        scale = plan.scale_for("academy")
+        if scale <= 0.0:
+            skipped.append("academy")
+        else:
+            academy.run_now(scope, ctx.secrets, mode=mode, call_tokens=min(int(payload.get("call_tokens") or 900), 900), chain=False, max_tokens=max(1_400, int(academy.DEFAULT_MAX_TOKENS * scale)))
+            queued.append("academy")
     # Leisure runs inline: a few agents explore per tick, only while the leisure share can afford a call.
     treasury = economy.Treasury(ctx.ledger, economy.shares_for(scope))
-    budget = cycles.CycleBudget(LEISURE_MAX_CALLS, treasury.cycle_budget("leisure", LEISURE_MAX_TOKENS))
+    budget = cycles.CycleBudget(LEISURE_MAX_CALLS, treasury.cycle_budget("leisure", int(LEISURE_MAX_TOKENS * plan.scale_for("leisure"))))
     cycle_id = store.start_cycle(scope, "leisure", None, ctx.job_id, budget.max_tokens)
     explored: List[Dict[str, Any]] = []
     status = "done"
@@ -95,9 +107,19 @@ def society_tick(ctx: JobContext) -> Dict[str, Any]:
     store.finish_cycle(cycle_id, status, budget.tokens, budget.calls, [{"step": "leisure", "explored": explored, "queued": queued}])
     next_run_after = now + max(60.0, interval)
     next_job = enqueue(scope, KIND_TICK, {k: v for k, v in payload.items() if k != "chained_from"} | {"chained_from": ctx.job_id}, ctx.secrets, run_after=next_run_after)
-    store.insert("cycles", scope, kind="tick", company_id=None, job_id=ctx.job_id, started_at=now, finished_at=time.time(), tokens_planned=0, tokens_used=budget.tokens, calls=budget.calls, log=[{"queued": queued, "explored": len(explored), "deferred": deferred}], next_run_after=next_run_after, status="done")
-    ctx.progress(step=1, total=1, text=f"Tick: queued {', '.join(queued) or 'nothing'}; {len(explored)} agent(s) explored" + (f"; {deferred}" if deferred else ""))
-    return {"queued": queued, "explored": explored, "next_job": next_job, "next_run_after": next_run_after, "calls": budget.calls, "tokens": budget.tokens, "deferred": deferred}
+    plan_note = plan.summary()
+    store.insert("cycles", scope, kind="tick", company_id=None, job_id=ctx.job_id, started_at=now, finished_at=time.time(), tokens_planned=0, tokens_used=budget.tokens, calls=budget.calls,
+                 log=[{"queued": queued, "explored": len(explored), "deferred": deferred, "plan": plan_note, "skipped_by_plan": skipped}], next_run_after=next_run_after, status="done")
+    ctx.progress(step=1, total=1, text=f"Tick: queued {', '.join(queued) or 'nothing'}; {len(explored)} agent(s) explored" + (f"; {deferred}" if deferred else "") + (f"; plan left out {', '.join(skipped)}" if skipped else ""))
+    return {"queued": queued, "explored": explored, "next_job": next_job, "next_run_after": next_run_after, "calls": budget.calls, "tokens": budget.tokens, "deferred": deferred, "plan": plan_note, "skipped_by_plan": skipped}
+
+
+def day_plan(scope: str, ledger: Any, now: float) -> treasury_plan.DayPlan:
+    """The plan of the day for this tick; a planner failure never stops the scheduler (every scale is then 1.0)."""
+    try:
+        return treasury_plan.plan_day(scope, ledger, now=now)
+    except Exception as exc:
+        return treasury_plan.DayPlan(scope, time.strftime("%Y-%m-%d", time.gmtime(now)), 0, 0.0, "error", notes=[f"planner failed: {str(exc)[:160]}"], created_at=now)
 
 
 def budget_deferral(ledger: Any, call_tokens: int, calls_per_cycle: int = 8) -> str:
