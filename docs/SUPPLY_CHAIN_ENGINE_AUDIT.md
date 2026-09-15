@@ -98,7 +98,7 @@ vendor from the learner's failure and 429 rates; correlation from `dynamics.cach
 repaired to a valid correlation matrix by the engine. Output: P50/P90 delivered value and the
 expected shortfall, next to the plan, with the bias line so a clipped tail is visible.
 
-### 5.3 Release wave and mission feasibility (fits; second batch)
+### 5.3 Release wave and mission feasibility (built 2026-09-15 as Batch R: `treasury_plan.wave_feasibility`, `mission_feasibility`)
 
 A wave's unpublished works and a mission's steps have the same shape as activities: tokens to
 finish, goal points toward the gate, dependencies (final edit after manuscript, a step after its

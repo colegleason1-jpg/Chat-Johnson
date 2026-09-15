@@ -471,3 +471,224 @@ def latest(scope: str) -> Optional[Dict[str, Any]]:
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+
+# ----------------------------------------------------------------------------- commitments: waves and missions
+
+@dataclass
+class Commitment:
+    """A unit of work that runs whole or not at all: a wave's work, a mission's step."""
+
+    key: str
+    label: str
+    cost_tokens: int
+    value_points: float
+    mix: Dict[str, float] = field(default_factory=dict)
+    prerequisite: str = ""
+
+    def usage(self) -> Dict[str, float]:
+        return {vendor: float(self.cost_tokens) * share for vendor, share in self.mix.items() if share > 0.0}
+
+
+@dataclass
+class Verdict:
+    kind: str                    # wave | mission
+    fits: bool
+    status: str                  # fits | short | supply | fallback | engine-missing | empty | error
+    cost_tokens: int
+    budget_tokens: int
+    shortfall_tokens: int = 0
+    funded: List[str] = field(default_factory=list)
+    unfunded: List[str] = field(default_factory=list)
+    limited_by: str = ""
+    diagnosis: str = ""
+    resources: List[Dict[str, Any]] = field(default_factory=list)
+    engine: str = ""
+    input_hash: str = ""
+    ms: int = 0
+    notes: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        if self.status == "empty":
+            return "nothing left to fund"
+        if self.fits:
+            return f"fits today: {self.cost_tokens:,} of {self.budget_tokens:,} tokens left after the chat reserve"
+        if self.status == "supply" and self.limited_by:
+            return f"bounded by {self.limited_by}'s supply today: {len(self.unfunded)} of {len(self.funded) + len(self.unfunded)} left out; {self.cost_tokens:,} tokens needed"
+        return f"short by {self.shortfall_tokens:,} tokens today ({self.cost_tokens:,} needed, {self.budget_tokens:,} left after the chat reserve); {len(self.unfunded)} of {len(self.funded) + len(self.unfunded)} left out"
+
+
+def spendable_today(scope: str, ledger: Any) -> Tuple[int, Dict[str, int]]:
+    """Tokens left today after the chat reserve, pooled and per vendor (the reserve comes off every vendor by the chat mix)."""
+    config = config_for(scope)
+    capacities = vendor_capacities(ledger)
+    budget = int(sum(capacities.values()))
+    reserve = min(budget, max(CHAT_RESERVE_MIN_TOKENS, int(budget * config["chat_reserve_fraction"])))
+    mix = vendor_mix(scope, ("normal_chat", "chat_bot", "task_finder", "repository"), list(capacities))
+    per_vendor = {vendor: max(0, int(capacity - reserve * mix.get(vendor, 0.0))) for vendor, capacity in capacities.items()}
+    return max(0, budget - reserve), per_vendor
+
+
+def feasibility(scope: str, ledger: Any, items: Sequence[Commitment], kind: str, budget: Optional[int] = None, capacities: Optional[Mapping[str, int]] = None) -> Verdict:
+    """Can these commitments all run today? Whole-or-nothing nodes; the answer names the shortfall or the vendor that binds."""
+    started = time.perf_counter()
+    items = [item for item in items if item.cost_tokens > 0]
+    if budget is None or capacities is None:
+        pooled, per_vendor = spendable_today(scope, ledger)
+        budget = pooled if budget is None else budget
+        capacities = per_vendor if capacities is None else capacities
+    budget = max(0, int(budget))
+    supply = {str(k): max(0, int(v)) for k, v in (capacities or {}).items()}
+    total = sum(item.cost_tokens for item in items)
+    if not items:
+        return Verdict(kind, True, "empty", 0, budget)
+    if not available():
+        verdict = _greedy(kind, items, budget, supply)
+        verdict.status = "engine-missing" if verdict.fits else verdict.status
+        verdict.notes.append("engine not installed: greedy check by value per token")
+        verdict.ms = int((time.perf_counter() - started) * 1000)
+        return verdict
+    try:
+        verdict = _solve_commitments(kind, items, budget, supply)
+    except Exception as exc:
+        verdict = _greedy(kind, items, budget, supply)
+        verdict.status = "error"
+        verdict.notes.append(f"planner error, greedy check applies: {str(exc)[:160]}")
+    verdict.cost_tokens = total
+    verdict.ms = int((time.perf_counter() - started) * 1000)
+    return verdict
+
+
+def _greedy(kind: str, items: Sequence[Commitment], budget: int, supply: Mapping[str, int]) -> Verdict:
+    total = sum(item.cost_tokens for item in items)
+    left, room = budget, dict(supply)
+    funded, unfunded = [], []
+    for item in sorted(items, key=lambda i: -(i.value_points / max(i.cost_tokens, 1))):
+        usage = item.usage() if room else {}
+        if item.cost_tokens <= left and all(room.get(v, 0) >= u for v, u in usage.items() if v in room):
+            funded.append(item.key)
+            left -= item.cost_tokens
+            for v, u in usage.items():
+                if v in room:
+                    room[v] -= int(u)
+        else:
+            unfunded.append(item.key)
+    fits = not unfunded
+    order = {item.key: index for index, item in enumerate(items)}
+    funded.sort(key=order.get)
+    unfunded.sort(key=order.get)
+    return Verdict(kind, fits, "fits" if fits else "short", total, budget, max(0, total - budget) if not fits else 0, funded, unfunded,
+                   resources=[{"vendor": v, "capacity": int(c), "headroom": int(room.get(v, 0))} for v, c in supply.items()])
+
+
+def _solve_commitments(kind: str, items: Sequence[Commitment], budget: int, supply: Mapping[str, int]) -> Verdict:
+    import scrcae
+    from scrcae import Dependency, Intervention, MinimizeCapitalObjective, OptimizationRequest, SupplyNetwork, solve
+    from scrcae.optimization.objectives import MaximizeRiskReductionObjective
+    from scrcae.risk import LinearResponse
+
+    keys = {item.key for item in items}
+    with_resources = bool(supply) and engine_knows_resources() and any(item.mix for item in items)
+    resources = tuple(scrcae.Resource(v, float(c)) for v, c in sorted(supply.items())) if with_resources else ()
+    declared = {r.name for r in resources}
+    total_value = sum(item.value_points for item in items)
+    scale = min(1.0, BASELINE_POINTS / total_value) if total_value > 0 else 1.0  # keep points inside the engine's 100-point baseline
+    interventions = tuple(
+        Intervention(item.key, item.label, "", cost=float(item.cost_tokens), risk_reduction_pts=float(item.value_points) * scale, min_funding_scale=1.0, max_funding_scale=1.0,
+                     **({"usage": {v: u for v, u in item.usage().items() if v in declared}} if with_resources else {}))
+        for item in items
+    )
+    dependencies = tuple(Dependency(dependent=i.key, prerequisite=i.prerequisite) for i in items if i.prerequisite and i.prerequisite in keys and i.prerequisite != i.key)
+    network = SupplyNetwork(interventions=interventions, baseline_risk_pts=BASELINE_POINTS, dependencies=dependencies, **({"resources": resources} if with_resources else {}))
+    common = {"network": network, "risk_response": LinearResponse(), "enforce_risk_cap": True}
+    best = solve(OptimizationRequest(objective=MaximizeRiskReductionObjective(), budget=float(budget), diagnose=False, **common))
+    funded = [a.node_id for a in best.allocations if a.funding_scale > 0.5]
+    unfunded = [item.key for item in items if item.key not in funded]
+    total = sum(item.cost_tokens for item in items)
+    verdict = Verdict(kind, not unfunded, "fits" if not unfunded else "short", total, budget, 0, funded, unfunded, engine=engine_version(), input_hash=str(best.audit.get("input_hash", "")))
+    if with_resources:
+        use = dict(getattr(best, "resource_use", {}) or {})
+        verdict.resources = [{"vendor": r.name, "capacity": int(r.capacity), "planned": int(round(float(use.get(r.name, 0.0)))), "headroom": int(round(r.capacity - float(use.get(r.name, 0.0))))} for r in resources]
+    if unfunded:
+        check = solve(OptimizationRequest(objective=MinimizeCapitalObjective(), budget=float(budget), required_risk_reduction_pts=float(total_value) * scale - 1e-6, **common))
+        diagnosis = getattr(check, "diagnosis", None)
+        verdict.diagnosis = str(getattr(diagnosis, "summary", lambda: "")() or "")
+        required = getattr(diagnosis, "capital_required", None)
+        limited = str(getattr(getattr(diagnosis, "attainable", None), "limited_by", "") or "")
+        if limited.startswith("resource:"):
+            verdict.status, verdict.limited_by = "supply", limited.split(":", 1)[1]
+        verdict.shortfall_tokens = max(0, int(math.ceil(float(required) - budget))) if required else max(0, total - budget)
+    if best.status != "optimal":
+        verdict.notes.append(f"solve returned {best.status}")
+    return verdict
+
+
+def mission_feasibility(scope: str, ledger: Any, plan: Sequence[Mapping[str, Any]], budget_per_step: int, heavy: bool = False, budget: Optional[int] = None, capacities: Optional[Mapping[str, int]] = None) -> Verdict:
+    """Before Launch: every model step must run, in order; sub-missions count their sections; deterministic nodes cost nothing."""
+    from .router import prompt_context_chars
+
+    prompt_tokens = prompt_context_chars(int(budget_per_step)) // 4
+    per_call = int(budget_per_step) * (1.83 if heavy else 1.0) + prompt_tokens  # Heavy: draft b/2 + critique b/3 + synthesis b
+    if budget is None or capacities is None:
+        pooled, per_vendor = spendable_today(scope, ledger)
+        budget = pooled if budget is None else budget
+        capacities = per_vendor if capacities is None else capacities
+    mix = vendor_mix(scope, ("task_finder", "normal_chat"), list(capacities or {}))
+    items: List[Commitment] = []
+    previous_model = ""
+    for node in plan:
+        executor = str(node.get("executor") or "model")
+        if executor == "model":
+            calls = 1
+        elif executor == "sub_mission":
+            calls = int((node.get("config") or {}).get("sections") or 3)
+        else:
+            continue
+        key = f"step:{int(node.get('id') or len(items) + 1)}"
+        items.append(Commitment(key, str(node.get("title") or key), int(per_call * calls), 1.0, mix=dict(mix), prerequisite=previous_model))
+        previous_model = key
+    return feasibility(scope, ledger, items, "mission", budget=budget, capacities=capacities)
+
+
+STAGES_TO_FINAL = ("backlog", "development", "draft", "edit", "preliminary_review", "board_feedback")
+STAGE_CALLS = {"backlog": 6, "development": 6, "draft": 4, "edit": 3, "preliminary_review": 2, "board_feedback": 2}  # calls (task + review) left from that stage to final
+
+
+def wave_items(scope: str, company_id: int, call_tokens: Optional[int] = None) -> Tuple[List[Commitment], Dict[str, Any]]:
+    """The current wave's unfinished works as commitments: tokens to reach ``final`` from each work's stage, equal points toward the gate."""
+    from .society import cycles, release
+
+    status = release.wave_status(scope, company_id)
+    works = release.wave_works(scope, company_id, int(status["wave"]))
+    per_call = int(call_tokens or cycles.DEFAULT_CALL_TOKENS) * 2  # a call plus the context it carries
+    needed = max(1, int(status["needed"]))
+    capacities = list(vendor_capacities(None))
+    mix = vendor_mix(scope, ("society",), capacities)
+    items = [
+        Commitment(f"work:{int(w['id'])}", str(w.get("title") or f"Work {w['id']}"), STAGE_CALLS.get(str(w.get("stage")), 0) * per_call, BASELINE_POINTS / needed, mix=dict(mix))
+        for w in works if str(w.get("stage")) in STAGES_TO_FINAL
+    ]
+    return items, status
+
+
+def wave_feasibility(scope: str, ledger: Any, company_id: int, call_tokens: Optional[int] = None) -> Tuple[Verdict, Dict[str, Any]]:
+    """Can the company's current wave reach its gate with what the company may spend today?
+
+    The budget is the company's line in the plan of the day when one exists, else its treasury share for the
+    cycles left today; the vendors' supply is what is left after the chat reserve.
+    """
+    from .society import cycles, economy, store
+
+    items, status = wave_items(scope, company_id, call_tokens)
+    company = store.row("companies", int(company_id)) or {}
+    pooled, per_vendor = spendable_today(scope, ledger)
+    plan = latest(scope)
+    line = next((line for line in (plan or {}).get("lines", []) if line.get("key") == f"company:{int(company_id)}"), None) if plan else None
+    if line and int(line.get("tokens") or 0) > 0:
+        budget = int(line["tokens"])
+    else:
+        treasury = economy.Treasury(ledger, economy.shares_for(scope))
+        cycles_left = max(1, int(math.ceil(_hours_left(time.time()) * 3600.0 / max(600.0, float(company.get("interval_s") or 21_600)))))
+        budget = treasury.cycle_budget(economy.share_key_for(company), cycles.DEFAULT_MAX_TOKENS, share=float(company.get("daily_share") or 0.0) or None) * cycles_left
+    budget = min(int(budget), pooled)
+    return feasibility(scope, ledger, items, "wave", budget=budget, capacities=per_vendor), status

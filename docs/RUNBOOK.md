@@ -154,6 +154,12 @@
   history), and the chat reserve is held back from every vendor before the solve, never traded
   away. The panel's per-vendor table shows capacity, reserved, planned, and headroom; a goal bounded
   by one vendor's supply says so instead of asking for a bigger pooled budget.
+- Feasibility verdicts (same engine, whole-or-nothing nodes): the Company tab's release wave shows
+  whether the current wave can reach its gate with the company's tokens today (each unfinished work
+  priced by the calls left from its stage to `final`), naming the shortfall or the vendor that binds
+  and the works left out; Task Finder shows the same verdict for a mission before Launch (model
+  steps and sub-mission sections, Heavy Mode at draft + critique + synthesis, deterministic nodes
+  free). Both are advice: nothing is blocked, the runner still paces per window.
 - Engine: `pip install -r requirements-supply.txt` (Python 3.12+; pinned to an audited commit of
   `colegleason1-jpg/supply-chain-resilience-engine`). Without it the panel says so and the fixed
   treasury shares apply; nothing else changes. Solves take 15–70 ms; never per chat send.

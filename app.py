@@ -1914,6 +1914,15 @@ def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int
             f"{len(plan) - model_nodes - sum(1 for step in plan if step['executor'] == 'sub_mission')} deterministic node(s) cost nothing"
             + (" · Heavy Mode: draft b/2 + critique b/3 + synthesis b per workstream" if heavy else "")
         )
+        try:
+            verdict = treasury_plan.mission_feasibility(project_scope, ledger, plan, budget, heavy=heavy)
+        except Exception as exc:  # advice only; Launch never depends on it
+            verdict = None
+            st.caption(f"Feasibility check unavailable: {plain_error(exc)}")
+        if verdict is not None and verdict.status != "empty":
+            (st.success if verdict.fits else st.warning)(f"Feasibility today: {verdict.summary()}" + (f" · {verdict.diagnosis}" if verdict.diagnosis and not verdict.fits else ""))
+            if not verdict.fits:
+                st.caption("Launch still works: steps run in order and the runner paces on each free-tier window; the steps left out here would wait for tomorrow's tokens or a lower output budget.")
         launch_col, refine_col, discard_col = st.columns([0.5, 0.25, 0.25], gap="small")
         if launch_col.button(
             send_label("Launch workstreams"), type="primary", key=f"launch_{thread_id}", use_container_width=True,
@@ -2029,6 +2038,16 @@ def render_release_wave(project_scope: str, company_id: int, company: Dict[str, 
     wave, needed = int(status["wave"]), int(status["needed"])
     release = status["release"]
     st.markdown(f"**Release wave {wave}** · {status['ready']} of {needed} works final (wave size {status['size']}, {status['works']} works in this wave)")
+    if not status["gate_met"] and not (release and release["status"] in ("board_review", "released")):
+        try:
+            verdict, _ = treasury_plan.wave_feasibility(project_scope, get_quota_ledger(), company_id)
+        except Exception as exc:  # the verdict is advice; the wave's controls never depend on it
+            verdict = None
+            st.caption(f"Wave feasibility unavailable: {plain_error(exc)}")
+        if verdict is not None and verdict.status != "empty":
+            (st.success if verdict.fits else st.warning)(f"Wave gate today: {verdict.summary()}" + (f" · {verdict.diagnosis}" if verdict.diagnosis and not verdict.fits else ""))
+            if verdict.unfunded:
+                st.caption("Left out today: " + ", ".join(verdict.unfunded[:8]) + ("…" if len(verdict.unfunded) > 8 else "") + ". Raise the company's treasury share or wait for tomorrow's tokens.")
     if release and release["status"] == "board_review":
         st.info(f"Wave {wave} is with the board. Read the manuscripts under Locked artifacts (company/…/works/), then decide.")
         note = st.text_area("Board feedback on the wave", key=f"wave_note_{company_id}", height=80)
