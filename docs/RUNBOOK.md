@@ -264,6 +264,10 @@
 - Company and academy cycles say "Waiting N s: the operator just sent a chat message": the quiet period
   (five minutes after a chat send, ten after a page request) keeps the free-tier window for the chat; the
   cycle re-queues itself for the end of it.
+- Buttons look dead on a tablet: check they are on screen. The page is pinned to the bottom by the chat bar, so a tall
+  page pushes controls above the top edge; the chat controls sit above the chat bar for that reason and the canvas stays
+  closed until you press *Show the page on the preview canvas*. If a control is visible and a tap still does nothing, the
+  script is busy (Heavy Mode, an automatic fix round, or a free-tier wait): the Running indicator at the top right says so.
 - A mission step failed and the chat says so ("Step N (title) failed: …"): the reason is the plain provider
   error; a full free-tier window is retried once inside the step before it counts as failed. "No page to
   check": the mission was launched without a page on the canvas; put one there (or send the request from

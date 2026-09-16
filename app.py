@@ -276,6 +276,7 @@ def commit_canvas_page(scope: str, workspace: str, source: str, message_id: Opti
         "hash": page_hash(source), "stripped": page_hash(strip_hazards(source)[0]), "message_id": message_id,
         "complete": not reasons, "reasons": reasons, "workspace": workspace,
     }
+    st.session_state["canvas_open"] = True  # a page produced in this session opens the canvas; a restored one does not
     if not reasons and "<script" in source.lower() and st.session_state.get("preview_mode") != PREVIEW_MODE_RUN:
         # A page with scripts is only judged by running it; Preview only would show its buttons as dead. Applied by the
         # canvas before its radio is built (this run's widget may already exist).
@@ -2228,8 +2229,10 @@ def render_workspace_switch() -> str:
 def render_normal_chat(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
     st.subheader("Normal Chat")
     st.caption("A single-pass terminal for quick text, planning, and coding questions." + mode_caption())
-    render_thread_bar(project_scope, "normal_chat", ledger)
     render_history(project_scope, "Conversation", workspace="normal_chat")
+    # The chat bar pins the page to its bottom, so the chat's own controls live here, next to it: above the
+    # conversation they scrolled off the top of the screen and could not be reached at all on a tablet.
+    render_thread_bar(project_scope, "normal_chat", ledger)
     submission = submission or take_queued_send("normal_chat")
     dispatch_chat(project_scope, "normal_chat", submission, ledger)
     dispatch_sandbox_fix(project_scope, "normal_chat", ledger, submission)
@@ -2238,7 +2241,6 @@ def render_normal_chat(project_scope: str, ledger: QuotaLedger, submission: Opti
 def render_chat_bot(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
     st.subheader("Chat Bot")
     st.caption("Continuous developer mode with explicit, consented codebase file injections." + mode_caption())
-    render_thread_bar(project_scope, "chat_bot", ledger)
     staged: List[Any] = []
     if CHAT_INPUT_ACCEPTS_FILES:
         st.caption("Attach text/code files with the paperclip in the chat bar; they are injected into that message only and never stored.")
@@ -2252,6 +2254,7 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger, submission: Optiona
         if staged:
             st.caption(f"{len(staged)} file(s) staged in memory only; they go with your next message. Use Artifact Lock to persist an output.")
     render_history(project_scope, "Developer conversation", workspace="chat_bot")
+    render_thread_bar(project_scope, "chat_bot", ledger)  # next to the chat bar: see render_normal_chat
     submission = submission or take_queued_send("chat_bot")
     files = list(submission.files) if submission and submission.files else list(staged)
     if submission is not None and files and not submission.text.strip():
@@ -3719,11 +3722,25 @@ WORKSPACE_RENDERERS[workspace](scope, ledger, submission)
 
 st.divider()
 # One column: a side panel squeezed the chat to a sliver at iPad width. The canvas opens itself when markup arrives.
+restore_preview_state(str(scope))  # before the canvas is judged: the restored page decides whether the button shows
 canvas_fallback = "" if (st.session_state.get("preview_source") or st.session_state.get("preview_cleared")) else last_markup_in_chat(scope, workspace)
-with st.expander(
-    "Live preview canvas",
-    expanded=bool(st.session_state.get("preview_source") or canvas_fallback or st.session_state.get("scene_preview") or st.session_state.get("sandbox_fix_pending")),
-):
+has_page = bool(st.session_state.get("preview_source") or canvas_fallback)
+# Opened by what happens in this session (a page just arrived, a fix is queued, a scene resolved), never by a page
+# restored from the vault on load: an expanded canvas adds a 500-pixel frame under the conversation, and the page is
+# pinned to its bottom, so on a tablet the chat's own controls ended up above the top of the screen.
+canvas_open = bool(st.session_state.get("canvas_open") or st.session_state.get("scene_preview") or st.session_state.get("sandbox_fix_pending"))
+def _toggle_canvas() -> None:
+    st.session_state["canvas_open"] = not bool(st.session_state.get("canvas_open"))
+
+
+if has_page or canvas_open:
+    # A real button, because an expander's own open state is not remembered across a rerun.
+    st.button(
+        ("Hide the preview canvas" if canvas_open else "Show the page on the preview canvas"),
+        key="toggle_canvas", on_click=_toggle_canvas, use_container_width=True,
+        help="The canvas holds the last page the chat produced; it stays closed on load so the chat controls stay on screen.",
+    )
+with st.expander("Live preview canvas", expanded=canvas_open):
     render_preview_panel(canvas_fallback, workspace)
     if st.session_state.get("scene_preview"):
         st.caption("Last resolved scene (from a spatial mission).")

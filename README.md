@@ -461,6 +461,11 @@ and Normal mode never uses it. Close the tab and it is gone.
   model returns SEARCH/REPLACE blocks, the app applies them in Python (exact match, then whitespace-tolerant),
   reports any block that matched nothing, and puts the merged page on the canvas; say "rewrite the page" for a
   fresh one.
+- **The controls stay on screen (batch U5)**: the chat bar pins the page to its bottom, so anything above a long
+  conversation scrolled off the top and could not be tapped at all on a tablet. Each chat's own controls (chat picker,
+  New chat, Clear chat, Delete, More) now render directly above the chat bar, and the preview canvas opens itself only
+  for a page produced in this session, never for one restored on load: a *Show the page on the preview canvas* button
+  opens it. Together that takes about a thousand pixels off the page and keeps every control in view.
 
 ## Development
 
