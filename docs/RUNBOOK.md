@@ -257,6 +257,13 @@
   A bad paste shows a warning inside the canvas and never takes the page down. A `data:text/html`
   link (pasted or generated) opens as the markup it carries; Download preview (.html) hands out the
   raw page to open in a browser tab.
+- A vendor answers 429 with a long Retry-After: the app records that wait on the vendor's bucket, routes to
+  another keyed vendor at once, and says "asked the app to wait about N s" when none is left; the routing
+  log's capacity reasons show "the vendor asked to wait N s". Gemini requests are also counted per day
+  (200 by default; `CHAT_JOHNSON_RPD_GEMINI`).
+- Company and academy cycles say "Waiting N s: the operator just sent a chat message": the quiet period
+  (five minutes after a chat send, ten after a page request) keeps the free-tier window for the chat; the
+  cycle re-queues itself for the end of it.
 - Run the page shows errors but nothing gets fixed: automatic fixes need Heavy Mode on and the
   Normal Chat or Chat Bot workspace (in another workspace the canvas says so and keeps the report
   until you switch). Each page gets 2 rounds, counted only when a fix lands; the same error twice

@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .. import proctor, treasury_plan, vault
+from .. import proctor, quiet, treasury_plan, vault
 from ..jobs import ACTIVE_STATUSES, JobCancelled, JobContext, enqueue, register_handler
 from . import academy, cycles, economy, leisure, store
 
@@ -63,7 +63,8 @@ def society_tick(ctx: JobContext) -> Dict[str, Any]:
     now = time.time()
     queued: List[str] = []
     call_tokens = int(payload.get("call_tokens") or cycles.DEFAULT_CALL_TOKENS)
-    deferred = budget_deferral(ctx.ledger, call_tokens)
+    quiet_for = quiet.quiet_seconds(scope, now)
+    deferred = budget_deferral(ctx.ledger, call_tokens) or quiet_for > 0  # the operator's chat keeps its window
     # The plan of the day sizes every activity (the engine when installed, today's fixed shares otherwise);
     # an activity the plan leaves unfunded is skipped with the plan's reason, the rest run at the planned scale.
     plan = day_plan(scope, ctx.ledger, now)
@@ -105,7 +106,7 @@ def society_tick(ctx: JobContext) -> Dict[str, Any]:
             status = "failed"
             explored = [{"error": str(exc)[:200]}]
     store.finish_cycle(cycle_id, status, budget.tokens, budget.calls, [{"step": "leisure", "explored": explored, "queued": queued}])
-    next_run_after = now + max(60.0, interval)
+    next_run_after = now + (max(60.0, min(interval, quiet_for)) if quiet_for > 0 else max(60.0, interval))
     next_job = enqueue(scope, KIND_TICK, {k: v for k, v in payload.items() if k != "chained_from"} | {"chained_from": ctx.job_id}, ctx.secrets, run_after=next_run_after)
     plan_note = plan.summary()
     store.insert("cycles", scope, kind="tick", company_id=None, job_id=ctx.job_id, started_at=now, finished_at=time.time(), tokens_planned=0, tokens_used=budget.tokens, calls=budget.calls,

@@ -10,7 +10,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .. import vault
+from .. import quiet, vault
 from ..quota_registry import job_lock
 from ..errors import plain_error
 from ..jobs import JobCancelled, JobContext, enqueue, register_handler
@@ -153,6 +153,9 @@ def run_now(scope: str, secrets: Dict[str, str], mode: str = "normal", call_toke
 def academy_cycle(ctx: JobContext) -> Dict[str, Any]:
     scope = ctx.project_scope
     payload = ctx.payload
+    deferred = quiet.deferral(scope, KIND_ACADEMY, payload, ctx.secrets, ctx.job_id, enqueue, ctx.progress)
+    if deferred is not None:
+        return {"cycle_id": None, "promoted": 0, "graduated": 0, "hired": 0, "log": [{"step": "quiet", "waited_s": deferred["quiet_s"]}], **deferred}
     mode = str(payload.get("mode") or "normal")
     call_tokens = int(payload.get("call_tokens") or DEFAULT_CALL_TOKENS)
     treasury = economy.Treasury(ctx.ledger, economy.shares_for(scope))

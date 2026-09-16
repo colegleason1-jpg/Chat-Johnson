@@ -22,6 +22,7 @@ any of this, and exploration can only pick an endpoint those rows already allowe
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import math
 import threading
@@ -44,7 +45,22 @@ PRIOR_BETA = 2.0
 LATENCY_WINDOW_HOURS = 72.0
 NO_EXPLORE_TASKS = ("context_load",)
 CACHE_SECONDS = 30.0
-OUTCOME_UPDATES = {"up": (1.0, 0.0), "locked": (1.0, 0.0), "down": (0.0, 1.0)}
+OUTCOME_UPDATES = {
+    "up": (1.0, 0.0), "locked": (1.0, 0.0), "down": (0.0, 1.0),
+    # The app's own evidence closes the loop too: a cut answer and a page that threw are half a failure each; a send
+    # the endpoint could not answer at all is a full one.
+    "cut": (0.0, 0.5), "sandbox_error": (0.0, 0.5), "failed": (0.0, 1.0),
+}
+_WORKSPACE: contextvars.ContextVar = contextvars.ContextVar("learner_workspace", default="")
+
+
+def set_workspace(workspace: str) -> None:
+    """Momentum is scoped to the workspace sending: Normal Chat's last endpoint is no reason for a company cycle to follow it."""
+    _WORKSPACE.set(str(workspace or ""))
+
+
+def current_workspace() -> str:
+    return str(_WORKSPACE.get() or "")
 
 
 @dataclass(frozen=True)
@@ -131,8 +147,20 @@ class Learner:
         self.created_at = float(now if now is not None else time.time())
         self.latency = vault.endpoint_latency_stats(self.project_scope, hours=LATENCY_WINDOW_HOURS)
         self.priors = vault.quality_priors_for(self.project_scope)
-        recent = vault.recent_routes(self.project_scope, limit=1)
-        self.last_used = str(recent[0]["route"]).split("/")[0] if recent and str(recent[0]["route"]) != "failed" else None
+        recent = vault.recent_routes(self.project_scope, limit=60)
+        answered = [row for row in recent if str(row["route"]) != "failed"]
+        self.last_used = str(answered[0]["route"]).split("/")[0] if answered else None
+        self.last_used_by_workspace: Dict[str, str] = {}
+        for row in answered:
+            workspace = str(row["workspace"] or "") if "workspace" in row.keys() else ""
+            self.last_used_by_workspace.setdefault(workspace, str(row["route"]).split("/")[0])
+
+    def momentum_endpoint(self) -> Optional[str]:
+        """The endpoint the sending workspace used last (None when it has no history), else the scope's last."""
+        workspace = current_workspace()
+        if workspace:
+            return self.last_used_by_workspace.get(workspace)
+        return self.last_used
 
     @property
     def enabled(self) -> bool:
@@ -185,7 +213,7 @@ class Learner:
         state = dynamics.SystemState(
             telemetry={e.name: telemetry_snapshot(e.name) for e in endpoints},
             load={e.name: dynamics.load_fraction(e, usage.get(e.name)) for e in endpoints},
-            last_used=self.last_used,
+            last_used=self.momentum_endpoint(),
             coupling=dynamics.cached_coupling(self.project_scope),
         )
         return dynamics.modulation(state, [e.name for e in endpoints], self.settings.laws)
@@ -264,6 +292,8 @@ def rebuild_priors(project_scope: str) -> int:
         keys = row.keys()
         outcome = str(row["outcome"]) if "outcome" in keys and row["outcome"] else ""
         endpoint = str(row["route"]).split("/")[0]
+        if not outcome and "finish" in keys and str(row["finish"] or "") == "length":
+            outcome = "cut"  # the app's own evidence: an answer the budget cut
         if observe_outcome(project_scope, endpoint, str(row["task_type"]), outcome):
             count += 1
     invalidate(project_scope)

@@ -68,6 +68,9 @@ def _explain(text: str, status: Optional[int]) -> str:
         return f"{vendor} refused access (HTTP 403): the key lacks permission for this model or region, or the account needs activation."
     if status == 404 or "retired" in lower or "not found" in lower and "model" in lower:
         return f"{vendor} no longer serves that model (HTTP 404): rediscovery picks a live one; set a model override in the sidebar to choose."
+    asked = re.search(r"asked to wait (\d+) s", lower)
+    if asked:
+        return f"{vendor} asked the app to wait about {asked.group(1)} s (HTTP 429): it is sent again then, or another keyed vendor takes it now."
     if status == 429 or "rate limit" in lower or "quota" in lower:
         wait = _WAIT_RE.search(text)
         when = f" ~{int(float(wait.group(1)))} s" if wait else " a minute"

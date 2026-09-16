@@ -51,7 +51,7 @@ from orchestrator.discovery import vendor_for
 from orchestrator.envsafe import self_hosted
 from orchestrator.errors import plain_error
 from orchestrator.executor import Orchestrator
-from orchestrator import dynamics, learner, pinkwave, proctor, treasury_plan
+from orchestrator import dynamics, learner, pinkwave, proctor, quiet, treasury_plan
 from orchestrator.society import economy as society_economy
 from orchestrator import mission_runner  # noqa: F401  (registers the mission job handler)
 from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner, secrets_deliverable
@@ -866,6 +866,7 @@ def consider_sandbox_fix(report: Optional[Dict[str, Any]], source: str, page: st
         if report["blocked"]:
             st.caption("Blocked images, fonts or connections are not fixed automatically; ask the chat to inline them.")
         return
+    note_sandbox_error(scope, page, int(report["seq"]))
     heavy = active_mode() == "heavy"
     generating = bool(st.session_state.get("generation_running", False)) or get_task_request_lock().locked()
     allowed, reason, settled = fix_decision(
@@ -891,6 +892,24 @@ def consider_sandbox_fix(report: Optional[Dict[str, Any]], source: str, page: st
     # The fix turn belongs in the workspace's chat area above the pinned bar, and run_generation assigns preview_editor,
     # which is illegal once this run's text_area exists: queue it and start the script over.
     st.rerun()
+
+
+def note_sandbox_error(scope: str, page: str, seq: int) -> None:
+    """A page that threw counts against the endpoint that wrote it, once per report; the learner used to hear thumbs only."""
+    noted: set = st.session_state.setdefault("sandbox_errors_noted", set())
+    if (page, seq) in noted:
+        return
+    noted.add((page, seq))
+    canvas = st.session_state.get("canvas_page") or {}
+    message_id = canvas.get("message_id")
+    if not message_id or page not in (canvas.get("hash"), canvas.get("stripped")):
+        return
+    try:
+        route = routes_for_messages(scope, [int(message_id)]).get(int(message_id))
+        if route is not None and str(route["route"]) != "failed":
+            learner.observe_outcome(scope, str(route["route"]).split("/")[0], str(route["task_type"]), "sandbox_error")
+    except Exception:  # learning must never break the canvas
+        pass
 
 
 def dispatch_sandbox_fix(project_scope: str, workspace: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
@@ -1569,13 +1588,17 @@ def thread_mission(thread: sqlite3.Row) -> str:
 def log_route(
     workspace: Optional[str], task_type: str, route: str, mode: str, started: float, reason: str, finish: str = "",
     decision: Optional[RouteDecision] = None, message_id: Optional[int] = None, fragility: Optional[float] = None,
+    waited: float = 0.0,
 ) -> None:
     """Trace of every send (what was asked, where it went, how long, how it ended, why): session table plus the vault.
 
     The vault row also keeps the runner-up endpoint and the pink-wave state, and is linked to the answer's message id so
-    a thumbs verdict or a locked artifact can be attached to the decision that produced it.
+    a thumbs verdict or a locked artifact can be attached to the decision that produced it. ``ms`` is the pass that
+    produced the answer (its POST to the end of its stream) when the decision carries it, else the wall time net of
+    ``waited`` (window pauses and the lock wait), so the learner's speed is the endpoint's, never the queue's.
     """
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    pass_ms = int(getattr(decision, "elapsed_ms", 0) or 0) if decision is not None else 0
+    elapsed_ms = pass_ms if pass_ms > 0 else max(0, int((time.perf_counter() - started - float(waited)) * 1000))
     log: List[Dict[str, Any]] = st.session_state.setdefault("routing_log", [])
     log.append(
         {
@@ -1660,7 +1683,12 @@ def _run_generation(
         )
     user_message_id = append_message(project_scope, "user", clean_prompt, mode=mode, workspace=workspace, task_type=task_type)
     pinkwave.activate(project_scope)  # this send walks the scope's wave: routing jitter, Heavy schedule, recall share
+    learner.set_workspace(workspace or "")  # momentum follows this workspace's last endpoint, not another's
     interface = fix_round > 0 or is_interface_request(clean_prompt)
+    try:
+        quiet.note_chat_send(project_scope, page=interface)  # background cycles step aside for a while
+    except Exception:  # a stamp must never break a send
+        pass
     sidebar_budget = int(st.session_state.get("max_tokens", 4096))
     current_page = ""
     if interface and fix_round == 0 and workspace in CANVAS_WORKSPACES and refers_to_canvas(clean_prompt):
@@ -1681,6 +1709,7 @@ def _run_generation(
     scroll_to_bottom(user_message_id)
     live_box = st.empty()
     started = time.perf_counter()
+    waited = 0.0  # window pauses and the lock wait: never the endpoint's speed
     request_lock = get_task_request_lock()
     lock_held = False  # released only by the thread that acquired it: a mission may hold the same lock
     try:
@@ -1690,11 +1719,14 @@ def _run_generation(
             with live_box.container():
                 st.info(f"Your free allowance for this minute is used up; sending again in {int(wait) + 1} s…")
             time.sleep(wait + 0.5)
+            waited += wait + 0.5
             live_box.empty()
         if request_lock.locked():
             with live_box.container():
                 st.info(f"A background job (academy, company cycle, or mission) is using the provider; waiting up to {int(CHAT_LOCK_TIMEOUT_SECONDS)} s for it to step aside…")
+        lock_started = time.perf_counter()
         lock_held = acquire_for_chat(request_lock, CHAT_LOCK_TIMEOUT_SECONDS)
+        waited += time.perf_counter() - lock_started
         live_box.empty()
         if not lock_held:
             st.caption("The background job did not release the provider in time; sending anyway (the ledger still meters every attempt).")
@@ -1755,6 +1787,7 @@ def _run_generation(
             with live_box.container():
                 st.info(f"Your free allowance for this minute is used up; sending again in {int(retry_wait) + 1} s…")
             time.sleep(retry_wait + 0.5)
+            waited += retry_wait + 0.5
             live_box.empty()
             answer, decision = attempt_generation()
     except Exception as exc:
@@ -1764,7 +1797,7 @@ def _run_generation(
         # The thread says so too: a question with no answer used to look like the app forgot it.
         note = f"The send failed: {plain_error(exc)}"
         system_id = append_message(project_scope, "system", note, mode=mode, workspace=workspace, task_type=task_type, finish="failed")
-        log_route(workspace, task_type, "failed", mode, started, str(exc)[:160], "failed", message_id=system_id)
+        log_route(workspace, task_type, "failed", mode, started, str(exc)[:160], "failed", message_id=system_id, waited=waited)
         st.error(plain_error(exc))
         with st.expander("Technical detail", expanded=False):
             st.code(redact_secrets(str(exc))[:600])
@@ -1809,7 +1842,12 @@ def _run_generation(
         finish=decision.finish,
     )
     fragility = proctor.cached_fragility(task_type, sum(len(str(m.get("content", ""))) for m in messages) // 4 + max_tokens, ledger) if cortex_available() else None
-    log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish, decision=decision, message_id=assistant_id, fragility=fragility)
+    log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish, decision=decision, message_id=assistant_id, fragility=fragility, waited=waited)
+    if decision.finish == "length":
+        try:
+            learner.observe_outcome(project_scope, decision.provider, task_type, "cut")  # the app's own evidence moves the prior
+        except Exception:
+            pass
     with st.chat_message("assistant"):
         applied = [skill.name for skill in select_skills(clean_prompt)]
         st.caption(
@@ -2859,7 +2897,7 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
         chain = st.checkbox("Keep cycling at the company interval while the app is awake", key=f"chain_{company_id}", value=False)
         left, right = st.columns(2)
         if left.button("Run a cycle now", key=f"run_cycle_{company_id}", type="primary", use_container_width=True, disabled=not configured_provider_names()):
-            society.run_now(project_scope, company_id, job_secrets_for_session(), mode=active_mode(), call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 1500), chain=chain, board_thread_id=thread_id)
+            society.run_now(project_scope, company_id, job_secrets_for_session(), mode="normal", call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 1500), chain=chain, board_thread_id=thread_id)
             st.rerun()
         queued = [job_view(r) for r in list_jobs(project_scope, ("queued",), limit=50, kind=society.KIND_COMPANY) if job_view(r)["payload"].get("company_id") == company_id]
         if right.button("Pause chain (cancel queued cycles)", key=f"pause_{company_id}", use_container_width=True, disabled=not queued):
@@ -3018,7 +3056,7 @@ def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional
         st.rerun()
     chain = chain_col.checkbox("Keep cycling (3 h)", key="academy_chain", value=False)
     if run_col.button("Run an academy cycle now", key="run_academy", use_container_width=True, disabled=not configured_provider_names() or not agents):
-        society.run_academy_now(project_scope, job_secrets_for_session(), mode=active_mode(), call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 900), chain=chain)
+        society.run_academy_now(project_scope, job_secrets_for_session(), mode="normal", call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 900), chain=chain)
         st.rerun()
     queued = [job_view(r) for r in list_jobs(project_scope, ("queued",), limit=50, kind=society.KIND_ACADEMY)]
     if queued and st.button("Pause chain (cancel queued academy cycles)", key="pause_academy"):
@@ -3040,7 +3078,7 @@ def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional
         custom_sources = parse_custom_sources(sources_text)
         s1, s2 = st.columns(2)
         if s1.button("Start the society tick", key="start_tick", type="primary", use_container_width=True, disabled=state["running"] or not configured_provider_names()):
-            society.start_tick(project_scope, job_secrets_for_session(), mode=active_mode(), interval_s=tick_minutes * 60, academy_interval_s=academy_hours * 3600, leisure_cap=leisure_cap, custom_sources=custom_sources, call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 1200))
+            society.start_tick(project_scope, job_secrets_for_session(), mode="normal", interval_s=tick_minutes * 60, academy_interval_s=academy_hours * 3600, leisure_cap=leisure_cap, custom_sources=custom_sources, call_tokens=min(int(st.session_state.get("max_tokens", 2048)), 1200))
             st.rerun()
         if s2.button("Stop the tick", key="stop_tick", use_container_width=True, disabled=not state["running"]):
             society.stop_tick(project_scope)

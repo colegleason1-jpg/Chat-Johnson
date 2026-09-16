@@ -119,6 +119,7 @@ class CortexEndpoint:
     strengths: Tuple[str, ...]
     model_env: str = ""
     max_output_tokens: int = 8_192  # the largest single answer the model can write; a page request needs a big one
+    rpd_limit: int = 0  # requests per UTC day the vendor allows (0 = no such cap); CHAT_JOHNSON_RPD_<VENDOR> overrides
 
 
 # Shared with the legacy provider client: one live-id cache per vendor.
@@ -159,6 +160,7 @@ CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
         strengths=("context_load", "reasoning", "chat"),
         model_env="CORTEX_GEMINI_MODEL",
         max_output_tokens=65_536,
+        rpd_limit=200,  # the Flash free tier also counts requests a day (250 published); a margin for retries and probes
     ),
     "groq": CortexEndpoint(
         name="groq",
@@ -666,6 +668,14 @@ def effective_tpm(endpoint: "CortexEndpoint") -> Optional[int]:
     return endpoint.tpm_limit
 
 
+def effective_rpd(endpoint: "CortexEndpoint") -> int:
+    """The endpoint's requests-per-day ceiling: ``CHAT_JOHNSON_RPD_<VENDOR>`` over the table; 0 means no such cap."""
+    override = resolve_secret(f"CHAT_JOHNSON_RPD_{_vendor(endpoint).upper()}")
+    if override.isdigit():
+        return int(override)
+    return int(endpoint.rpd_limit)
+
+
 def _ensure_cortex_ledger(ledger: Optional[QuotaLedger]) -> None:
     """Register each Cortex endpoint's vendor bucket, tightening to the stricter policy.
 
@@ -682,6 +692,9 @@ def _ensure_cortex_ledger(ledger: Optional[QuotaLedger]) -> None:
             effective_rpm(endpoint),
             tpm if tpm is not None else 10**9,
         )
+        rpd = effective_rpd(endpoint)
+        if rpd > 0:
+            ledger.tighten_daily_requests(_vendor(endpoint), rpd)
 
 
 LOCAL_ENDPOINT_NAME = "local"
@@ -820,11 +833,13 @@ def cortex_wait_seconds(ledger: Optional[QuotaLedger], messages: Sequence[Mappin
             continue
         if usage.daily_limit > 0 and usage.daily_used + estimated > usage.daily_limit:
             continue
+        if usage.daily_request_limit > 0 and usage.daily_requests >= usage.daily_request_limit:
+            continue
         waits.append(ledger.wait_seconds(_vendor(endpoint), estimated))
     return float(min(waits)) if waits else 0.0
 
 
-HEADROOM_MARKERS = ("headroom", "requests used in the last minute", "would exceed")
+HEADROOM_MARKERS = ("headroom", "requests used in the last minute", "would exceed", "asked to wait")
 CHAT_MAX_WAIT_SECONDS = 65.0  # one free-tier window; longer waits surface as the plain error instead
 
 
@@ -864,6 +879,9 @@ class EndpointUsage:
     daily_limit: float = 0.0   # 0 = uncapped
     rpm_limit: float = 0.0     # 0 = use the endpoint table
     tpm_limit: float = 0.0
+    daily_requests: float = 0.0
+    daily_request_limit: float = 0.0  # 0 = no request cap per day
+    blocked_for: float = 0.0   # seconds the vendor asked the app to wait (a 429 with a reset hint)
 
     def rpm_ceiling(self, endpoint: CortexEndpoint) -> float:
         table = float(effective_rpm(endpoint))
@@ -882,6 +900,8 @@ def _usage_from_row(row: Mapping[str, float]) -> EndpointUsage:
         rpm_used=float(row.get("rpm_used", 0.0)), tpm_used=float(row.get("tpm_used", 0.0)),
         daily_used=float(row.get("daily_tokens", 0.0)), daily_limit=float(row.get("daily_limit", 0.0)),
         rpm_limit=float(row.get("rpm_limit", 0.0)), tpm_limit=float(row.get("tpm_limit", 0.0)),
+        daily_requests=float(row.get("daily_requests", 0.0)), daily_request_limit=float(row.get("daily_request_limit", 0.0)),
+        blocked_for=float(row.get("blocked_for", 0.0)),
     )
 
 
@@ -948,6 +968,11 @@ def _capacity_reasons(endpoint: CortexEndpoint, usage: EndpointUsage, estimated_
     if usage.daily_limit > 0 and usage.daily_used + estimated_tokens > usage.daily_limit:
         hours = max(1, int(seconds_to_utc_midnight() // 3600) + 1)
         reasons.append(f"daily cap of {int(usage.daily_limit)} tokens reached ({int(usage.daily_used)} used); resets in about {hours} h")
+    if usage.daily_request_limit > 0 and usage.daily_requests >= usage.daily_request_limit:
+        hours = max(1, int(seconds_to_utc_midnight() // 3600) + 1)
+        reasons.append(f"{int(usage.daily_requests)}/{int(usage.daily_request_limit)} requests used today; resets in about {hours} h")
+    if usage.blocked_for > 0:
+        reasons.append(f"the vendor asked to wait {int(usage.blocked_for) + 1} s (HTTP 429)")
     return reasons
 
 
@@ -991,6 +1016,18 @@ def _build_constraint_array(
             rows.append(row)
             lower.append(-array_lib.inf)
             upper.append(float(max(0.0, use.daily_limit - use.daily_used)))  # tokens * x_i <= remaining today
+        if use.daily_request_limit > 0:
+            row = array_lib.zeros(len(endpoints), dtype=float)
+            row[index] = 1.0
+            rows.append(row)
+            lower.append(-array_lib.inf)
+            upper.append(float(max(0.0, use.daily_request_limit - use.daily_requests)))  # x_i <= remaining requests today
+        if use.blocked_for > 0:
+            row = array_lib.zeros(len(endpoints), dtype=float)
+            row[index] = 1.0
+            rows.append(row)
+            lower.append(-array_lib.inf)
+            upper.append(0.0)  # the vendor asked to wait: x_i <= 0
         if not enabled.get(endpoint.name, False):
             row = array_lib.zeros(len(endpoints), dtype=float)
             row[index] = 1.0
@@ -1242,6 +1279,44 @@ def discover_endpoint_model(
     )
 
 
+_DURATION_RE = re.compile(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m(?!s))?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?$")
+
+
+def vendor_wait_hint(headers: Mapping[str, Any]) -> float:
+    """Seconds the vendor asks the app to wait, from Retry-After (seconds or an HTTP date) or a rate-limit reset header
+    such as Groq's ``x-ratelimit-reset-requests: 2m59.56s``; 0 when the response carries no hint."""
+    if not headers:
+        return 0.0
+    lowered = {str(k).lower(): str(v) for k, v in dict(headers).items()}
+    hints = []
+    retry_after = lowered.get("retry-after", "").strip()
+    if retry_after:
+        try:
+            hints.append(float(retry_after))
+        except ValueError:
+            try:
+                from email.utils import parsedate_to_datetime
+
+                hints.append(parsedate_to_datetime(retry_after).timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                pass
+    for name in ("x-ratelimit-reset-requests", "x-ratelimit-reset-tokens", "x-ratelimit-reset"):
+        value = lowered.get(name, "").strip().lower()
+        if not value:
+            continue
+        match = _DURATION_RE.fullmatch(value)
+        if match and any(match.groups()):
+            hours, minutes, seconds, millis = (float(group or 0.0) for group in match.groups())
+            hints.append(hours * 3600.0 + minutes * 60.0 + seconds + millis / 1000.0)
+            continue
+        try:
+            number = float(value)
+        except ValueError:
+            continue
+        hints.append(number - time.time() if number > 10_000_000 else number)  # an epoch or plain seconds
+    return max(0.0, max(hints)) if hints else 0.0
+
+
 def _resilient_post(
     selected: CortexEndpoint,
     messages: Sequence[Mapping[str, str]],
@@ -1294,11 +1369,21 @@ def _resilient_post(
                 return response, model_id
             record_telemetry(selected.name, latency, False)
             detail = _providers.body_text(response)
-            retry_after = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+            response_headers = getattr(response, "headers", None) or {}
+            retry_after = response_headers.get("Retry-After") if hasattr(response_headers, "get") else None
             response.close()
             if secret:
                 detail = detail.replace(secret, "[REDACTED_SECRET]")
             last_error = f"HTTP {response.status_code}: {detail}"
+            if int(response.status_code) == 429:
+                # The vendor's own view of the window wins over the ledger's: the wait it names is recorded on the
+                # bucket, so selection moves to another vendor now and the pacer knows the real wait. A long wait is
+                # never slept through under the request lock.
+                hint = vendor_wait_hint(response_headers) if hasattr(response_headers, "get") else 0.0
+                if ledger is not None:
+                    ledger.block(vendor, hint if hint > 0 else discovery.retry_delay(attempt))
+                if hint > discovery.MAX_BACKOFF_SECONDS:
+                    raise ProviderError(f"{selected.name} asked to wait {int(hint) + 1} s (HTTP 429: {detail[:120]})")
             if discovery.is_transient(response.status_code) and attempt < max_attempts:
                 discovery.sleep(discovery.retry_delay(attempt, retry_after))
                 continue
@@ -1385,6 +1470,8 @@ def build_cortex_request(
         "temperature": float(temperature),
         "stream": bool(stream),
     }
+    if stream:
+        payload["stream_options"] = {"include_usage": True}  # the last chunk then carries the vendor's own token count
     if selected.name == "groq" and "gpt-oss" in resolved_model and int(max_tokens) >= PAGE_OUTPUT_TOKENS:
         # gpt-oss spends the same ceiling on hidden reasoning; a page answer needs the ceiling for the page.
         payload["reasoning_effort"] = "low"
@@ -1410,6 +1497,23 @@ def _extract_finish(selected: CortexEndpoint, payload: Mapping[str, Any]) -> str
     if raw in ("content_filter", "safety", "recitation", "blocklist", "prohibited_content", "spii"):
         return "filtered"
     return raw
+
+
+def _extract_usage(selected: CortexEndpoint, payload: Mapping[str, Any]) -> int:
+    """The vendor's total token count for the request when a chunk carries one (hidden reasoning included); 0 otherwise."""
+    if selected.kind == "gemini":
+        meta = payload.get("usageMetadata") or {}
+        return int(meta.get("totalTokenCount") or 0) if isinstance(meta, dict) else 0
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        extra = payload.get("x_groq")
+        usage = extra.get("usage") if isinstance(extra, dict) else None
+    if not isinstance(usage, dict):
+        return 0
+    total = usage.get("total_tokens")
+    if total is None:
+        total = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
+    return int(total or 0)
 
 
 def _extract_stream_text(selected: CortexEndpoint, payload: Mapping[str, Any]) -> str:
@@ -1462,7 +1566,9 @@ def cortex_stream(
 ) -> Iterator[str]:
     """Yield generated text chunks from a MILP-selected provider endpoint.
 
-    ``status`` (when given) receives ``finish`` once the vendor reports why the answer ended.
+    ``status`` (when given) receives ``finish`` once the vendor reports why the answer ended, ``model`` (the id
+    that actually served, after any rediscovery or sibling fallback), ``usage_tokens`` (the vendor's own count
+    when its last chunk carries one) and ``elapsed_ms`` (from the POST to the end of the stream, no waits).
 
     Transient vendor errors are retried with backoff, a retired model id is
     replaced from the vendor's live list, and an overloaded model falls back
@@ -1472,16 +1578,23 @@ def cortex_stream(
         raise ProviderError("requests is required for provider HTTP execution")
     selected = _as_endpoint(endpoint)
     effective_timeout = timeout or int(os.environ.get("CHAT_JOHNSON_TIMEOUT", "120"))
-    response, _ = _resilient_post(
+    started = time.monotonic()
+    response, served_model = _resilient_post(
         selected, messages, max_tokens, temperature, stream=True, system_prompt=system_prompt,
         timeout=effective_timeout, ledger=ledger,
     )
+    if status is not None:
+        status["model"] = served_model
     emitted = False
     try:
         for payload_item in _iter_sse_payloads(response):
             finish = _extract_finish(selected, payload_item)
             if finish and status is not None:
                 status["finish"] = finish
+            if status is not None:
+                usage_tokens = _extract_usage(selected, payload_item)
+                if usage_tokens:
+                    status["usage_tokens"] = usage_tokens
             chunk = _extract_stream_text(selected, payload_item)
             if chunk:
                 emitted = True
@@ -1490,6 +1603,8 @@ def cortex_stream(
         raise ProviderError(f"{selected.name} stream failed after {'some' if emitted else 'no'} text: {type(exc).__name__}") from exc
     finally:
         response.close()
+        if status is not None:
+            status["elapsed_ms"] = int((time.monotonic() - started) * 1000)
     if not emitted:
         raise ProviderError(f"{selected.name} returned an empty stream (no text; blocked, truncated, or filtered)")
 
@@ -1591,20 +1706,22 @@ def cortex_generate(
         status: Dict[str, Any] = {}
         try:
             raw = ""
+            reservation = ledger.reserve(_vendor(endpoint), estimated_tokens) if ledger is not None else None
             try:
                 for chunk in cortex_stream(
                     endpoint, messages, max_tokens=max_tokens, temperature=temperature, system_prompt=system_prompt, ledger=ledger, status=status,
                 ):
                     raw += chunk
             finally:
-                # Charged on the raw text (hidden reasoning included) and even when the stream failed part-way.
-                if ledger is not None and raw:
-                    ledger.record(_vendor(endpoint), _estimate_tokens(messages, raw), count_request=False)
+                # The reservation becomes the real charge: the vendor's own count when its last chunk carried one, else
+                # the raw text (hidden reasoning included); charged even when the stream failed part-way.
+                if ledger is not None and reservation is not None:
+                    ledger.settle(_vendor(endpoint), reservation, _charge_for(status, messages, raw), count_request=False)
             text = strip_reasoning_tags(raw)
             route_decision = RouteDecision(
                 finish=str(status.get("finish", "")),
                 provider=endpoint.name,
-                model=endpoint_model(endpoint),
+                model=str(status.get("model") or endpoint_model(endpoint)),
                 task_type=task_type,
                 reason=f"{decision.reason}; solver={decision.solver}; attempted={attempted}",
                 solver=decision.solver,
@@ -1612,14 +1729,37 @@ def cortex_generate(
                 runner_up=decision.runner_up,
                 chaos=dict(decision.chaos),
                 explored=decision.explored,
+                elapsed_ms=int(status.get("elapsed_ms", 0) or 0),
             )
             return text, route_decision
         except ProviderError as exc:
             excluded.add(endpoint.name)
             failures[endpoint.name] = str(exc)
+            _note_failure(endpoint.name, task_type)
 
     detail = "; ".join(f"{name}: {error}" for name, error in failures.items()) or "no keyed endpoint"
     raise ProviderError(f"all Cortex endpoints failed -> {detail}")
+
+
+def _charge_for(status: Mapping[str, Any], messages: Sequence[Mapping[str, str]], raw: str) -> int:
+    """What a finished (or broken) stream costs: the vendor's count when it gave one, else the estimate; 0 for no text."""
+    counted = int(status.get("usage_tokens", 0) or 0)
+    if counted > 0:
+        return counted
+    return _estimate_tokens(messages, raw) if raw else 0
+
+
+def _note_failure(endpoint_name: str, task_type: str) -> None:
+    """A failed send moves the endpoint's quality prior for that task (the learner only ever heard thumbs before)."""
+    from . import learner as learner_module
+
+    active = learner_module.current()
+    if active is None:
+        return
+    try:
+        learner_module.observe_outcome(active.project_scope, endpoint_name, task_type, "failed")
+    except Exception:  # learning must never break a send
+        pass
 
 
 class CortexStream:
@@ -1676,14 +1816,22 @@ class CortexStream:
 
     def __iter__(self) -> Iterator[str]:
         # Hidden reasoning is filtered live, not only after the stream ends.
+        vendor = _vendor(self.milp.endpoint)
+        reservation = self.ledger.reserve(vendor, _estimate_tokens(self.messages) + int(self.max_tokens)) if self.ledger is not None else None
         try:
             yield from _visible_chunks(self._raw())
+        except ProviderError:
+            _note_failure(self.milp.endpoint.name, self.decision.task_type)
+            raise
         finally:
-            # Charged on the raw text, and charged even when the stream failed part-way.
-            if self.ledger is not None and self.text:
-                self.ledger.record(_vendor(self.milp.endpoint), _estimate_tokens(self.messages, self.text), count_request=False)
+            # The reservation becomes the real charge (the vendor's count, else the raw text), even after a broken stream.
+            if self.ledger is not None and reservation is not None:
+                self.ledger.settle(vendor, reservation, _charge_for(self.status, self.messages, self.text), count_request=False)
             self.text = strip_reasoning_tags(self.text)
             self.decision.finish = str(self.status.get("finish", ""))
+            if self.status.get("model"):
+                self.decision.model = str(self.status["model"])
+            self.decision.elapsed_ms = int(self.status.get("elapsed_ms", 0) or 0)
 
 
 # =============================================================================
@@ -1910,6 +2058,7 @@ class RouteDecision:
     runner_up: str = ""  # what Cortex 2 would have chosen instead (the counterfactual for the outcome log)
     chaos: Dict[str, Any] = field(default_factory=dict)  # the pink-wave state behind this decision
     explored: bool = False  # the wave routed this send to a runner-up on purpose
+    elapsed_ms: int = 0  # the pass that produced this answer, from its POST to the end of its stream, no waits
 
 
 def classify(text: str) -> str:

@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .. import vault
+from .. import quiet, vault
 from ..quota_registry import job_lock
 from ..errors import plain_error
 from ..jobs import JobCancelled, JobContext, enqueue, register_handler
@@ -259,6 +259,9 @@ def company_cycle(ctx: JobContext) -> Dict[str, Any]:
     if not company:
         raise RuntimeError(f"company {payload.get('company_id')} not found")
     company_id = int(company["id"])
+    deferred = quiet.deferral(scope, KIND_COMPANY, payload, ctx.secrets, ctx.job_id, enqueue, ctx.progress)
+    if deferred is not None:
+        return {"cycle_id": None, "to_board": 0, "log": [{"step": "quiet", "waited_s": deferred["quiet_s"]}], "next_run_after": None, **deferred}
     mode = str(payload.get("mode") or "normal")
     call_tokens = int(payload.get("call_tokens") or DEFAULT_CALL_TOKENS)
     treasury = economy.Treasury(ctx.ledger, economy.shares_for(scope))

@@ -130,8 +130,8 @@ def get_request_lock() -> threading.Lock:
         return lock
 
 
-CHAT_LOCK_TIMEOUT_SECONDS = 20.0   # a chat send waits this long for a background job to release the provider, then proceeds
-JOB_YIELD_SECONDS = 30.0           # a background job steps aside for a waiting chat send for at most this long
+CHAT_LOCK_TIMEOUT_SECONDS = 65.0   # one free-tier window: a chat send waits this long for a background job to release the provider, then proceeds
+JOB_YIELD_SECONDS = 70.0           # a background job steps aside for a waiting chat send for at most this long
 _CHAT_WAITING = threading.Event()  # set while the operator's chat is waiting for the request lock
 
 

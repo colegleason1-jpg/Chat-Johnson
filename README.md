@@ -440,6 +440,16 @@ and Normal mode never uses it. Close the tab and it is gone.
   like this* (endpoint, reason, runner-up, latency, how it ended); a restart and keys from an earlier session
   are announced; browser errors are said plainly ("the page's code stops mid-way"); `?health=1` reports the
   process start, workers, jobs, ledger and snapshot age.
+- **Routing and quota that see reality (batch U3)**: the ledger reserves a request's estimated tokens while it
+  is in flight and settles them with the vendor's own count from the last stream chunk (hidden reasoning
+  included); a 429 with Retry-After or a rate-limit reset header blocks that vendor for exactly that long, so
+  the send moves to another keyed vendor at once and a long wait is never slept through under the lock;
+  Gemini's requests per day are counted (`CHAT_JOHNSON_RPD_GEMINI` overrides 200); the route row records the
+  model that actually served and the pass latency net of window pauses and lock waits, so learned speed is the
+  endpoint's; a cut answer, a failed send and a page that threw in the sandbox move the endpoint's quality
+  prior like a thumbs-down would; momentum follows the sending workspace's last endpoint, not another's;
+  background cycles run in normal mode and wait five minutes after a chat send (ten after a page request); the
+  chat waits one full window (65 s) for a background job to release the provider.
 
 ## Development
 
