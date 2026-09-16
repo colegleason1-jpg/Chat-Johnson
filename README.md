@@ -345,7 +345,22 @@ HTTP status, key fingerprint, and any auto-switch. Probes count toward the vendo
 - **Prompt context sizing**: the project-memory block is sized so the request fits every keyed
   endpoint's TPM ceiling at the current output budget (4 chars per token, 500-token reserve, never
   below 8k or above 24k characters), so a long thread does not silently lock out the fastest
-  endpoint. The live window fills newest-first, so a follow-up always sees the latest results.
+  endpoint. The live window fills newest-first and before memory, so a follow-up always sees the
+  latest results whole; an inherited digest is capped at an eighth and labelled background, never a rule.
+- **Finished answers (batch U1)**: every message remembers the vendor's finish reason. An answer cut
+  inside its code is continued by the app (verbatim from its tail, stitched on overlap, up to three
+  rounds) before it is stored or shown; a still-cut answer carries a plain note into the next prompt
+  so the model never mistakes a cut page for a design. A page or app request is raised automatically
+  to the largest answer a keyed provider can write (up to 16,384; sidebar checkbox, default on), routes
+  only to endpoints that can write it, gets the whole budget for the Heavy draft, a critique told a cut
+  is a cut, and a synthesis that must not shorten. A fragment or deliberation-only answer is asked for
+  once more. The model receives an APP STATE block (canvas mode, answer limit, whether the last answer
+  was cut, the last sandbox report) and CANVAS RULES (no CDN, no network) in both preview modes, and
+  the page it is asked to change travels whole on the request turn. Only the operator's own sentences
+  can become digest decisions; recall needs whole real words and is off for page requests; a chat
+  migrates far later and never counts automatic turns as load. The canvas keeps one whole page per
+  scope (the last complete page fence wins over snippets and stubs), survives a reload with its mode,
+  and an incomplete page is continued, never sent to a repair round.
 - **Free-tier pacing in Task Finder**: before each workstream the ledger is consulted; if every keyed
   vendor is inside its RPM/TPM window the step waits (up to 65 s) instead of failing. Missions are
   pinned to the chat, so they survive window eviction and thread migration.

@@ -191,6 +191,133 @@ CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
     ),
 }
 
+# A page or app is the one answer that must not be cut: it gets a bigger budget and only endpoints that can write it.
+PAGE_OUTPUT_TOKENS = 6_144        # below this a page request is not worth the output-need rows
+INTERFACE_OUTPUT_CAP = 16_384     # the automatic budget raise for a page request stops here
+OUTPUT_RESERVE_TOKENS = 500       # prompt slack kept out of the output ceiling
+CONTINUATION_ROUNDS = 3
+CONTINUATION_TAIL_CHARS = 240
+CONTINUATION_MIN_OVERLAP = 12
+_INTERFACE_RE = re.compile(
+    r"\b(?:apps?|application|web ?pages?|pages?|website|site|landing|dashboard|interface|ui|mock-?ups?|prototype|games?|"
+    r"widget|calculator|quiz|flashcards?|study guide|to-?do|html|css|buttons?|preview|canvas)\b",
+    re.I,
+)
+
+
+def is_interface_request(text: str) -> bool:
+    """Whether the request asks for a page, app or interface (or refers to the one on the canvas)."""
+    head = (text or "")[:2_000]
+    return "```html" in head or bool(_INTERFACE_RE.search(head))
+
+
+def keyed_endpoints() -> List[CortexEndpoint]:
+    return [endpoint for endpoint in CORTEX_ENDPOINTS.values() if _endpoint_key(endpoint)]
+
+
+def output_ceiling(endpoint: CortexEndpoint, prompt_tokens: int) -> int:
+    """The largest answer this endpoint can write after the prompt: its model ceiling, bounded by its minute window."""
+    tpm = effective_tpm(endpoint)
+    by_window = (int(tpm) - int(prompt_tokens) - OUTPUT_RESERVE_TOKENS) if tpm else endpoint.max_output_tokens
+    return max(0, min(int(endpoint.max_output_tokens), by_window))
+
+
+def effective_output_budget(messages: Sequence[Mapping[str, str]], sidebar_budget: int, interface: bool) -> int:
+    """The output budget a send really gets: the slider, raised for a page request up to what a keyed endpoint can write."""
+    budget = int(sidebar_budget)
+    if not interface:
+        return budget
+    prompt_tokens = _estimate_tokens(messages)
+    ceilings = [output_ceiling(endpoint, prompt_tokens) for endpoint in keyed_endpoints()]
+    best = max(ceilings) if ceilings else budget
+    return max(budget, min(INTERFACE_OUTPUT_CAP, best))
+
+
+def open_fence(text: str) -> bool:
+    return (text or "").count("```") % 2 == 1
+
+
+def needs_continuation(text: str, finish: str) -> bool:
+    """A cut inside a fenced block is the one truncation the app finishes on its own."""
+    return finish == "length" and open_fence(text)
+
+
+def continuation_messages(messages: Sequence[Mapping[str, str]], answer: str, tail_chars: int = CONTINUATION_TAIL_CHARS) -> List[dict]:
+    """The original conversation plus the cut answer, then the order to continue it verbatim from its tail."""
+    tail = answer[-tail_chars:]
+    order = (
+        f"CONTINUATION: your previous answer was cut by the output budget after {len(answer) // 4} tokens. Continue it "
+        "EXACTLY from the end of this tail, character for character: no preamble, no repeated lines, no new fence "
+        "opener, only the missing rest, then close the fence.\n[TAIL]\n" + tail + "\n[/TAIL]"
+    )
+    return [dict(m) for m in messages] + [{"role": "assistant", "content": answer}, {"role": "user", "content": order}]
+
+
+_FENCE_OPENER = re.compile(r"^\s*```[a-zA-Z0-9_-]*[ \t]*\n?")
+
+
+def stitch(answer: str, continuation: str, max_overlap: int = CONTINUATION_TAIL_CHARS) -> str:
+    """Join a continuation onto the cut answer, dropping a repeated fence opener and the longest overlapping tail."""
+    piece = _FENCE_OPENER.sub("", continuation, count=1) if open_fence(answer) else continuation
+    longest = min(len(answer), len(piece), max_overlap)
+    for size in range(longest, CONTINUATION_MIN_OVERLAP - 1, -1):
+        if answer.endswith(piece[:size]):
+            return answer + piece[size:]
+    return answer + piece
+
+
+def continue_answer(
+    task_type: str,
+    messages: Sequence[Mapping[str, str]],
+    answer: str,
+    decision: "RouteDecision",
+    ledger: Optional[QuotaLedger],
+    max_tokens: int,
+    rounds: int = CONTINUATION_ROUNDS,
+    on_round: Optional[Callable[[int], None]] = None,
+) -> Tuple[str, "RouteDecision", int]:
+    """Finish an answer that was cut inside a fence: up to ``rounds`` verbatim continuations, stitched into one text.
+
+    Runs single passes in normal mode (a Heavy pass would redraft the page). Returns the stitched answer, the last
+    decision (its ``finish`` says whether the text is now complete) and the number of continuations used.
+    """
+    used = 0
+    text, last = answer, decision
+    while used < rounds and needs_continuation(text, last.finish):
+        used += 1
+        if on_round is not None:
+            on_round(used)
+        piece, last = cortex_generate(
+            task_type, continuation_messages(messages, text), ledger=ledger, max_tokens=max_tokens, temperature=0.1,
+            output_need=max_tokens,
+        )
+        piece = strip_reasoning_tags(piece)
+        if not piece.strip():
+            break
+        text = stitch(text, piece)
+        last.reason = f"{decision.reason}; continued {used}x"
+    return text, last, used
+
+
+_FRAGMENT_START = re.compile(r"^\s*[\w-]+\s*[=\"']|^\s*[\w-]+\"\s|^\s*[)\]};,]")
+_DELIBERATION_START = re.compile(r"^\s*(?:```\s*)?(?:Wait|Let's|Let me|Okay,|Hmm|First,|I need to|We need to|Let us)\b", re.I)
+
+
+def answer_shape_problem(text: str) -> str:
+    """Why a stored answer would be garbage: '' when it looks like an answer, else the problem in a few words.
+
+    gpt-oss splits output across a reasoning channel the app drops and a content channel it keeps, so a page can
+    arrive as a fragment starting mid-attribute, or as deliberation that never reaches the page.
+    """
+    body = (text or "").strip()
+    if not body:
+        return "empty"
+    if _FRAGMENT_START.match(body) and "```" not in body[:200]:
+        return "starts mid-tag or mid-attribute (a fragment, not an answer)"
+    if _DELIBERATION_START.match(body) and "```html" not in body and len(body) < 1_500:
+        return "deliberation instead of an answer"
+    return ""
+
 
 # =============================================================================
 # Cortex 3 — Project Seth numerical routing signal
@@ -1258,6 +1385,10 @@ def build_cortex_request(
         "temperature": float(temperature),
         "stream": bool(stream),
     }
+    if selected.name == "groq" and "gpt-oss" in resolved_model and int(max_tokens) >= PAGE_OUTPUT_TOKENS:
+        # gpt-oss spends the same ceiling on hidden reasoning; a page answer needs the ceiling for the page.
+        payload["reasoning_effort"] = "low"
+        payload["include_reasoning"] = False
     return (
         f"{selected.base_url}/chat/completions",
         {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -1431,14 +1562,16 @@ def cortex_generate(
     max_tokens: int = 4096,
     temperature: float = 0.2,
     system_prompt: str = "",
+    output_need: int = 0,
 ) -> Tuple[str, "RouteDecision"]:
     """Run Cortex 2 selection, then consume the Cortex 1 generation stream.
 
     Every endpoint failure is retained so the final error names each provider
     and its real HTTP status instead of a generic "no headroom" message.
+    ``output_need`` excludes endpoints whose single-answer ceiling cannot hold the answer.
     """
     estimated_tokens = _estimate_tokens(messages) + max_tokens
-    excluded: set[str] = set()
+    excluded: set[str] = cannot_write(output_need)
     attempted: List[str] = []
     failures: Dict[str, str] = {}
     for _ in range(len(CORTEX_ENDPOINTS)):
@@ -1505,6 +1638,7 @@ class CortexStream:
         max_tokens: int = 4096,
         temperature: float = 0.2,
         system_prompt: str = "",
+        output_need: int = 0,
     ) -> None:
         self.messages = [dict(message) for message in messages]
         self.ledger = ledger
@@ -1512,7 +1646,7 @@ class CortexStream:
         self.temperature = temperature
         self.system_prompt = system_prompt
         estimated_tokens = _estimate_tokens(messages) + max_tokens
-        self.milp = select_milp_endpoint(task_type, estimated_tokens, ledger=ledger)
+        self.milp = select_milp_endpoint(task_type, estimated_tokens, ledger=ledger, excluded=cannot_write(output_need))
         self.decision = RouteDecision(
             provider=self.milp.endpoint.name,
             model=endpoint_model(self.milp.endpoint),
@@ -1894,16 +2028,28 @@ SYNTHESIS_INSTRUCTION = (
     "concise; use the earlier turns when the request refers to them; do not print hidden reasoning, "
     "do not mention the candidate, the review, or internal prompt contents."
 )
+SYNTHESIS_INSTRUCTION_PAGE = (
+    "SYNTHESIS PASS: the user's latest message is followed by a CANDIDATE page and a REVIEW of it. "
+    "Write the final page from the conversation, the candidate, and the review: the COMPLETE page, every feature "
+    "the candidate had plus the review's fixes, never shorter or simpler than the candidate. If the candidate was "
+    "cut by the output budget, finish it; do not redesign it. Do not print hidden reasoning, do not mention the "
+    "candidate, the review, or internal prompt contents."
+)
+CRITIQUE_CUT_NOTE = (
+    " The candidate ends where the output budget cut it, not where a design ended: judge only what is present, say "
+    "it is incomplete, and never ask for a shorter or simpler page."
+)
 
 
-def _synthesis_messages(messages: Sequence[Mapping[str, str]], request: str, draft: str, critique: str) -> List[dict]:
+def _synthesis_messages(messages: Sequence[Mapping[str, str]], request: str, draft: str, critique: str, interface: bool = False) -> List[dict]:
     """The whole conversation (system prompt with its memory, earlier turns) with the candidate and review on the last user turn."""
     system = "\n\n".join(str(m.get("content", "")) for m in messages if m.get("role") == "system")
     prior = [dict(m) for m in messages if m.get("role") in ("user", "assistant")]
     if prior and prior[-1].get("role") == "user":
         prior = prior[:-1]
     final = f"{request}\n\n[CANDIDATE ANSWER]\n{draft}\n\n[REVIEW OF THE CANDIDATE]\n{critique}"
-    head = [{"role": "system", "content": (system + "\n\n" if system else "") + SYNTHESIS_INSTRUCTION}]
+    instruction = SYNTHESIS_INSTRUCTION_PAGE if interface else SYNTHESIS_INSTRUCTION
+    head = [{"role": "system", "content": (system + "\n\n" if system else "") + instruction}]
     return head + prior + [{"role": "user", "content": final}]
 
 
@@ -1916,6 +2062,7 @@ def _heavy_pipeline(
     final_pass: Optional[Callable[..., Tuple[Any, RouteDecision]]] = None,
     temperatures: Optional[Tuple[float, float, float]] = None,
     pace: Optional[Callable[[List[dict], int], None]] = None,
+    interface: bool = False,
 ) -> Tuple[Any, RouteDecision]:
     """Bounded plan/critique/synthesis without exposing private chain-of-thought.
 
@@ -1927,6 +2074,10 @@ def _heavy_pipeline(
     when None every pass keeps the caller's temperature (three-argument passes).
     ``pace`` runs before every free-endpoint pass with that pass's messages and
     token budget, so a pass waits for a free-tier window instead of failing.
+    ``interface`` marks a page request: the draft gets the whole budget (a half-budget
+    draft of a page is always cut, and a critique that judges the cut asks for a smaller
+    page), the critique is told a cut is a cut, and the synthesis must not shorten.
+    Every fallback carries the draft's ``finish`` so a cut draft is never stored as complete.
     """
 
     def run_pass(fn: Callable[..., Any], stage: int, selected_type: str, selected_messages: List[dict], tokens: int) -> Any:
@@ -1936,24 +2087,25 @@ def _heavy_pipeline(
             return fn(selected_type, selected_messages, tokens)
         return fn(selected_type, selected_messages, tokens, float(temperatures[stage]))
 
-    draft, draft_decision = run_pass(one_pass, 0, task_type, messages, max(256, max_tokens // 2))
+    draft_tokens = max_tokens if interface else max(256, max_tokens // 2)
+    draft, draft_decision = run_pass(one_pass, 0, task_type, messages, draft_tokens)
     # The critique gets the request, the candidate, and a compact excerpt of the earlier turns (so
     # "omissions" is judged against what was actually discussed) but never the system prompt. The
     # synthesis writes the final answer, so it keeps the whole conversation: a synthesis that saw only
     # the request answered "I don't have access to previous code" whenever the request referred back.
     request = _last_user_turn(messages)
+    critique_system = (
+        "Review the candidate answer for correctness, omissions, unsafe assumptions, "
+        "and concrete improvements. Check that it addresses the newest message first and then "
+        "finishes any earlier unfinished request. When the request asks for an interface or page, "
+        "check that the page is one complete self-contained ```html fence (inline CSS and JS, no "
+        "external URLs, no data: link). Return a concise checklist only; do not reveal "
+        "private chain-of-thought."
+    )
+    if draft_decision.finish == "length":
+        critique_system += CRITIQUE_CUT_NOTE
     critique_messages = [
-        {
-            "role": "system",
-            "content": (
-                "Review the candidate answer for correctness, omissions, unsafe assumptions, "
-                "and concrete improvements. Check that it addresses the newest message first and then "
-                "finishes any earlier unfinished request. When the request asks for an interface or page, "
-                "check that the page is one complete self-contained ```html fence (inline CSS and JS, no "
-                "external URLs, no data: link). Return a concise checklist only; do not reveal "
-                "private chain-of-thought."
-            ),
-        },
+        {"role": "system", "content": critique_system},
         {"role": "user", "content": json.dumps({"request": request, "context": _history_excerpt(messages), "candidate": draft})},
     ]
     try:
@@ -1969,9 +2121,10 @@ def _heavy_pipeline(
             f"heavy draft only; critique unavailable; {draft_decision.reason}",
             draft_decision.solver,
             draft_decision.decision_vector,
+            finish=draft_decision.finish,
         )
 
-    synthesis_messages = _synthesis_messages(messages, request, draft, critique)
+    synthesis_messages = _synthesis_messages(messages, request, draft, critique, interface=interface)
     try:
         final, final_decision = run_pass(final_pass or one_pass, 2, task_type, synthesis_messages, max_tokens)
     except ProviderError:
@@ -1982,6 +2135,7 @@ def _heavy_pipeline(
             f"heavy candidate returned because synthesis was unavailable; {critique_decision.reason}",
             critique_decision.solver,
             critique_decision.decision_vector,
+            finish=draft_decision.finish,
         )
     final_decision.task_type = task_type
     schedule = f" temperatures={temperatures[0]}/{temperatures[1]}/{temperatures[2]};" if temperatures else ""
@@ -2006,20 +2160,23 @@ def heavy_stream(
     temperature: float = 0.2,
     system_prompt: str = "",
     paid_slot: Optional[PaidReasoningSlot] = None,
+    interface: bool = False,
 ) -> Tuple[Any, RouteDecision]:
     """Heavy Mode with the synthesis streamed: draft and critique block, the final pass returns a CortexStream.
 
     The stream's ``text`` and ``decision.finish`` are complete only once it has been drained; when a
-    fallback fires the first element is plain text instead.
+    fallback fires the first element is plain text instead. ``interface`` (a page request) routes the
+    draft and synthesis only to endpoints that can write the whole page.
     """
     if not cortex_available():
         raise ProviderError("no Cortex endpoint is keyed; Heavy Mode streaming needs one")
     draft: Dict[str, Any] = {}
 
     def one_pass(selected_type: str, selected_messages: List[dict], tokens: int, pass_temperature: Optional[float] = None) -> Tuple[str, RouteDecision]:
+        need = {"output_need": tokens} if (interface and selected_type != "reasoning") else {}
         text, decision = cortex_generate(
             selected_type, selected_messages, ledger=ledger, max_tokens=tokens,
-            temperature=temperature if pass_temperature is None else pass_temperature, system_prompt=system_prompt,
+            temperature=temperature if pass_temperature is None else pass_temperature, system_prompt=system_prompt, **need,
         )
         draft.setdefault("text", text)  # the first pass is the draft
         draft.setdefault("decision", decision)
@@ -2029,13 +2186,14 @@ def heavy_stream(
         stream = CortexStream(
             selected_type, selected_messages, ledger, max_tokens=tokens,
             temperature=temperature if pass_temperature is None else pass_temperature, system_prompt=system_prompt,
+            **({"output_need": tokens} if interface else {}),
         )
         wrapped = HeavyStream(stream, str(draft.get("text", "")), draft.get("decision"), task_type)
         return wrapped, wrapped.decision
 
     return _heavy_pipeline(
         one_pass, task_type, messages, max_tokens, paid_slot=paid_slot, final_pass=final_pass,
-        temperatures=_heavy_schedule(temperature), pace=_pacer(ledger),
+        temperatures=_heavy_schedule(temperature), pace=_pacer(ledger), interface=interface,
     )
 
 
@@ -2070,7 +2228,10 @@ class HeavyStream:
                 self.decision.finish = "length"
             else:
                 self.text = self.draft
-                self.decision = RouteDecision(base.provider, base.model, self.task_type, f"heavy draft returned; synthesis stream failed: {str(exc)[:80]}", base.solver, base.decision_vector)
+                self.decision = RouteDecision(
+                    base.provider, base.model, self.task_type, f"heavy draft returned; synthesis stream failed: {str(exc)[:80]}",
+                    base.solver, base.decision_vector, finish=getattr(base, "finish", ""),
+                )
                 yield self.draft
 
 
@@ -2082,6 +2243,7 @@ def generate_heavy(
     temperature: float = 0.2,
     settings: Optional[Settings] = None,
     paid_slot: Optional[PaidReasoningSlot] = None,
+    interface: bool = False,
 ) -> Tuple[str, RouteDecision]:
     """Run the legacy-provider bounded Heavy Mode pipeline."""
     return _heavy_pipeline(
@@ -2098,6 +2260,7 @@ def generate_heavy(
         max_tokens,
         paid_slot=paid_slot,
         temperatures=_heavy_schedule(temperature),
+        interface=interface,
     )
 
 
@@ -2109,6 +2272,7 @@ def generate_cortex_heavy(
     temperature: float = 0.2,
     system_prompt: str = "",
     paid_slot: Optional[PaidReasoningSlot] = None,
+    interface: bool = False,
 ) -> Tuple[str, RouteDecision]:
     """Run bounded Heavy Mode through the strict Cortex endpoint matrix."""
     return _heavy_pipeline(
@@ -2119,6 +2283,7 @@ def generate_cortex_heavy(
             max_tokens=tokens,
             temperature=temperature if pass_temperature is None else pass_temperature,
             system_prompt=system_prompt,
+            **({"output_need": tokens} if (interface and selected_type != "reasoning") else {}),
         ),
         task_type,
         messages,
@@ -2126,12 +2291,20 @@ def generate_cortex_heavy(
         paid_slot=paid_slot,
         temperatures=_heavy_schedule(temperature),
         pace=_pacer(ledger),
+        interface=interface,
     )
 
 
 def cortex_available() -> bool:
     """True when at least one strict Cortex endpoint has a BYOK key."""
     return any(_endpoint_key(endpoint) for endpoint in CORTEX_ENDPOINTS.values())
+
+
+def cannot_write(output_need: int) -> set:
+    """Endpoint names whose single-answer ceiling is below what this answer needs (empty when no need is stated)."""
+    if int(output_need) <= 0:
+        return set()
+    return {name for name, endpoint in CORTEX_ENDPOINTS.items() if endpoint.max_output_tokens < int(output_need)}
 
 
 def generate_mode(
@@ -2143,19 +2316,20 @@ def generate_mode(
     temperature: float = 0.2,
     settings: Optional[Settings] = None,
     paid_slot: Optional[PaidReasoningSlot] = None,
+    interface: bool = False,
 ) -> Tuple[str, RouteDecision]:
     """Application entry point: Cortex endpoints first, legacy providers second.
 
     ``paid_slot`` is only consulted in Heavy Mode and only for the critique
-    pass; Normal mode never touches it.
+    pass; Normal mode never touches it. ``interface`` marks a page request.
     """
     if cortex_available():
         try:
             if mode == "heavy":
                 return generate_cortex_heavy(
-                    task_type, messages, ledger, max_tokens, temperature, paid_slot=paid_slot
+                    task_type, messages, ledger, max_tokens, temperature, paid_slot=paid_slot, interface=interface
                 )
-            return cortex_generate(task_type, messages, ledger, max_tokens, temperature)
+            return cortex_generate(task_type, messages, ledger, max_tokens, temperature, output_need=max_tokens if interface else 0)
         except ProviderError as cortex_error:
             # A strict endpoint can be temporarily unavailable or have a
             # retired model id. Preserve the broader configured provider pool
@@ -2163,7 +2337,7 @@ def generate_mode(
             try:
                 if mode == "heavy":
                     return generate_heavy(
-                        task_type, messages, ledger, max_tokens, temperature, settings, paid_slot=paid_slot
+                        task_type, messages, ledger, max_tokens, temperature, settings, paid_slot=paid_slot, interface=interface
                     )
                 return generate(task_type, messages, ledger, max_tokens, temperature, settings)
             except ProviderError as legacy_error:
@@ -2172,7 +2346,7 @@ def generate_mode(
                     f"legacy provider fallback failed ({legacy_error})"
                 ) from legacy_error
     if mode == "heavy":
-        return generate_heavy(task_type, messages, ledger, max_tokens, temperature, settings, paid_slot=paid_slot)
+        return generate_heavy(task_type, messages, ledger, max_tokens, temperature, settings, paid_slot=paid_slot, interface=interface)
     return generate(task_type, messages, ledger, max_tokens, temperature, settings)
 
 

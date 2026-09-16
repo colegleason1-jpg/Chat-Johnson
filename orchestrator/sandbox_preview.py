@@ -318,13 +318,19 @@ def report_summary(report: Mapping[str, Any]) -> str:
     return " · ".join(parts) if parts else "ran clean"
 
 
+INCOMPLETE_REASON = "the page is incomplete (its answer was cut at the length limit), not broken: it is continued, not repaired"
+
+
 def fix_decision(
     state: Mapping[str, Any], report: Optional[Mapping[str, Any]], heavy: bool, generating: bool, keyed: bool = True,
+    complete: bool = True,
 ) -> Tuple[bool, str, bool]:
     """Whether a report earns an automatic fix turn: (allowed, reason shown to the operator, settled).
 
     ``settled`` says the report needs no further consideration (it is clean, capped, repeated, or acted on); a
     transient refusal (Heavy Mode off, no key, a generation running) leaves it open so the next rerun decides again.
+    An incomplete page (``complete`` False: cut at the output budget) is never repaired; a repair of a cut page
+    is a smaller cut page, which is the spiral this rule ends.
     """
     if report is None:
         return False, "no report", True
@@ -332,6 +338,8 @@ def fix_decision(
         return False, "already handled", True
     if report.get("status") not in FIX_STATUSES:
         return False, "ran clean", True
+    if not complete:
+        return False, INCOMPLETE_REASON, True
     rounds = int(state.get("rounds", 0))
     if rounds >= FIX_ROUNDS:
         return False, f"stopped: {FIX_ROUNDS} automatic rounds used; {NEXT_STEP}", True

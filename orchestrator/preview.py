@@ -13,7 +13,7 @@ import binascii
 import html
 import secrets
 import re
-from typing import Optional, Set
+from typing import List, Optional, Set, Tuple
 from urllib.parse import unquote
 
 try:
@@ -143,29 +143,120 @@ def _fence_source(language: str, body: str) -> str:
     return ""
 
 
-def extract_preview_source(text: str) -> str:
-    """Pull the first HTML/CSS fence (or bare markup) out of a model answer; '' when there is none.
+_PAGE_SHAPE = re.compile(r"<\s*(?:!doctype|html|body)\b", re.I)
+PAGE_MIN_CHARS = 400
 
-    An answer cut off at the output budget leaves its fence open; that markup is taken up to the end of
-    the text, so a long mockup still reaches the canvas (partial, but rendered) instead of vanishing.
-    An answer that offers a data:text/html link instead of markup is opened the same way.
+
+def _is_page(language: str, body: str) -> bool:
+    """A whole page (doctype/html/body, or a long markup fence), as opposed to a snippet or a CSS stub."""
+    normalized = language.strip().lower()
+    if normalized.startswith("css"):
+        return False
+    return bool(_PAGE_SHAPE.search(body)) or (normalized.startswith(("html", "htm")) and len(body.strip()) >= PAGE_MIN_CHARS)
+
+
+def extract_preview_fence(text: str) -> Tuple[str, bool]:
+    """(markup, closed) for the canvas: the LAST closed whole page wins, then a cut page, then the first snippet.
+
+    A model that restarts a page, quotes a snippet, or shows a CSS stub before the real page used to put the wrong
+    thing on the canvas; a cut page (its fence never closed) is taken whole so it still renders, marked as not closed.
     """
-    for language, body in _FENCE.findall(text):
-        found = _fence_source(language, body)
-        if found:
-            return found
+    closed = [(language, body) for language, body in _FENCE.findall(text)]
+    pages = [(language, body) for language, body in closed if _is_page(language, body)]
+    if pages:
+        language, body = pages[-1]
+        return _fence_source(language, body), True
     tail = text[text.rfind("```") :] if "```" in text else ""
     unclosed = _OPEN_FENCE.match(tail) if tail.count("```") == 1 else None
+    if unclosed and _is_page(unclosed.group("language"), unclosed.group("body")):
+        found = _fence_source(unclosed.group("language"), unclosed.group("body"))
+        if found:
+            return found, False
+    for language, body in closed:
+        found = _fence_source(language, body)
+        if found:
+            return found, True
     if unclosed:
         found = _fence_source(unclosed.group("language"), unclosed.group("body"))
         if found:
-            return found
+            return found, False
     linked = decode_data_link(text)
     if linked:
-        return linked
+        return linked, True
     if looks_like_markup(text):
-        return text.strip()
-    return ""
+        return text.strip(), True
+    return "", True
+
+
+def extract_preview_source(text: str) -> str:
+    """The markup the canvas should show for a model answer; '' when there is none (see ``extract_preview_fence``)."""
+    return extract_preview_fence(text)[0]
+
+
+_TAG_PAIRS = (("<script", "</script"), ("<style", "</style"))
+_BRACKETS = {"{": "}", "[": "]", "(": ")"}
+
+
+def _script_balance(script: str) -> bool:
+    """Whether braces, brackets and parentheses balance outside strings, template literals and comments."""
+    stack: List[str] = []
+    i, n = 0, len(script)
+    quote = ""
+    while i < n:
+        ch = script[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote or (quote == "`" and ch == "`"):
+                quote = ""
+            i += 1
+            continue
+        if script.startswith("//", i):
+            end = script.find("\n", i)
+            i = n if end < 0 else end + 1
+            continue
+        if script.startswith("/*", i):
+            end = script.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+        elif ch in _BRACKETS:
+            stack.append(_BRACKETS[ch])
+        elif ch in _BRACKETS.values():
+            if not stack or stack[-1] != ch:
+                return False
+            stack.pop()
+        i += 1
+    return not stack and not quote
+
+
+def page_completeness(source: str, closed: bool = True, finish: str = "") -> List[str]:
+    """Why a page is not whole: '' entries never appear; an empty list means complete.
+
+    Cheap and deterministic: fence closed, the document closed, every script and style closed, brackets balanced
+    in every script, and the vendor not having reported a cut. An incomplete page is continued, never repaired.
+    """
+    reasons: List[str] = []
+    body = source or ""
+    lowered = body.lower()
+    if finish == "length":
+        reasons.append("the answer was cut at the length limit")
+    if not closed:
+        reasons.append("the code fence never closed")
+    if "<html" in lowered and "</html" not in lowered:
+        reasons.append("</html> is missing")
+    elif "<body" in lowered and "</body" not in lowered:
+        reasons.append("</body> is missing")
+    for opener, closer in _TAG_PAIRS:
+        if lowered.count(opener) > lowered.count(closer):
+            reasons.append(f"a {opener[1:]} block never closes")
+    for match in re.finditer(r"<script\b[^>]*>(.*?)</script\s*>", body, re.I | re.S):
+        if not _script_balance(match.group(1)):
+            reasons.append("a script has unbalanced braces or an unterminated string")
+            break
+    return reasons
 
 
 def safe_preview_document(source: str) -> str:

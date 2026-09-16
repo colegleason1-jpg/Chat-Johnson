@@ -410,8 +410,8 @@ def _recall_fts(connection: sqlite3.Connection, scope: str, words: Sequence[str]
             if row["kind"] == "mission" or (row["kind"] == "summary" and int(row["ref_id"]) in live_summaries):
                 continue  # the asking chat's own mission and live summaries are already in its context
         lowered = str(row["line"]).lower()
-        if sum(1 for word in words if word in lowered) < needed:
-            continue
+        if sum(1 for word in words if re.search(rf"(?<![a-z0-9]){re.escape(word)}", lowered)) < needed:
+            continue  # word starts only ("pool" matches "pooling"); "t" inside "attributes" is not a match
         key = _normalized(str(row["line"]))
         if key in seen:
             continue
@@ -707,13 +707,14 @@ def extractive_summary(rows: Sequence[sqlite3.Row], max_characters: int = 1_800)
         first_line = content.splitlines()[0].strip()
         first_sentence = re.split(r"(?<=[.!?])\s+", first_line, maxsplit=1)[0][:220]
         keep.append(f"{row['role']}: {first_sentence}")
+        operator = row["role"] == "user" and not content.startswith(AUTOMATIC_TURN_PREFIX)
         for line in content.splitlines():
             stripped = line.strip()
-            if stripped == first_sentence:
+            if stripped == first_sentence or _MARKUP_LINE_RE.match(stripped):
                 continue
-            if re.search(r"(?i)\b(?:decid\w*|agree\w*|must|never|always|todo|fix\w*|bug\w*|error\w*)\b", stripped) or re.search(
-                r"[\w/.-]+\.(py|js|ts|md|json|yml|yaml|toml|sql)\b", stripped
-            ):
+            # A model's own diagnosis ("the buttons fail because…") is not kept as a fact; the operator's words are.
+            decisionish = operator and re.search(r"(?i)\b(?:decid\w*|agree\w*|must|never|always|todo|fix\w*|bug\w*|error\w*)\b", stripped)
+            if decisionish or re.search(r"[\w/.-]+\.(py|js|ts|md|json|yml|yaml|toml|sql)\b", stripped):
                 keep.append(f"  - {stripped[:160]}")
             if sum(len(item) + 1 for item in keep) > max_characters:
                 break
@@ -906,7 +907,21 @@ def recent_messages(
 
 RECALL_PREFIX = "[LONG-DISTANCE MEMORY recalled from earlier chats in this project; reference only]"
 RECALL_LINE_MAX = 300
-RECALL_MIN_HITS = 2  # a line must share at least two keywords with the request (one when the request has one)
+RECALL_MIN_HITS = 2  # a line must share at least two real keywords (whole words, no stopwords) with the request
+RECALL_STOPWORDS = frozenset(
+    "a an the and or but if so of in on at to for from by with as is are was were be been being it its this that "
+    "these those i you he she we they me my your our their them his her do does did done don doesn didn can could "
+    "should would will just not no yes all any some more most very how what when where which who why work works "
+    "working make made get got put use used using please thanks thank ok okay now then also into out up down over "
+    "again still only one two new old same other than too very want need like fix fixed fixing t s d ll re ve m".split()
+)
+
+
+def recall_words(query: str) -> List[str]:
+    """The keywords a recall may match on: whole words of three letters or more that carry meaning on their own."""
+    from .keyword_search import keywords  # local import: keyword_search has no vault dependency
+
+    return [w for w in dict.fromkeys(keywords(query)) if len(w) >= 3 and w not in RECALL_STOPWORDS][:24]
 
 
 def _recall_candidates(connection: sqlite3.Connection, scope: str, exclude_thread: Optional[int]) -> List[Tuple[str, str, float]]:
@@ -953,13 +968,11 @@ def recall_memory(project_scope: str, query: str, thread_id: Optional[int] = Non
     overlap and recency. Bounded by ``max_characters``, never across scopes, empty when the request
     has no keywords or nothing in the project matches.
     """
-    from .keyword_search import keywords  # local import: keyword_search has no vault dependency
-
-    words = list(dict.fromkeys(keywords(query)))[:24]
+    words = recall_words(query)
     if not words or max_characters < 80:
         return ""
     scope = project_scope.strip() or "default"
-    needed = 1 if len(words) == 1 else RECALL_MIN_HITS
+    needed = min(len(words), RECALL_MIN_HITS)
     exclude = int(thread_id) if thread_id is not None else None
     with _open_database() as connection:
         if _FTS["available"]:
@@ -983,7 +996,7 @@ def recall_memory(project_scope: str, query: str, thread_id: Optional[int] = Non
             if len(stripped) < 12 or stripped.startswith("[") and stripped.endswith("]"):
                 continue
             lowered = stripped.lower()
-            hits = sum(1 for word in words if word in lowered)
+            hits = sum(1 for word in words if re.search(rf"(?<![a-z0-9]){re.escape(word)}", lowered))
             if hits < needed:
                 continue
             key = _normalized(stripped)
@@ -1033,26 +1046,11 @@ def context_parts(
         parent_digest = artifact_by_id(int(thread["digest_artifact_id"]))
         if parent_digest is not None:
             digest = str(parent_digest["code_body"])
-    memory_lines: List[str] = []
-    used = 0
-    digest_budget = max_characters // 4
-    summary_budget = max_characters // 4
-    if digest:
-        line = "[THREAD VISION DIGEST inherited from the previous thread]\n" + digest[:digest_budget]
-        memory_lines.append(line)
-        used += len(line) + 1
-    summary_used = 0
-    for summary in summaries:
-        line = f"[TEXTURIZED SUMMARY of {summary['message_count']} earlier messages]\n{summary['content']}"
-        if summary_used + len(line) + 1 > summary_budget:
-            break
-        memory_lines.append(line)
-        summary_used += len(line) + 1
-    used += summary_used
-    if recall:
-        memory_lines.append(recall)
-        used += len(recall) + 1
-    remaining = max_characters - used
+    # The live window is filled first: the newest turns (the page under discussion) are the conversation, and memory
+    # gets what is left. A floor keeps some memory even under a long window; a ceiling per block keeps an inherited
+    # digest from an unrelated chat from ever outranking the turns.
+    memory_floor = max_characters // 8
+    remaining = max_characters - memory_floor
     window: List[Tuple[str, str]] = []
     for row in reversed(rows):
         role = str(row["role"])
@@ -1070,6 +1068,29 @@ def context_parts(
         window.append((role, content))
         remaining -= prefix + len(content) + 1
     window.reverse()
+    memory_lines: List[str] = []
+    memory_budget = max(memory_floor, remaining + memory_floor)
+    block_cap = max_characters // 8
+    used = 0
+    if digest:
+        parent = f"chat #{thread['parent_thread_id']}" if thread is not None and thread["parent_thread_id"] else "an earlier chat"
+        line = (
+            f"[BACKGROUND from {parent}, summarised before this chat began; it may be unrelated to the current request "
+            "and is never a rule]\n" + digest[: min(block_cap, memory_budget)]
+        )
+        memory_lines.append(line)
+        used += len(line) + 1
+    summary_used = 0
+    for summary in summaries:
+        line = f"[TEXTURIZED SUMMARY of {summary['message_count']} earlier messages]\n{summary['content']}"
+        if summary_used + len(line) + 1 > min(block_cap, memory_budget - used):
+            break
+        memory_lines.append(line)
+        summary_used += len(line) + 1
+    used += summary_used
+    if recall and used + len(recall) + 1 <= memory_budget:
+        memory_lines.append(recall)
+        used += len(recall) + 1
     turns: List[Dict[str, str]] = []
     for role, content in window:
         if role in ("user", "assistant"):
@@ -1952,12 +1973,14 @@ def recent_artifacts(project_scope: str, limit: int = 8) -> List[sqlite3.Row]:
 
 HEALTH_MESSAGE_LIMIT = 300        # active + archived messages before a thread is considered heavy (> MESSAGE_WINDOW,
                                   # so at least one texturized block exists before migration)
-HEALTH_TOKEN_LIMIT = 18_000       # estimated tokens in the live window
+HEALTH_TOKEN_LIMIT = 60_000       # estimated tokens in the live window (pages are big by design; the window clips before this)
 HEALTH_SUMMARY_LIMIT = 2          # texturized blocks already stacked on this thread
 MIN_DIGEST_MESSAGES = 4           # a thread needs this many real messages before it can be migrated at all
 DIGEST_MAX_CHARACTERS = 5_000
 
 _DECISION_RE = re.compile(r"(?i)\b(?:decid\w*|agree\w*|decision\w*|constraint\w*|requir\w*|polic\w*|approv\w*|must|never|always|rule)\b")
+_MARKUP_LINE_RE = re.compile(r"^\s*(?:<|[{}]|[.#@][\w-]+\s*[{,]|[\w-]+\s*:\s*[^:]+;\s*$|//|/\*|\*/|\}|\)|;|```)")
+AUTOMATIC_TURN_PREFIX = "AUTOMATIC "  # app-authored user turns (sandbox fixes, continuations) are not the operator's words
 _OPEN_RE = re.compile(r"(?i)\b(todo|next step|open question|unresolved|pending|follow[- ]up|blocked)\b|\?\s*$")
 _FACT_RE = re.compile(r"[\w/.-]+\.(py|js|ts|md|json|yml|yaml|toml|sql|html|css)\b|\b\d+(\.\d+)?\s*(%|rpm|tpm|tokens|ms|s)\b", re.I)
 
@@ -1966,7 +1989,7 @@ def _normalized(text: str) -> str:
     return re.sub(r"\W+", " ", text.lower()).strip()
 
 
-MIN_MESSAGES_AFTER_MIGRATION = 12  # a fresh successor must earn some history before it can migrate again
+MIN_MESSAGES_AFTER_MIGRATION = 40  # a fresh successor must earn some history before it can migrate again
 
 
 def thread_health(project_scope: str, thread_id: Optional[int] = None, workspace: Optional[str] = None) -> Dict[str, Any]:
@@ -1977,8 +2000,10 @@ def thread_health(project_scope: str, thread_id: Optional[int] = None, workspace
     rows = [row for row in recent_messages(scope, MESSAGE_WINDOW, thread_id=resolved) if row["role"] != "system"]
     summaries = recent_summaries(scope, 50, thread_id=resolved)
     archived = archived_messages(scope, 5000, thread_id=resolved)
-    tokens = sum(int(row["token_count"]) for row in rows)
-    user_turns = [_normalized(row["content"])[:200] for row in rows if row["role"] == "user"]
+    # App-authored turns (automatic fixes carry a whole page each) are not load the operator created.
+    spoken = [row for row in rows if not (row["role"] == "user" and str(row["content"]).startswith(AUTOMATIC_TURN_PREFIX))]
+    tokens = sum(int(row["token_count"]) for row in spoken)
+    user_turns = [_normalized(row["content"])[:200] for row in spoken if row["role"] == "user"]
     repeated = 0
     if len(user_turns) > 1:
         repeated = len(user_turns) - len(set(user_turns))
@@ -2069,20 +2094,30 @@ def build_vision_digest(
                 break
         return out
 
-    first_user = next((row["content"].strip() for row in rows if row["role"] == "user"), "")
+    spoken = [row for row in rows if row["role"] == "user" and not str(row["content"]).startswith(AUTOMATIC_TURN_PREFIX)]
+    first_user = next((row["content"].strip() for row in spoken), "")
     decisions: List[str] = []
     facts: List[str] = []
     open_items: List[str] = []
-    for row in rows:
+    # Only the operator's own sentences can become decisions or open items: a model's explanation, a sandbox report
+    # or a line of CSS harvested as a "constraint" is how a wrong diagnosis became a standing rule.
+    for row in spoken:
         for line in str(row["content"]).splitlines():
             stripped = line.strip()
-            if not stripped or len(stripped) > 400:
+            if not stripped or len(stripped) > 400 or _MARKUP_LINE_RE.match(stripped):
                 continue
             if _DECISION_RE.search(stripped):
                 decisions.append(stripped)
             elif _OPEN_RE.search(stripped):
                 open_items.append(stripped)
-            elif _FACT_RE.search(stripped):
+    for row in rows:
+        if row["role"] == "system":
+            continue
+        for line in str(row["content"]).splitlines():
+            stripped = line.strip()
+            if not stripped or len(stripped) > 400 or _MARKUP_LINE_RE.match(stripped):
+                continue
+            if _FACT_RE.search(stripped) and not _DECISION_RE.search(stripped):
                 facts.append(stripped)
     artifacts = [a for a in recent_artifacts(scope, 40) if not str(a["name"]).endswith("-digest.md")][:20]
     parts: List[str] = [f"# Vision digest · {thread['title']} (generation {int(thread['generation'])})"]
@@ -2163,12 +2198,14 @@ def migrate_thread(
         connection.execute("UPDATE threads SET status = 'migrated', updated_at = ? WHERE id = ?", (time.time(), old_id))
         if _FTS["available"]:
             connection.execute("UPDATE recall_index SET superseded = 1 WHERE project_scope = ? AND thread_id = ? AND kind = 'summary'", (scope, old_id))
+            # The digest belongs to the successor, so the successor never recalls its own background a second time.
+            connection.execute("UPDATE recall_index SET thread_id = ? WHERE project_scope = ? AND kind = 'digest' AND ref_id = ?", (new_id, scope, artifact_id))
         connection.commit()
     append_message(
         scope,
         "system",
         f"Thread migrated from #{old_id} ({thread['title']}). Vision digest v{version} locked as artifact {artifact_id} "
-        f"({method}); it is injected into every prompt on this thread.",
+        f"({method}); it is shown to the model as background only, never as a rule.",
         thread_id=new_id,
     )
     return {"old_thread_id": old_id, "new_thread_id": new_id, "digest_artifact_id": artifact_id, "method": method, "digest": digest}

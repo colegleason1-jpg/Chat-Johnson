@@ -239,6 +239,15 @@
 - `retired model` messages: discovery will replace the id on the next call; if it persists set
   `CORTEX_GEMINI_MODEL` / `CORTEX_GROQ_MODEL` explicitly.
 - Blank streamed answers: the vendor filtered or truncated; the chat shows a notice with the finish reason.
+- A page or app comes back cut, the buttons are dead, and the model blames "CSP" (the 2026-09-16 audit,
+  `docs/LOGIC_GAP_AUDIT.md`): fixed at the root. The app now continues an answer cut inside its code
+  (up to three rounds), stores the finish reason on the message, tells the model in APP STATE that the
+  last answer was cut, raises the answer limit automatically for pages (sidebar checkbox), routes pages
+  only to endpoints that can write them, gives the Heavy draft the whole budget, sends CANVAS RULES in
+  both preview modes, sends the page under discussion whole, fills the live window before memory, and
+  only lets the operator's own sentences become digest decisions. If a page is still cut after the
+  continuations, the answer says so; raise "Answer length limit" and send again. An inherited digest
+  appears as "[BACKGROUND from chat #N …]" and is never a rule; migration happens far later than before.
 - Preview canvas empty after a mockup: the canvas fills from the chat's latest answer that holds HTML/CSS,
   including an answer cut off at the output budget (its open fence is taken to the end), and it refills
   after a reload. A pasted link renders as text with a note: the canvas is a no-network sandbox and never

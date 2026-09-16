@@ -64,11 +64,27 @@ def load_skills(root: str = SKILLS_DIR) -> Tuple[Skill, ...]:
     return tuple(found)
 
 
-def select_skills(prompt: str, limit: int = 2, root: str = SKILLS_DIR, skills: Optional[Sequence[Skill]] = None) -> List[Skill]:
-    """Skills whose keywords appear in the prompt as whole words, best match first; none when nothing matches."""
+# A skill written for one workspace must not steer another: the repository skill demands whole-file blocks that
+# a canvas page cannot use, and the company skill demands a 200-word board report. Unlisted skills apply anywhere.
+WORKSPACE_ONLY = {"repository-patching": ("repository",), "company-reporting": ("company",)}
+AUTOMATIC_PREFIX = "AUTOMATIC "  # an app-authored turn (a sandbox fix, a continuation) carries its own contract
+
+
+def select_skills(
+    prompt: str, limit: int = 2, root: str = SKILLS_DIR, skills: Optional[Sequence[Skill]] = None, workspace: str = "",
+) -> List[Skill]:
+    """Skills whose keywords appear in the prompt as whole words, best match first; none when nothing matches.
+
+    ``workspace`` keeps workspace-bound skills out of the others; an app-authored turn selects no skill at all.
+    """
+    if (prompt or "").lstrip().startswith(AUTOMATIC_PREFIX):
+        return []
     words = set(keywords(prompt))
     scored = []
     for skill in (skills if skills is not None else load_skills(root)):
+        allowed = WORKSPACE_ONLY.get(skill.name)
+        if allowed and workspace and workspace not in allowed:
+            continue
         hits = sum(1 for k in skill.keywords if k in words)
         if hits:
             scored.append((hits, skill.name, skill))
@@ -76,9 +92,9 @@ def select_skills(prompt: str, limit: int = 2, root: str = SKILLS_DIR, skills: O
     return [skill for _, _, skill in scored[: max(0, int(limit))]]
 
 
-def skills_block(prompt: str, limit: int = 2, root: str = SKILLS_DIR) -> Tuple[str, List[str]]:
+def skills_block(prompt: str, limit: int = 2, root: str = SKILLS_DIR, workspace: str = "") -> Tuple[str, List[str]]:
     """The text to append to the system prompt and the names it carries."""
-    chosen = select_skills(prompt, limit=limit, root=root)
+    chosen = select_skills(prompt, limit=limit, root=root, workspace=workspace)
     if not chosen:
         return "", []
     parts = [f"SKILL · {s.name}: {s.description}\n{s.body}" for s in chosen]

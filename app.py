@@ -64,19 +64,25 @@ from orchestrator.quota import QuotaLedger
 from orchestrator.quota_registry import CHAT_LOCK_TIMEOUT_SECONDS, acquire_for_chat, get_quota_ledger, get_request_lock
 from orchestrator.router import (
     RouteDecision,
+    CONTINUATION_ROUNDS,
     CORTEX_ENDPOINTS,
     TASK_TYPES,
     CortexStream,
     PaidReasoningSlot,
     ProviderError,
+    answer_shape_problem,
     byok_status,
     classify,
+    continue_answer,
     cortex_available,
     cortex_wait_seconds,
+    effective_output_budget,
     endpoint_model,
     generate_mode,
     headroom_wait_seconds,
     heavy_stream,
+    is_interface_request,
+    needs_continuation,
     local_endpoint,
     register_local_endpoint,
     register_local_endpoint_from_env,
@@ -118,7 +124,7 @@ from orchestrator.missions import (
 )
 from orchestrator.connectors_nodes import CONNECTORS, validate_nodes
 from orchestrator import mcp_client
-from orchestrator.preview import extract_preview_source, looks_like_link, resolve_preview_source, safe_preview_document
+from orchestrator.preview import extract_preview_fence, extract_preview_source, looks_like_link, page_completeness, resolve_preview_source, safe_preview_document
 from orchestrator.sandbox_preview import (
     FIX_PREFIX,
     FIX_ROUNDS,
@@ -188,6 +194,114 @@ PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN = "Sanitized", "Run in sandbox"
 SANDBOX_PAGE_MEMORY = 8  # per-page sandbox bookkeeping kept in the session and the vault; the oldest page is dropped first
 SANDBOX_FIX_SETTING = "sandbox_fix"  # one vault setting per scope: {page_hash: {"rounds", "last_signature"}}
 FIX_WORKSPACES = ("normal_chat", "chat_bot")  # the workspaces whose renderers dispatch a queued automatic fix
+CANVAS_WORKSPACES = ("normal_chat", "chat_bot")  # the chats whose pages own the canvas; other workspaces never overwrite it
+PREVIEW_STATE_SETTING = "preview_state"
+PREVIEW_STATE_MAX_CHARS = 200_000
+_PAGE_REFERENCE_RE = re.compile(
+    r"\b(?:fix|broken|works?|working|still|change|update|add|remove|edit|make it|this page|the page|the preview|this preview|buttons?|canvas)\b",
+    re.I,
+)
+
+
+def refers_to_canvas(prompt: str) -> bool:
+    """Whether a request is about the page already on the canvas rather than a fresh one."""
+    return bool(_PAGE_REFERENCE_RE.search(prompt or ""))
+
+
+def persist_preview_state(scope: str) -> None:
+    """The canvas (page, mode, completeness) mirrored per scope so a reload or a restart does not empty it."""
+    source = str(st.session_state.get("preview_source") or "")
+    if len(source) > PREVIEW_STATE_MAX_CHARS:
+        return
+    page = st.session_state.get("canvas_page") or {}
+    setting_set(scope, PREVIEW_STATE_SETTING, json.dumps({
+        "source": source, "mode": st.session_state.get("preview_mode") or PREVIEW_MODE_SANITIZED,
+        "complete": bool(page.get("complete", True)), "reasons": list(page.get("reasons") or []),
+        "message_id": page.get("message_id"), "workspace": str(page.get("workspace") or ""), "at": time.time(),
+    }))
+
+
+def restore_preview_state(scope: str) -> None:
+    """On a fresh session the canvas and its mode come back from the vault (a reload used to reset both to empty and
+    Sanitized); a session that already holds a canvas keeps it."""
+    if st.session_state.get("preview_state_restored"):
+        return
+    st.session_state.preview_state_restored = True
+    if st.session_state.get("preview_source") or "preview_mode" in st.session_state:
+        return
+    try:
+        stored = json.loads(setting_get(scope, PREVIEW_STATE_SETTING, "") or "{}")
+    except ValueError:
+        stored = {}
+    if not isinstance(stored, dict) or not str(stored.get("source") or "").strip():
+        return
+    source = str(stored["source"])
+    st.session_state.preview_source = source
+    st.session_state.preview_editor = source
+    st.session_state.preview_cleared = False
+    if stored.get("mode") in (PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN):
+        st.session_state.preview_mode = stored["mode"]
+    st.session_state.canvas_page = {
+        "hash": page_hash(source), "stripped": page_hash(strip_hazards(source)[0]), "message_id": stored.get("message_id"),
+        "complete": bool(stored.get("complete", True)), "reasons": list(stored.get("reasons") or []),
+        "workspace": str(stored.get("workspace") or ""),
+    }
+
+
+def commit_canvas_page(scope: str, workspace: str, source: str, message_id: Optional[int], closed: bool = True, finish: str = "") -> None:
+    """The one place a generated page becomes the canvas page: completeness is judged here, once, and remembered."""
+    reasons = page_completeness(source, closed, finish)
+    st.session_state.preview_source = source
+    st.session_state.preview_editor = source
+    st.session_state.preview_cleared = False
+    st.session_state.canvas_page = {
+        "hash": page_hash(source), "stripped": page_hash(strip_hazards(source)[0]), "message_id": message_id,
+        "complete": not reasons, "reasons": reasons, "workspace": workspace,
+    }
+    persist_preview_state(scope)
+
+
+def canvas_page_complete(source: str) -> bool:
+    """Whether the page is whole; the remembered verdict when it is the canvas page, else the structural check alone."""
+    page = st.session_state.get("canvas_page") or {}
+    digest = page_hash(source)
+    if digest in (page.get("hash"), page.get("stripped")):
+        return bool(page.get("complete", True))
+    return not page_completeness(source)
+
+
+def _persist_preview_mode() -> None:
+    persist_preview_state(str(st.session_state.project_scope))
+
+
+def app_state_block(workspace: str, budget: int) -> str:
+    """The app's own facts for this send, so the model never has to guess them (and never blames the browser for a cut)."""
+    mode = st.session_state.get("preview_mode") or PREVIEW_MODE_SANITIZED
+    canvas = (
+        "Preview only: scripts, handlers, forms and external resources are stripped, nothing can run"
+        if mode == PREVIEW_MODE_SANITIZED else "Run the page: scripts run offline under a strict no-network policy"
+    )
+    last = st.session_state.get("last_decision")
+    previous = "none yet"
+    if last is not None:
+        previous = "was CUT at the length limit; the canvas shows the partial page" if getattr(last, "finish", "") == "length" else "ended normally"
+    page = st.session_state.get("canvas_page") or {}
+    source = str(st.session_state.get("preview_source") or "")
+    if source.strip():
+        state = "complete" if page.get("complete", True) else "INCOMPLETE (" + "; ".join(page.get("reasons") or ["cut"]) + ")"
+        page_line = f"{len(source)} characters, {state}"
+    else:
+        page_line = "none"
+    lines = [
+        "APP STATE (facts about this session; trust them over guesses):",
+        f"- Canvas mode: {canvas}.",
+        f"- Answer length limit: {int(budget)} tokens (~{int(budget) * 4} characters) per answer; a page or app request is raised automatically "
+        "to what a provider can write, and an answer cut inside its code is continued by the app.",
+        f"- Your previous answer: {previous}.",
+        f"- Last sandbox report: {st.session_state.get('sandbox_last_report') or 'none'}.",
+        f"- Canvas page: {page_line}.",
+    ]
+    return "\n".join(lines)
 
 
 def _clear_widget(key: str) -> None:
@@ -355,11 +469,15 @@ def build_prompt_messages(
     workspace: Optional[str] = None,
     thread_id: Optional[int] = None,
     extra_system: str = "",
+    app_state: str = "",
+    current_page: str = "",
+    interface: Optional[bool] = None,
 ) -> List[Dict[str, str]]:
     """The shared prompt builder with this session's output budget."""
     return _build_prompt_messages(
         project_scope, user_prompt, injected_context, workspace=workspace, thread_id=thread_id,
-        max_tokens=int(st.session_state.get("max_tokens", 2048)), extra_system=extra_system,
+        max_tokens=int(st.session_state.get("max_tokens", 4096)), extra_system=extra_system,
+        app_state=app_state, current_page=current_page, interface=interface,
     )
 
 
@@ -547,16 +665,19 @@ def _clear_preview() -> None:
     st.session_state.preview_editor = ""
     st.session_state.preview_source = ""
     st.session_state.preview_cleared = True
+    st.session_state.pop("canvas_page", None)
+    persist_preview_state(str(st.session_state.project_scope))
 
 
 def render_preview_panel(fallback_source: str = "", workspace: str = "") -> None:
+    restore_preview_state(str(st.session_state.project_scope))
     if not st.session_state.get("preview_source") and fallback_source:
         st.session_state.preview_source = fallback_source
         if not st.session_state.get("preview_editor"):  # set before the widget is created in this run, never after
             st.session_state.preview_editor = fallback_source
     if "preview_editor" not in st.session_state:
         st.session_state.preview_editor = st.session_state.get("preview_source", "")
-    mode = st.radio("Preview mode", [PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN], key="preview_mode", horizontal=True)
+    mode = st.radio("Preview mode", [PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN], key="preview_mode", horizontal=True, on_change=_persist_preview_mode)
     run_mode = mode == PREVIEW_MODE_RUN
     if run_mode:
         st.caption(
@@ -643,6 +764,7 @@ def run_sandbox_preview(source: str, workspace: str, rerun: bool) -> None:
     if notes:
         st.caption("Before running, the sandbox removed " + "; ".join(notes) + ".")
     if report is not None:
+        st.session_state.sandbox_last_report = report_summary(report)  # told to the model as APP STATE on the next send
         st.caption(f"Sandbox: {report_summary(report)}" + (f" · {report['ms']} ms" if report["ms"] else ""))
         with st.expander("Sandbox report", expanded=False):
             st.text(sandbox_report_text(report))  # page text is shown as text, never rendered as markdown
@@ -699,7 +821,9 @@ def consider_sandbox_fix(report: Optional[Dict[str, Any]], source: str, page: st
         return
     heavy = active_mode() == "heavy"
     generating = bool(st.session_state.get("generation_running", False)) or get_task_request_lock().locked()
-    allowed, reason, settled = fix_decision(state, report, heavy, generating, keyed=bool(configured_provider_names()))
+    allowed, reason, settled = fix_decision(
+        state, report, heavy, generating, keyed=bool(configured_provider_names()), complete=canvas_page_complete(source),
+    )
     if settled and not allowed:
         # Capped or repeated: no workspace can fix this page, so the report is closed wherever it arrived.
         st.session_state["sandbox_fix"][page]["handled_seq"] = int(report["seq"])
@@ -1489,8 +1613,16 @@ def _run_generation(
         )
     user_message_id = append_message(project_scope, "user", clean_prompt, mode=mode, workspace=workspace, task_type=task_type)
     pinkwave.activate(project_scope)  # this send walks the scope's wave: routing jitter, Heavy schedule, recall share
-    messages = build_prompt_messages(project_scope, clean_prompt, injected_context, workspace=workspace, extra_system=extra_system)
-    max_tokens = int(st.session_state.get("max_tokens", 2048))
+    interface = fix_round > 0 or is_interface_request(clean_prompt)
+    sidebar_budget = int(st.session_state.get("max_tokens", 4096))
+    current_page = ""
+    if interface and fix_round == 0 and workspace in CANVAS_WORKSPACES and refers_to_canvas(clean_prompt):
+        current_page = str(st.session_state.get("preview_source") or "")  # the page the request is about, sent whole
+    messages = build_prompt_messages(
+        project_scope, clean_prompt, injected_context, workspace=workspace, extra_system=extra_system,
+        app_state=app_state_block(workspace or "", sidebar_budget), current_page=current_page, interface=interface,
+    )
+    max_tokens = effective_output_budget(messages, sidebar_budget, interface and bool(st.session_state.get("auto_page_budget", True)))
     with st.chat_message("user"):
         if fix_round > 0:
             st.caption(f"Automatic fix · round {fix_round} of {FIX_ROUNDS} · from the sandbox report")
@@ -1523,7 +1655,7 @@ def _run_generation(
             if mode == "normal" and cortex_available():
                 # Normal mode streams token-by-token from the MILP-selected endpoint.
                 try:
-                    stream = CortexStream(task_type, messages, ledger, max_tokens=max_tokens, temperature=0.35)
+                    stream = CortexStream(task_type, messages, ledger, max_tokens=max_tokens, temperature=0.35, **({"output_need": max_tokens} if interface else {}))
                     with live_box.container():
                         with st.chat_message("assistant"):
                             st.caption(f"{stream.decision.provider}/{stream.decision.model} · {task_type} · streaming")
@@ -1538,7 +1670,7 @@ def _run_generation(
                 with live_box.container():
                     st.info("Heavy Mode: draft and review passes running; the synthesis streams here when they finish…")
                 try:
-                    stream, heavy_decision = heavy_stream(task_type, messages, ledger, max_tokens=max_tokens, temperature=0.2, paid_slot=session_paid_slot())
+                    stream, heavy_decision = heavy_stream(task_type, messages, ledger, max_tokens=max_tokens, temperature=0.2, paid_slot=session_paid_slot(), **({"interface": True} if interface else {}))
                     if isinstance(stream, str):
                         return stream, heavy_decision
                     live_box.empty()
@@ -1562,6 +1694,7 @@ def _run_generation(
                 max_tokens=max_tokens,
                 temperature=0.2 if mode == "heavy" else 0.35,
                 paid_slot=session_paid_slot() if mode == "heavy" else None,
+                **({"interface": True} if interface else {}),
             )
 
         try:
@@ -1591,6 +1724,30 @@ def _run_generation(
             request_lock.release()
     live_box.empty()
     answer = strip_reasoning_tags(answer)
+    problem = answer_shape_problem(answer)
+    if problem:
+        # A reasoning model can hand back a fragment or its deliberation instead of the answer: ask once more.
+        with live_box.container():
+            st.info(f"The provider returned {problem}; asking once more…")
+        try:
+            again, again_decision = attempt_generation()
+            again = strip_reasoning_tags(again)
+            if not answer_shape_problem(again):
+                answer, decision = again, again_decision
+        except ProviderError as exc:
+            st.session_state.setdefault("provider_events", []).append(redact_secrets(str(exc))[:600])
+        live_box.empty()
+    continued = 0
+    if needs_continuation(answer, decision.finish) and cortex_available():
+        # Cut inside its code: finish the answer instead of storing a broken page and repairing it later.
+        def _continuing(round_no: int) -> None:
+            live_box.info(f"The answer was cut inside its code; continuing it ({round_no} of {CONTINUATION_ROUNDS})…")
+
+        try:
+            answer, decision, continued = continue_answer(task_type, messages, answer, decision, ledger, max_tokens, on_round=_continuing)
+        except ProviderError as exc:
+            st.session_state.setdefault("provider_events", []).append(redact_secrets(str(exc))[:600])
+        live_box.empty()
     assistant_id = append_message(
         project_scope,
         "assistant",
@@ -1599,6 +1756,7 @@ def _run_generation(
         mode=mode,
         workspace=workspace,
         task_type=task_type,
+        finish=decision.finish,
     )
     fragility = proctor.cached_fragility(task_type, sum(len(str(m.get("content", ""))) for m in messages) // 4 + max_tokens, ledger) if cortex_available() else None
     log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish, decision=decision, message_id=assistant_id, fragility=fragility)
@@ -1608,20 +1766,21 @@ def _run_generation(
             f"{decision.provider}/{decision.model} · {task_type} · {mode}"
             + (f" · skills: {', '.join(applied)}" if applied else "")
             + (" · automatic fix" if fix_round > 0 else "")
+            + (f" · continued {continued}x" if continued else "")
         )
         render_output_with_artifacts(answer, project_scope, assistant_id, f"message-{assistant_id}")
     if decision.finish == "length":
         st.warning(
-            f"This answer stopped at the output budget ({max_tokens} tokens). Raise 'Output token budget' in the "
-            "sidebar for longer answers, or send 'continue'."
+            f"This answer is still cut off at the answer length limit ({max_tokens})"
+            + (f" after {continued} continuation(s)" if continued else "")
+            + ". Raise the limit in the sidebar and send again, or ask for a smaller page."
         )
     elif decision.finish == "filtered":
         st.info("The provider filtered part of this answer under its content policy.")
-    extracted = extract_preview_source(answer)
-    if extracted:  # never wipe what the operator typed into the canvas
-        st.session_state.preview_source = extracted
-        st.session_state.preview_editor = extracted
-        st.session_state.preview_cleared = False
+    if workspace in CANVAS_WORKSPACES:
+        extracted, closed = extract_preview_fence(answer)
+        if extracted:  # never wipe what the operator typed into the canvas; other workspaces never overwrite it
+            commit_canvas_page(project_scope, workspace or "", extracted, assistant_id, closed, decision.finish)
     st.session_state.last_decision = decision
     return assistant_id
 
@@ -1695,7 +1854,8 @@ def render_history(project_scope: str, heading: str, workspace: Optional[str] = 
         with st.chat_message(role):
             if row["provider"]:
                 task = row["task_type"] if "task_type" in row.keys() and row["task_type"] else ""
-                st.caption(f"{row['provider']} · {task or row['mode']} · {row['token_count']} estimated tokens")
+                cut = "finish" in row.keys() and row["finish"] == "length"
+                st.caption(("Cut off at the answer length limit · " if cut else "") + f"{row['provider']} · {task or row['mode']} · {row['token_count']} estimated tokens")
             if role == "assistant":
                 render_output_with_artifacts(
                     row["content"],
@@ -3173,11 +3333,13 @@ with st.sidebar:
         help="Uses a bounded draft → review → synthesis workflow. Private reasoning is not displayed; token usage and latency are higher. "
         f"With the canvas in Run in sandbox mode, a page that throws is sent back for up to {FIX_ROUNDS} automatic fix rounds.",
     )
-    st.session_state.max_tokens = st.slider("Output token budget", 256, 8192, 2048, 256, key="output_token_budget")
-    st.caption(
-        "Heavy Mode is an auditable multi-pass policy, not an exposed chain-of-thought channel. "
-        "It uses only configured BYOK providers."
+    st.session_state.max_tokens = st.slider("Answer length limit", 256, 8192, 4096, 256, key="output_token_budget",
+                                            help="About 4 characters per unit. A working web page needs 6,000 or more; pages and apps are raised automatically below.")
+    st.checkbox(
+        "Raise the limit automatically for pages and apps", key="auto_page_budget", value=True,
+        help="A request for a page, app or interface gets the largest answer a keyed provider can write (up to 16,384), and an answer cut inside its code is continued on its own.",
     )
+    st.caption("Heavy Mode only uses the keys you pasted. It is slower and uses more of your free allowance.")
     with st.expander("Paid reasoning slot (Heavy Mode critique only)", expanded=False):
         st.caption(
             "Backend is free-tier only. This optional slot must be switched on AND given a key "

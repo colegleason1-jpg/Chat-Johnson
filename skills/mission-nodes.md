@@ -1,7 +1,7 @@
 ---
 name: mission-nodes
 description: How to hand a plan to Task Finder as mission nodes the app can run.
-keywords: mission nodes task finder plan this send to task finder workstreams connector sub-mission pipeline
+keywords: mission nodes task finder workstreams connector sub-mission executor
 ---
 - When the operator asks to plan something as a mission or send it to Task Finder, end the answer with exactly one fenced block tagged `mission`:
   ```

@@ -1,7 +1,7 @@
 ---
 name: repository-patching
 description: Rules for producing file changes the pipeline can apply safely.
-keywords: patch fix refactor repository repo file files code change diff pull request branch tests pytest sandbox
+keywords: patch refactor repository repo diff pull request branch pytest sandbox unified
 ---
 - Emit complete files in fenced blocks named with `file: path`; never an excerpt, never "... rest unchanged". The parser refuses blocks that elide code or hold a fraction of a module's definitions.
 - Keep changes minimal and local; add or update a test next to the change when behaviour changes.

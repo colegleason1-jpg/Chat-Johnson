@@ -114,7 +114,7 @@ def test_context_budgets_keep_summaries_after_migration(db):
     db.migrate_thread("s")
     fill(db, "s", 201, text="new turn {i}")  # force a texturized block on the successor
     context = db.context_block("s")
-    assert "[THREAD VISION DIGEST" in context
+    assert "[BACKGROUND from chat #" in context
     assert "[TEXTURIZED SUMMARY" in context
 
 
@@ -148,7 +148,7 @@ def test_migration_creates_successor_with_locked_digest_and_keeps_history(db):
     new_rows = db.recent_messages("s", thread_id=new)
     assert len(new_rows) == 1 and new_rows[0]["role"] == "system"
     context = db.context_block("s")
-    assert context.startswith("[THREAD VISION DIGEST")
+    assert context.startswith("[BACKGROUND from chat #")
     assert "REFINED" in context
     # the digest is a normal locked artifact, exportable like any other
     filename, body = db.export_artifact(result["digest_artifact_id"])
