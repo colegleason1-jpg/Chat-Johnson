@@ -79,6 +79,16 @@ MISSION_TEMPLATES: Dict[str, Tuple[Tuple[str, ...], List[Tuple[str, ...]]]] = { 
             ("Walkthrough", "chat", "Using the resolved positions above, write a short walkthrough of the space for: {goal}. Note anything the solver had to move and why."),
         ],
     ),
+    "preview": (
+        ("preview", "canvas", "this page", "the page", "buttons", "mockup", "html", "css", "the app page", "web page", "landing page"),
+        [
+            ("Check the page", "quick_text", "Static check of the page on the canvas (structure, closed fences and tags, script balance, external "
+                                             "resources the canvas would block): {goal}", "preview.validate"),
+            ("Repair the page", "code_patch", "Rewrite the page so the check passes and the request is met: {goal}. Return one complete "
+                                              "```html fence with inline CSS and JavaScript only.", "preview.repair"),
+            ("Check again", "quick_text", "Static check of the repaired page: {goal}", "preview.validate"),
+        ],
+    ),
     "webcheck": (
         ("check the site", "is the site up", "site up", "smoke test", "verify the deployment", "deployed url", "check url", "check the url",
          "health check", "uptime", "is it live"),
@@ -100,7 +110,7 @@ MISSION_TEMPLATES: Dict[str, Tuple[Tuple[str, ...], List[Tuple[str, ...]]]] = { 
 
 # On a tie, an explicitly research-shaped request keeps research workstreams; everything else that
 # names a thing to write is a writing mission.
-_TIE_ORDER = ("research", "webcheck", "spatial", "writing", "code", "analysis", "plan", "general")
+_TIE_ORDER = ("research", "webcheck", "spatial", "preview", "writing", "code", "analysis", "plan", "general")
 
 MAX_SECTIONS = 12
 DEFAULT_TARGET_WORDS = 800
@@ -245,7 +255,8 @@ def text_measure(text: str) -> Dict[str, int]:
 # Mission nodes: every step is a node with an executor, config, inputs, output, and failure policy
 # =============================================================================
 
-EXECUTORS = ("model", "solver", "webqa", "connector", "sub_mission")
+EXECUTORS = ("model", "solver", "webqa", "connector", "sub_mission", "preview.validate", "preview.repair")
+PREVIEW_REPAIR_ROUNDS = 2  # a repair node asks for the page at most this many times before it reports what is still wrong
 OUTPUTS = ("chat", "artifact", "both")
 FAILURE_POLICIES = ("stop", "skip", "retry_once")
 MAX_NODES = 12

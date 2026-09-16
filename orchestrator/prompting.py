@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from .capabilities import capability_card
+from .pagepatch import CURRENT_PAGE_HEADER_PATCH, PATCH_RULES
 from .pinkwave import for_scope
 from .router import is_interface_request, prompt_context_chars
 from .skills import skills_block
@@ -46,6 +47,7 @@ def build_prompt_messages(
     app_state: str = "",
     current_page: str = "",
     interface: Optional[bool] = None,
+    patch_mode: bool = False,
 ) -> List[Dict[str, str]]:
     """System prompt (persona, capability card, compressed memory) followed by the live window as real turns.
 
@@ -57,14 +59,16 @@ def build_prompt_messages(
     ``app_state`` is the app's own facts for this send (canvas mode, budget, a cut answer, the last
     sandbox report); ``current_page`` is the page on the canvas, sent whole on the request turn and
     never clipped; ``interface`` marks a page request (detected from the prompt when None): recall is
-    off for it, the canvas rules ride along, and the memory never outranks the page.
+    off for it, the canvas rules ride along, and the memory never outranks the page. ``patch_mode``
+    asks for SEARCH/REPLACE edit blocks instead of the whole page (a large page is edited, never rewritten).
     """
     page_request = is_interface_request(user_prompt) if interface is None else bool(interface)
     # Sized so the request fits every keyed endpoint's TPM ceiling at the current output budget.
     context_chars = prompt_context_chars(int(max_tokens))
     page_turn = ""
     if current_page.strip():
-        page_turn = f"{CURRENT_PAGE_HEADER}\n```html\n{current_page.strip()}\n```"
+        header = CURRENT_PAGE_HEADER_PATCH if patch_mode else CURRENT_PAGE_HEADER
+        page_turn = f"{header}\n```html\n{current_page.strip()}\n```"
         context_chars = max(MIN_TURN_CONTEXT_CHARS, context_chars - len(page_turn) - 200)
     if page_request:
         share = 0.0  # lines recalled from other chats by keyword are where a wrong diagnosis comes back from
@@ -88,6 +92,8 @@ def build_prompt_messages(
         system += "\n\n" + app_state.strip()
     if page_request:
         system += "\n\n" + CANVAS_RULES
+    if patch_mode and current_page.strip():
+        system += "\n\n" + PATCH_RULES
     if extra_system.strip():
         # A seat persona or another role block: after the card (stable prefix), before the memory (volatile).
         system += "\n\n" + extra_system.strip()

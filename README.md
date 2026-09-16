@@ -450,6 +450,17 @@ and Normal mode never uses it. Close the tab and it is gone.
   prior like a thumbs-down would; momentum follows the sending workspace's last endpoint, not another's;
   background cycles run in normal mode and wait five minutes after a chat send (ten after a page request); the
   chat waits one full window (65 s) for a background job to release the provider.
+- **Missions that fail out loud and see the page (batch U4)**: a failed step posts a system row in the mission
+  chat (and one more when the mission stops there); a full free-tier window is a pause with one retry, not a failed
+  step; a mission that refers to the canvas carries the page with it whole and every model step sees it under the
+  canvas rules; a `preview` mission kind ("fix the buttons on this preview") runs `preview.validate` (static
+  check: structure, closed fences and tags, script balance, external resources the canvas would block) and
+  `preview.repair` (a bounded regenerate loop against that check); the page the mission produced comes back as an
+  artifact with *Put this page on the canvas*; Task Finder says plainly that missions cannot run the browser and
+  offers *Send to Chat Bot instead*. In the chats, a page over 6,000 characters is edited in **patch mode**: the
+  model returns SEARCH/REPLACE blocks, the app applies them in Python (exact match, then whitespace-tolerant),
+  reports any block that matched nothing, and puts the merged page on the canvas; say "rewrite the page" for a
+  fresh one.
 
 ## Development
 

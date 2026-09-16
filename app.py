@@ -51,7 +51,7 @@ from orchestrator.discovery import vendor_for
 from orchestrator.envsafe import self_hosted
 from orchestrator.errors import plain_error
 from orchestrator.executor import Orchestrator
-from orchestrator import dynamics, learner, pinkwave, proctor, quiet, treasury_plan
+from orchestrator import dynamics, learner, pagepatch, pinkwave, proctor, quiet, treasury_plan
 from orchestrator.society import economy as society_economy
 from orchestrator import mission_runner  # noqa: F401  (registers the mission job handler)
 from orchestrator.jobs import ACTIVE_STATUSES, enqueue as enqueue_job, get_runner, secrets_deliverable
@@ -513,12 +513,13 @@ def build_prompt_messages(
     app_state: str = "",
     current_page: str = "",
     interface: Optional[bool] = None,
+    patch_mode: bool = False,
 ) -> List[Dict[str, str]]:
     """The shared prompt builder with this session's output budget."""
     return _build_prompt_messages(
         project_scope, user_prompt, injected_context, workspace=workspace, thread_id=thread_id,
         max_tokens=int(st.session_state.get("max_tokens", 4096)), extra_system=extra_system,
-        app_state=app_state, current_page=current_page, interface=interface,
+        app_state=app_state, current_page=current_page, interface=interface, patch_mode=patch_mode,
     )
 
 
@@ -1693,11 +1694,13 @@ def _run_generation(
     current_page = ""
     if interface and fix_round == 0 and workspace in CANVAS_WORKSPACES and refers_to_canvas(clean_prompt):
         current_page = str(st.session_state.get("preview_source") or "")  # the page the request is about, sent whole
+    # A large page is edited, never rewritten: SEARCH/REPLACE blocks come back and are applied here.
+    patch_mode = bool(current_page) and pagepatch.wants_patch_mode(clean_prompt, current_page)
     messages = build_prompt_messages(
         project_scope, clean_prompt, injected_context, workspace=workspace, extra_system=extra_system,
-        app_state=app_state_block(workspace or "", sidebar_budget), current_page=current_page, interface=interface,
+        app_state=app_state_block(workspace or "", sidebar_budget), current_page=current_page, interface=interface, patch_mode=patch_mode,
     )
-    max_tokens = effective_output_budget(messages, sidebar_budget, interface and bool(st.session_state.get("auto_page_budget", True)))
+    max_tokens = effective_output_budget(messages, sidebar_budget, interface and not patch_mode and bool(st.session_state.get("auto_page_budget", True)))
     with st.chat_message("user"):
         if fix_round > 0:
             st.caption(f"Automatic fix · round {fix_round} of {FIX_ROUNDS} · from the sandbox report")
@@ -1863,7 +1866,16 @@ def _run_generation(
         st.info("The provider filtered part of this answer under its content policy.")
     if workspace in CANVAS_WORKSPACES:
         extracted, closed = extract_preview_fence(answer)
-        if extracted:  # never wipe what the operator typed into the canvas; other workspaces never overwrite it
+        edits = pagepatch.parse_edits(answer) if patch_mode else []
+        if edits and not (extracted and closed and pagepatch._BLOCK_RE.search(extracted) is None and len(extracted) > len(current_page) // 2):
+            merged, problems = pagepatch.apply_edits(current_page, edits)
+            applied = len(edits) - len(problems)
+            if applied:
+                commit_canvas_page(project_scope, workspace or "", merged, assistant_id, True, "")
+                st.caption(f"Applied {applied} of {len(edits)} edit(s) to the page on the canvas.")
+            for problem in problems:
+                st.warning(f"Edit not applied: {problem}. Ask again naming the exact lines, or say \"rewrite the page\" for a fresh one.")
+        elif extracted:  # never wipe what the operator typed into the canvas; other workspaces never overwrite it
             commit_canvas_page(project_scope, workspace or "", extracted, assistant_id, closed, decision.finish)
     st.session_state.last_decision = decision
     return assistant_id
@@ -2250,6 +2262,11 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger, submission: Optiona
     dispatch_sandbox_fix(project_scope, "chat_bot", ledger, submission)
 
 
+def mission_wants_page(goal: str, plan: Sequence[Dict[str, Any]]) -> bool:
+    """A mission about the canvas page: it refers to it, or a step checks or repairs a page."""
+    return refers_to_canvas(goal) or any(str(step.get("executor") or "").startswith("preview.") for step in plan)
+
+
 def launch_mission(project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, plan: Sequence[Dict[str, Any]]) -> Tuple[int, int]:
     """Queue the mission as a background job; returns (job id, the thread it landed on, which a migration may have changed)."""
     migration = health_sweep(project_scope, ledger, workspace="task_finder")
@@ -2264,6 +2281,9 @@ def launch_mission(project_scope: str, ledger: QuotaLedger, thread_id: int, goal
         "paid_model": str(st.session_state.get("paid_slot_model", "") or ""),
         "paid_enabled": bool(st.session_state.get("paid_slot_enabled", False)),
     }
+    page = str(st.session_state.get("preview_source") or "")
+    if page.strip() and mission_wants_page(goal, plan):
+        payload["page"] = page  # the mission is about the page on the canvas: it travels with the job, whole
     # Keys travel encrypted or in the runner's memory for this job only; the row never holds them.
     job_id = enqueue_job(project_scope, mission_runner.KIND, payload, job_secrets_for_session(), thread_id=thread_id)
     save_mission_nodes(thread_id, plan, project_scope)  # on the thread the mission actually lives in
@@ -2361,6 +2381,18 @@ def render_launch_summary(job: Dict[str, Any], thread_id: int, dismissed: set) -
             components.html(scene_preview_document(scene), height=440, scrolling=False)
             st.session_state.scene_preview = scene
             st.download_button("⬇ Download scene (.json)", data=body, file_name=filename, mime="application/json", key=f"scene_{thread_id}_{result['scene_artifact']}")
+    if result.get("page_artifact"):
+        filename, body = export_artifact(int(result["page_artifact"]), st.session_state.project_scope)
+        verdict = "passes the static check" if result.get("page_complete") else "still fails the static check (see the steps above)"
+        st.info(f"The mission produced a page ({len(body):,} characters) that {verdict}; it is locked as artifact v{result['page_version']}.")
+        put, download = st.columns(2, gap="small")
+        if put.button("Put this page on the canvas", key=f"page_to_canvas_{job['id']}", use_container_width=True,
+                      help="Replaces the page on the canvas with the mission's page; switch to Run the page to see it work."):
+            commit_canvas_page(str(st.session_state.project_scope), "task_finder", body, None, True, "")
+            st.rerun()
+        download.download_button("⬇ Download page (.html)", data=body, file_name=filename, mime="text/html", key=f"page_dl_{job['id']}", use_container_width=True)
+    if result.get("page_check"):
+        st.caption("Page check: " + ("complete." if result["page_check"].get("complete") else "INCOMPLETE: " + "; ".join(result["page_check"].get("reasons") or [])))
     if result.get("webqa"):
         http = result["webqa"].get("http", {})
         (st.success if http.get("ok") else st.error)(f"Web QA: {http.get('url', '')} → status {http.get('status')} in {http.get('elapsed_ms')} ms" + (f" · {http['error']}" if http.get("error") else ""))
@@ -2448,6 +2480,18 @@ def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int
                 "Typing another message replaces this mission until it is launched."
             )
         st.markdown("> " + goal.replace("\n", "\n> "))
+        if kind == "preview" or refers_to_canvas(goal):
+            st.info(
+                "Missions cannot run the browser: a page is checked here statically (structure, scripts, external resources) "
+                "and repaired from that check. To see the page run and be fixed from real errors, send it to Chat Bot with "
+                "the canvas set to Run the page."
+            )
+            if st.button("Send to Chat Bot instead", key=f"to_chat_bot_{thread_id}", help="Opens Chat Bot and sends this request there; the page on the canvas goes with it."):
+                pending.pop(thread_id, None)
+                st.session_state.get("pending_plans", {}).pop(thread_id, None)
+                st.session_state["queued_send"] = {"workspace": "chat_bot", "text": goal}
+                st.session_state.workspace_jump = "chat_bot"
+                st.rerun()
         if not preset:
             if kind == "writing":
                 target = parse_length_target(goal)
@@ -2543,7 +2587,8 @@ def render_task_finder(project_scope: str, ledger: QuotaLedger, submission: Opti
     st.caption(
         "Describe a mission in the chat bar; it is decomposed into workstreams you can edit before launch. "
         "Steps run one at a time to respect free-tier limits, and every result lands in this chat so the mission "
-        "continues as a conversation." + mode_caption()
+        "continues as a conversation. Missions cannot run the browser: pages are checked statically here; Chat Bot "
+        "with Run the page is where a page runs and gets fixed from real errors." + mode_caption()
     )
     thread = render_thread_bar(project_scope, "task_finder", ledger)
     thread_id = int(thread["id"])

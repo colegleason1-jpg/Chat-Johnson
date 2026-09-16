@@ -264,6 +264,12 @@
 - Company and academy cycles say "Waiting N s: the operator just sent a chat message": the quiet period
   (five minutes after a chat send, ten after a page request) keeps the free-tier window for the chat; the
   cycle re-queues itself for the end of it.
+- A mission step failed and the chat says so ("Step N (title) failed: …"): the reason is the plain provider
+  error; a full free-tier window is retried once inside the step before it counts as failed. "No page to
+  check": the mission was launched without a page on the canvas; put one there (or send the request from
+  Chat Bot) and launch again.
+- An edit to a big page came back as SEARCH/REPLACE blocks and one says "nothing in the page matches": the
+  model paraphrased the lines; ask again naming the exact lines, or say "rewrite the page" for a whole one.
 - Run the page shows errors but nothing gets fixed: automatic fixes need Heavy Mode on and the
   Normal Chat or Chat Bot workspace (in another workspace the canvas says so and keeps the report
   until you switch). Each page gets 2 rounds, counted only when a fix lands; the same error twice

@@ -177,7 +177,8 @@ def test_mission_handler_writes_the_thread_and_assembles_a_writing_deliverable(d
     assert result["sections"] == 2 and result["deliverable_artifact"] and result["target_words"] == 800
     assert calls[0][0] == "heavy" and calls[0][2] == 900 and calls[0][3].armed and calls[0][3].api_key == "sk-paid"
     rows = vault.recent_messages("scope-a", 50, thread_id=int(thread["id"]))
-    assert [r["role"] for r in rows] == ["user", "assistant", "user", "assistant"]
+    assert [r["role"] for r in rows] == ["user", "assistant", "user", "assistant", "system"]
+    assert rows[-1]["content"].startswith("Step 3 (Editor notes) failed: ") and rows[-1]["finish"] == "failed"  # said in the thread
     assert rows[1]["provider"] == "fake/m1" and rows[1]["task_type"] == "writing"
     assert vault.thread_by_id(int(thread["id"]))["mission"] == "Write a 2 page essay on tides"
     assert view["progress"]["step"] == 3 and view["progress"]["last_route"] == "fake/m1"

@@ -6,6 +6,7 @@ state arrives in the payload (mode, budget, paid-slot model) or in the job's sec
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,9 +14,11 @@ from . import vault
 from .errors import plain_error
 from .jobs import JobCancelled, JobContext, register_handler
 from .connectors_nodes import run_connector
-from .missions import assemble_deliverable, deliverable_slug, normalise_plan, parse_length_target, task_plan, text_measure
+from .missions import PREVIEW_REPAIR_ROUNDS, assemble_deliverable, deliverable_slug, normalise_plan, parse_length_target, task_plan, text_measure
+from .preview import extract_preview_fence, page_completeness
 from .prompting import build_prompt_messages
-from .router import PaidReasoningSlot, RouteDecision, cortex_wait_seconds, generate_mode, strip_reasoning_tags
+from .router import PAGE_OUTPUT_TOKENS, PaidReasoningSlot, ProviderError, RouteDecision, cortex_wait_seconds, generate_mode, headroom_wait_seconds, strip_reasoning_tags
+from .sandbox_preview import strip_hazards
 from .spatial import SceneError, parse_scene_block, scene_json, scene_markdown, solve_layout
 from .webqa import browser_available, browser_check, check_markdown, check_url, first_url
 from .quota_registry import job_lock
@@ -40,8 +43,44 @@ def _record(scope: str, task_type: str, route: str, mode: str, started: float, r
         pass
 
 
+_EXTERNAL_RE = re.compile(r"""<(?:script|link|img|iframe|video|audio|source)\b[^>]*?(?:src|href)\s*=\s*["']?(https?:)?//[^"'\s>]+|@import\s+(?:url\()?["']?https?://""", re.I)
+
+
+def newest_page(outputs: List[Tuple[str, str]], state: Dict[str, Any]) -> str:
+    """The page the mission is working on: the last whole page an earlier step produced, else the one it was launched with."""
+    for _, text in reversed(outputs):
+        found, closed = extract_preview_fence(text)
+        if found and closed:
+            return found
+    return str(state.get("page") or "")
+
+
+def page_check(source: str) -> Tuple[List[str], str]:
+    """The static verdict on a page (no browser here): completeness reasons, plus a plain report the operator can read."""
+    reasons = list(page_completeness(source))
+    _, hazards = strip_hazards(source)
+    external = sorted({match.group(0)[:80] for match in _EXTERNAL_RE.finditer(source)})
+    lines = [f"Page check (static, no browser): {len(source):,} characters, {source.lower().count('<script')} script block(s)."]
+    lines.append("Structure: " + ("complete." if not reasons else "INCOMPLETE: " + "; ".join(reasons) + "."))
+    if external:
+        reasons.append(f"{len(external)} external resource(s) the canvas would block")
+        lines.append("External resources the canvas never loads (inline them): " + "; ".join(external))
+    if hazards:
+        lines.append("Removed before running: " + "; ".join(hazards))
+    lines.append("Verdict: " + ("the page can be put on the canvas." if not reasons else "the page needs repair before it can work: " + "; ".join(reasons) + "."))
+    lines.append("To see it run and be fixed automatically, send it to Chat Bot with the canvas set to Run the page.")
+    return reasons, "\n".join(lines)
+
+
 def run_executor(executor: str, step: Dict[str, Any], goal: str, outputs: List[Tuple[str, str]], scope: str, thread_id: int, extras: Dict[str, Any]) -> Tuple[str, RouteDecision]:
-    """Deterministic steps: the layout solver and the web QA check. No model call, no quota."""
+    """Deterministic steps: the layout solver, the web QA check and the static page check. No model call, no quota."""
+    if executor == "preview.validate":
+        source = newest_page(outputs, extras.get("state") or {})
+        if not source.strip():
+            raise ValueError("no page to check: the mission was launched without a page on the canvas and no earlier step produced one")
+        reasons, report = page_check(source)
+        extras["page_check"] = {"complete": not reasons, "reasons": reasons}
+        return report, RouteDecision("local-executor", "preview.validate", str(step.get("type") or "quick_text"), "static page check")
     if executor == "solver":
         spec = None
         for _, text in reversed(outputs):
@@ -82,18 +121,70 @@ def _inputs_context(node: Dict[str, Any], outputs: List[Tuple[str, str]], by_id:
     return "\n\n".join(parts)
 
 
-def _run_model_node(ctx: JobContext, node: Dict[str, Any], context: str, thread_id: int, mode: str, budget: int, paid_slot: Optional[PaidReasoningSlot], position: int) -> Tuple[str, RouteDecision]:
-    # Built right before the call so this step sees every result before it.
+def _run_model_node(ctx: JobContext, node: Dict[str, Any], context: str, thread_id: int, mode: str, budget: int, paid_slot: Optional[PaidReasoningSlot], position: int, page: str = "", description: str = "") -> Tuple[str, RouteDecision]:
+    # Built right before the call so this step sees every result before it. A mission that carries a page sends it
+    # whole on every model step (the deliverable is the page) and asks only endpoints that can write one.
     step_budget = int(node.get("config", {}).get("max_tokens") or budget)
-    messages = build_prompt_messages(ctx.project_scope, str(node.get("description", "")), context, workspace=WORKSPACE, thread_id=thread_id, max_tokens=step_budget)
+    if page:
+        step_budget = max(step_budget, PAGE_OUTPUT_TOKENS)
+    messages = build_prompt_messages(
+        ctx.project_scope, description or str(node.get("description", "")), context, workspace=WORKSPACE, thread_id=thread_id, max_tokens=step_budget,
+        **({"current_page": page, "interface": True, "app_state": f"APP STATE: this is a mission step; the page on the canvas ({len(page)} characters) is sent below whole."} if page else {}),
+    )
     wait = cortex_wait_seconds(ctx.ledger, messages, step_budget)
     if 0 < wait <= MISSION_MAX_WAIT_SECONDS:
         ctx.progress(text=f"Waiting {int(wait) + 1}s for a free-tier window before step {position}…")
         ctx.sleep(wait + 0.5)
-    # The lock covers selection, request, and ledger record, so a chat send cannot overspend the same key.
-    with job_lock(ctx.request_lock):  # steps aside for a waiting chat send first
-        answer, decision = generate_mode(mode, str(node.get("type") or "chat"), messages, ctx.ledger, max_tokens=step_budget, temperature=0.2, paid_slot=paid_slot)
-    return strip_reasoning_tags(answer), decision
+    for attempt in (1, 2):
+        # The lock covers selection, request, and ledger record, so a chat send cannot overspend the same key.
+        try:
+            with job_lock(ctx.request_lock):  # steps aside for a waiting chat send first
+                answer, decision = generate_mode(
+                    mode, str(node.get("type") or "chat"), messages, ctx.ledger, max_tokens=step_budget, temperature=0.2, paid_slot=paid_slot,
+                    **({"interface": True} if page else {}),
+                )
+            return strip_reasoning_tags(answer), decision
+        except ProviderError as exc:
+            # A full free-tier window is a pause, not a failed step: wait once for it and send again.
+            retry_wait = headroom_wait_seconds(exc, ctx.ledger, messages, step_budget, MISSION_MAX_WAIT_SECONDS) if attempt == 1 else 0.0
+            if not retry_wait:
+                raise
+            ctx.progress(text=f"Step {position}: the free-tier window is full; waiting {int(retry_wait) + 1}s and sending again…")
+            ctx.sleep(retry_wait + 0.5)
+    raise ProviderError("unreachable")  # pragma: no cover
+
+
+def _run_preview_repair(ctx: JobContext, node: Dict[str, Any], context: str, outputs: List[Tuple[str, str]], state: Dict[str, Any], position: int) -> Tuple[str, RouteDecision]:
+    """Bounded regenerate loop: ask for the whole page, check it statically, ask again with the findings; stop when it passes."""
+    source = newest_page(outputs, state)
+    if not source.strip():
+        raise ValueError("no page to repair: the mission was launched without a page on the canvas and no earlier step produced one")
+    rounds = max(1, min(int((node.get("config") or {}).get("rounds") or PREVIEW_REPAIR_ROUNDS), 4))
+    reasons, report = page_check(source)
+    request = str(node.get("description", ""))
+    last_report = report
+    for round_no in range(1, rounds + 1):
+        ctx.progress(text=f"Step {position}: repair round {round_no} of {rounds}…")
+        brief = (
+            f"{request}\n\nThe static check of the current page says:\n{last_report}\n\n"
+            "Return the whole corrected page as one complete ```html fence (inline CSS and JavaScript, no external URLs)."
+        )
+        answer, decision = _run_model_node(ctx, node, context, int(ctx.thread_id or 0), state["mode"], state["budget"], state["paid_slot"], position, page=source, description=brief)
+        candidate, closed = extract_preview_fence(answer)
+        if not candidate:
+            last_report = "The answer carried no ```html page fence; return the page itself."
+            continue
+        reasons = list(page_completeness(candidate, closed, decision.finish))
+        checked, last_report = page_check(candidate)
+        reasons = reasons + [r for r in checked if r not in reasons]
+        source = candidate
+        if not reasons:
+            state["page"] = candidate
+            decision.reason = f"repaired in {round_no} round(s); static check passed; {decision.reason}"
+            return answer, decision
+        decision.reason = f"round {round_no}: {'; '.join(reasons)}; {decision.reason}"
+    state["page"] = source
+    raise ValueError(f"the page still fails the static check after {rounds} round(s): {'; '.join(reasons) if reasons else last_report[:160]}")
 
 
 def _run_sub_mission(ctx: JobContext, node: Dict[str, Any], goal: str, position: int, prefix: str, state: Dict[str, Any]) -> Tuple[str, RouteDecision]:
@@ -119,6 +210,7 @@ def _run_nodes(ctx: JobContext, plan: List[Dict[str, Any]], goal: str, outputs: 
     thread_id = int(ctx.thread_id or 0)
     mode, budget = state["mode"], state["budget"]
     extras: Dict[str, Any] = state["extras"]
+    extras["state"] = state  # the deterministic executors read the launch page through it
     by_id: Dict[int, Tuple[str, str]] = {}
     total = len(plan)
     for position, node in enumerate(plan, start=1):
@@ -137,7 +229,9 @@ def _run_nodes(ctx: JobContext, plan: List[Dict[str, Any]], goal: str, outputs: 
             try:
                 context = _inputs_context(node, outputs, by_id)
                 if executor == "model":
-                    answer, decision = _run_model_node(ctx, node, context, thread_id, mode, budget, state["paid_slot"], position)
+                    answer, decision = _run_model_node(ctx, node, context, thread_id, mode, budget, state["paid_slot"], position, page=str(state.get("page") or ""))
+                elif executor == "preview.repair":
+                    answer, decision = _run_preview_repair(ctx, node, context, outputs, state, position)
                 elif executor == "connector":
                     config = dict(node.get("config") or {})
                     name = str(config.get("connector") or "")
@@ -161,6 +255,8 @@ def _run_nodes(ctx: JobContext, plan: List[Dict[str, Any]], goal: str, outputs: 
             reason = plain_error(error) if error is not None else "no output"
             state["failures"].append((shown_title, reason))
             _record(scope, step_type, "failed", mode, started, str(error)[:160])
+            # Said in the chat, where the operator looks; a failed step used to leave nothing behind but a job row.
+            vault.append_message(scope, "system", f"Step {label} ({title}) failed: {reason}", mode=mode, thread_id=thread_id, workspace=WORKSPACE, task_type=step_type, finish="failed")
             if prefix:
                 ctx.progress(text=f"Step {label} failed: {reason[:100]}")
             else:
@@ -170,6 +266,7 @@ def _run_nodes(ctx: JobContext, plan: List[Dict[str, Any]], goal: str, outputs: 
             remaining = total - position
             if remaining:
                 state["failures"].append((f"{prefix}steps {position + 1}–{total}", f"not run: step {label} failed and its policy is {policy}"))
+                vault.append_message(scope, "system", f"The mission stopped at step {label}; steps {position + 1}–{total} did not run (failure policy: {policy}).", mode=mode, thread_id=thread_id, workspace=WORKSPACE, task_type=step_type, finish="failed")
             raise MissionStopped(shown_title)
         output_target = str(node.get("output") or "chat")
         artifact_note = ""
@@ -187,6 +284,9 @@ def _run_nodes(ctx: JobContext, plan: List[Dict[str, Any]], goal: str, outputs: 
         _record(scope, step_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish)
         outputs.append((title, answer))
         by_id[int(node.get("id") or position)] = (title, answer)
+        produced, closed = extract_preview_fence(answer)
+        if produced and closed and not page_completeness(produced, closed, decision.finish):
+            state["page"] = produced  # the newest whole page is what the next step and the canvas see
         state["succeeded"] += int(counted)
         state["truncated"] += int(counted and decision.finish == "length")
         ctx.progress(last_route=f"{decision.provider}/{decision.model}")
@@ -208,7 +308,9 @@ def run_mission_job(ctx: JobContext) -> Dict[str, Any]:
     state: Dict[str, Any] = {
         "mode": mode, "budget": budget, "paid_slot": paid_slot_for(ctx), "extras": {},
         "succeeded": 0, "failed": 0, "truncated": 0, "failures": [],
+        "page": str(payload.get("page") or ""),  # the canvas page the mission was launched with, when it refers to it
     }
+    launched_page = state["page"]
     ctx.progress(step=0, total=total, succeeded=0, failed=0, text="Starting workstreams…")
     stopped = ""
     try:
@@ -219,10 +321,16 @@ def run_mission_job(ctx: JobContext) -> Dict[str, Any]:
     if succeeded:
         # Pinned only once there is something to continue from; an all-failed launch leaves the next message free to be a new mission.
         vault.set_thread_mission(thread_id, goal, scope)
+    extras = {key: value for key, value in state["extras"].items() if key != "state"}
     summary: Dict[str, Any] = {
         "thread_id": thread_id, "goal": goal, "steps": total, "succeeded": succeeded, "failed": failed,
-        "truncated": state["truncated"], "failures": state["failures"], "stopped_at": stopped, **state["extras"],
+        "truncated": state["truncated"], "failures": state["failures"], "stopped_at": stopped, **extras,
     }
+    final_page = str(state.get("page") or "")
+    if final_page.strip() and final_page != launched_page:
+        # The page travels back: locked as an artifact and offered to the canvas by the launch summary.
+        artifact_id, version = vault.save_artifact(scope, f"page-{thread_id}.html", f"missions/page-{thread_id}.html", final_page, "html")
+        summary.update({"page_artifact": int(artifact_id), "page_version": int(version), "page_complete": not page_completeness(final_page)})
     sections = [answer for title, answer in outputs if title.lower().startswith("draft section")]
     if plan and plan[0].get("kind") == "writing" and sections:
         # The deliverable is assembled deterministically and locked; the chat keeps the per-section record.
