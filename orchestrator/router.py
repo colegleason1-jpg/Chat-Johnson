@@ -118,6 +118,7 @@ class CortexEndpoint:
     context_score: float
     strengths: Tuple[str, ...]
     model_env: str = ""
+    max_output_tokens: int = 8_192  # the largest single answer the model can write; a page request needs a big one
 
 
 # Shared with the legacy provider client: one live-id cache per vendor.
@@ -157,6 +158,7 @@ CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
         context_score=1.00,
         strengths=("context_load", "reasoning", "chat"),
         model_env="CORTEX_GEMINI_MODEL",
+        max_output_tokens=65_536,
     ),
     "groq": CortexEndpoint(
         name="groq",
@@ -171,6 +173,7 @@ CORTEX_ENDPOINTS: Dict[str, CortexEndpoint] = {
         context_score=0.58,
         strengths=("code_patch", "quick_text", "chat"),
         model_env="CORTEX_GROQ_MODEL",
+        max_output_tokens=32_768,
     ),
     "huggingface": CortexEndpoint(
         name="huggingface",

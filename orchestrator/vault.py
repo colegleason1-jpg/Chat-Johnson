@@ -249,6 +249,7 @@ def initialize_database() -> None:
             _ensure_column(connection, table, "thread_id", "INTEGER")
         _ensure_column(connection, "threads", "workspace", "TEXT NOT NULL DEFAULT 'normal_chat'")
         _ensure_column(connection, "message_history", "task_type", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "message_history", "finish", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "threads", "mission", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "message_archive", "task_type", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
@@ -648,8 +649,13 @@ def append_message(
     thread_id: Optional[int] = None,
     workspace: Optional[str] = None,
     task_type: str = "",
+    finish: str = "",
 ) -> int:
-    """Insert a message into the workspace's current (or given) thread, then texturize + archive past the window."""
+    """Insert a message into the workspace's current (or given) thread, then texturize + archive past the window.
+
+    ``finish`` is the vendor's reason the answer ended ("length" when the output budget cut it); it travels
+    into the next prompt as a note, so the model learns that a page that stops was cut, not designed short.
+    """
     safe_role = role if role in {"user", "assistant", "system"} else "user"
     safe_content = redact_secrets(content)
     scope = project_scope.strip() or "default"
@@ -660,8 +666,8 @@ def append_message(
         cursor = connection.execute(
             """
             INSERT INTO message_history
-                (role, content, timestamp, token_count, project_scope, provider, mode, thread_id, task_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (role, content, timestamp, token_count, project_scope, provider, mode, thread_id, task_type, finish)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 safe_role,
@@ -673,6 +679,7 @@ def append_message(
                 mode[:40],
                 resolved_thread,
                 (task_type or "")[:40],
+                (finish or "")[:24],
             ),
         )
         message_id = int(cursor.lastrowid)
@@ -1050,6 +1057,8 @@ def context_parts(
     for row in reversed(rows):
         role = str(row["role"])
         content = str(row["content"])
+        if role == "assistant" and "finish" in row.keys() and row["finish"] == "length":
+            content += truncation_notice(content, int(row["token_count"]))
         prefix = len(role.upper()) + 2
         if prefix + len(content) + 1 > remaining:
             # The turn that no longer fits is clipped to the room left (head and tail, the middle marked)
@@ -1077,6 +1086,15 @@ def context_parts(
 
 CLIP_MIN_CHARS = 400
 TRUNCATED_MARKER = " [TRUNCATED]"
+
+
+def truncation_notice(content: str, tokens: int) -> str:
+    """What a cut answer carries into the next prompt: the model must know the cut was the budget, not a design."""
+    tail = content.rstrip()[-80:].replace("\n", " ")
+    return (
+        f"\n[CUT AT THE OUTPUT BUDGET after ~{int(tokens)} tokens. The operator sees an incomplete answer ending with: "
+        f"'…{tail}'. Do not shrink, redesign or blame the browser for it: continue it, or say it was cut.]"
+    )
 
 
 def clip_turn(content: str, room: int, newest: bool = False) -> str:
