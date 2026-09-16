@@ -105,9 +105,9 @@ def test_fix_decision_matrix_and_which_refusals_are_transient():
     assert sp.fix_decision(fresh, None, True, False) == (False, "no report", True)
     assert sp.fix_decision({"handled_seq": 2}, error, True, False) == (False, "already handled", True)
     assert sp.fix_decision(fresh, sp.normalize_report({"seq": 2, "status": "ready"}), True, False) == (False, "ran clean", True)
-    assert sp.fix_decision({"rounds": 2}, error, True, False) == (False, f"stopped: 2 automatic rounds used; {sp.NEXT_STEP}", True)
+    assert sp.fix_decision({"rounds": 2}, error, True, False) == (False, f"repair stopped: 2 automatic rounds used; {sp.NEXT_STEP}", True)
     same = {"rounds": 1, "last_signature": sp.error_signature(error)}
-    assert sp.fix_decision(same, error, True, False) == (False, f"stopped: the same error came back; {sp.NEXT_STEP}", True)
+    assert sp.fix_decision(same, error, True, False) == (False, f"{sp.SAME_ERROR_REASON}; {sp.NEXT_STEP}", True)
     # Transient refusals leave the report open so the next rerun decides again.
     assert sp.fix_decision(fresh, error, False, False) == (False, "Heavy Mode is off, so nothing is fixed automatically", False)
     assert sp.fix_decision(fresh, error, True, False, keyed=False) == (False, "no provider key is configured, so nothing is fixed automatically", False)

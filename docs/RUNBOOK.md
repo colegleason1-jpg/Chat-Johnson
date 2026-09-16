@@ -9,7 +9,9 @@
    the build marker verified; without it the marker reads `unknown` on platforms that strip `.git`.
 
 ## Verify (after every deploy)
-1. Open `<app url>/?health=1`: a JSON block with `status`, `build`, `vault`, `keyed_vendors`.
+1. Open `<app url>/?health=1`: a JSON block with `status`, `build`, `process` (start, age, workers, active jobs),
+   `vault` (counts, jobs by status, sends), `ledger` (per-vendor usage), `snapshots` (with `age_s`), `keyed_vendors`.
+   A `curl` of that URL gets Streamlit's shell page only; the JSON needs a browser (the smoke drive).
 2. Run the smoke drive locally or from Actions (*post-deploy-smoke*, needs the `DEPLOY_URL`
    repository variable): health view, build match, workspace switch, pinned chat bar.
 3. Paste one key, send one message, and read the *Routing log* expander: the send must show a
@@ -255,7 +257,7 @@
   A bad paste shows a warning inside the canvas and never takes the page down. A `data:text/html`
   link (pasted or generated) opens as the markup it carries; Download preview (.html) hands out the
   raw page to open in a browser tab.
-- Run in sandbox shows errors but nothing gets fixed: automatic fixes need Heavy Mode on and the
+- Run the page shows errors but nothing gets fixed: automatic fixes need Heavy Mode on and the
   Normal Chat or Chat Bot workspace (in another workspace the canvas says so and keeps the report
   until you switch). Each page gets 2 rounds, counted only when a fix lands; the same error twice
   stops the loop, and a real send always goes first. Rounds are remembered per page in the vault

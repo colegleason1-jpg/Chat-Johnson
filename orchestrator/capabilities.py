@@ -27,7 +27,7 @@ IMPLEMENTED: Tuple[Tuple[str, str], ...] = (
     ("Memory", "SQLite vault, private per visitor: per-workspace chats, 200-message windows, summaries, digests, "
                "locked artifacts, exports, keyword recall from the project's other chats"),
     ("Heavy Mode", "draft, review, synthesis passes; an optional paid slot serves only the review pass, per session"),
-    ("Preview canvas", "sanitized HTML/CSS mockups, or Run in sandbox: the page executes offline in a sealed frame and, "
+    ("Preview canvas", "Preview only (buttons off) for HTML/CSS mockups, or Run the page: it executes offline in a sealed frame and, "
                        "in Heavy Mode, script errors come back for up to 2 automatic fix rounds"),
 )
 

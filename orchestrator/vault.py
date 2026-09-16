@@ -1407,6 +1407,46 @@ def record_route(
         return int(cursor.lastrowid)
 
 
+def routes_for_messages(project_scope: str, message_ids: Sequence[int]) -> Dict[int, sqlite3.Row]:
+    """The send behind each answer (the newest route row per message id), so a thread can say why an answer came out as it did."""
+    ids = sorted({int(value) for value in message_ids})
+    if not ids:
+        return {}
+    scope = project_scope.strip() or "default"
+    with _open_database() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM route_log WHERE project_scope = ? AND message_id IN ({','.join('?' for _ in ids)}) ORDER BY id ASC",
+            (scope, *ids),
+        ).fetchall()
+    return {int(row["message_id"]): row for row in rows}
+
+
+FINISH_WORDS = {
+    "": "ended normally", "stop": "ended normally", "length": "was cut at the answer length limit",
+    "filtered": "was filtered by the provider's content policy", "failed": "failed",
+}
+
+
+def route_facts(row: Mapping[str, Any]) -> str:
+    """One plain paragraph per send: where it went and why, the runner-up, how long it took, how it ended, the verdict."""
+    route, mode = str(row["route"] or ""), str(row["mode"] or "normal")
+    reason = " ".join(str(row["reason"] or "").split())
+    if route == "failed":
+        head = f"No endpoint answered this send in {mode} mode" + (f": {reason}" if reason else "") + "."
+    else:
+        head = f"Sent to {route} in {mode} mode" + (f" because {reason}" if reason else "") + "."
+    parts = [head]
+    if row["runner_up"]:
+        parts.append(f"The solver's runner-up was {row['runner_up']}.")
+    if row["explored"]:
+        parts.append("This was an exploration send: a less-used endpoint was tried on purpose.")
+    finish = str(row["finish"] or "")
+    parts.append(f"It took {int(row['ms'] or 0) / 1000.0:.1f} s and {FINISH_WORDS.get(finish, 'ended with ' + finish)}.")
+    if row["outcome"]:
+        parts.append(f"Your verdict: {row['outcome']}.")
+    return " ".join(parts)
+
+
 def set_route_outcome(project_scope: str, message_id: int, outcome: str) -> int:
     """Attach the operator's verdict to the send that produced a message: 'up', 'down', or 'locked' (an artifact was kept)."""
     if outcome not in ROUTE_OUTCOMES:
@@ -1861,9 +1901,17 @@ def health_check() -> Dict[str, Any]:
             threads = int(connection.execute("SELECT COUNT(*) FROM threads").fetchone()[0])
             messages = int(connection.execute("SELECT COUNT(*) FROM message_history").fetchone()[0])
             artifacts = int(connection.execute("SELECT COUNT(*) FROM artifact_store").fetchone()[0])
-        return {"ok": True, "path": str(database_path()), "threads": threads, "messages": messages, "artifacts": artifacts, "error": ""}
+            jobs = {str(status): int(count) for status, count in connection.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status")}
+            routes = connection.execute("SELECT COUNT(*), MAX(timestamp) FROM route_log").fetchone()
+        return {
+            "ok": True, "path": str(database_path()), "threads": threads, "messages": messages, "artifacts": artifacts, "error": "",
+            "jobs": jobs, "sends": int(routes[0] or 0), "last_send_at": float(routes[1] or 0.0),
+        }
     except Exception as exc:
-        return {"ok": False, "path": str(database_path()), "threads": 0, "messages": 0, "artifacts": 0, "error": f"{type(exc).__name__}: {exc}"[:200]}
+        return {
+            "ok": False, "path": str(database_path()), "threads": 0, "messages": 0, "artifacts": 0,
+            "error": f"{type(exc).__name__}: {exc}"[:200], "jobs": {}, "sends": 0, "last_send_at": 0.0,
+        }
 
 
 def export_thread(thread_id: int, project_scope: Optional[str] = None) -> Dict[str, Any]:
@@ -1893,11 +1941,17 @@ def export_thread(thread_id: int, project_scope: Optional[str] = None) -> Dict[s
     if thread["digest_artifact_id"]:
         artifact = artifact_by_id(int(thread["digest_artifact_id"]))
         digest = str(artifact["code_body"]) if artifact is not None else ""
+    route_fields = ("message_id", "timestamp", "route", "mode", "ms", "finish", "reason", "runner_up", "explored", "outcome")
+    routes = [
+        {name: row[name] for name in route_fields}
+        for _, row in sorted(routes_for_messages(scope, [int(item["id"]) for item in messages]).items())
+    ]
     return {
         "thread": {name: thread[name] for name in thread.keys()},
         "messages": messages,
         "summaries": summaries,
         "digest": digest,
+        "routes": routes,  # why each answer came out as it did; a failed send is a route row on its system message
         "exported_at": time.time(),
     }
 
@@ -1938,6 +1992,7 @@ def thread_transcript(thread_id: int, fmt: str = "markdown", project_scope: Opti
                 "",
             ]
     lines += ["## Messages", ""]
+    routes = {int(route["message_id"]): route for route in payload.get("routes", []) if route.get("message_id") is not None}
     for index, item in enumerate(payload["messages"], start=1):
         meta = [str(item["role"]).upper(), _stamp(item["timestamp"])]
         if item["provider"]:
@@ -1948,6 +2003,9 @@ def thread_transcript(thread_id: int, fmt: str = "markdown", project_scope: Opti
         if item["archived"]:
             meta.append("archived")
         lines += [f"### {index}. " + " · ".join(meta), "", str(item["content"]), ""]
+        route = routes.get(int(item["id"]))
+        if route is not None:
+            lines += [f"_Why: {route_facts(route)}_", ""]
     return f"{stem}.md", "\n".join(lines)
 
 
@@ -2204,8 +2262,8 @@ def migrate_thread(
     append_message(
         scope,
         "system",
-        f"Thread migrated from #{old_id} ({thread['title']}). Vision digest v{version} locked as artifact {artifact_id} "
-        f"({method}); it is shown to the model as background only, never as a rule.",
+        f"This chat continues chat #{old_id} ({thread['title']}), which got long. Its summary (v{version}) is locked as artifact "
+        f"{artifact_id} ({method}) and is shown to the model as background only, never as a rule.",
         thread_id=new_id,
     )
     return {"old_thread_id": old_id, "new_thread_id": new_id, "digest_artifact_id": artifact_id, "method": method, "digest": digest}

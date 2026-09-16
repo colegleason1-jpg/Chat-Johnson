@@ -32,7 +32,7 @@ approved reconstruction plan.
 
 | Path | Responsibility |
 |---|---|
-| `app.py` | Streamlit studio: sidebar control deck, six workspaces, preview canvas (sanitized, or Run in sandbox with automatic fixes), a Clear button per text field, SQLite vault, Artifact Lock |
+| `app.py` | Streamlit studio: sidebar control deck, six workspaces, preview canvas (Preview only, or Run the page with automatic fixes), a Clear button per text field, SQLite vault, Artifact Lock |
 | `cli.py` | `status`, `chat`, `run` commands |
 | `orchestrator/router.py` | BYOK vault, Cortex 1/2/3, Heavy Mode, legacy provider routing |
 | `orchestrator/config.py` | Legacy provider registry and conservative free-tier limits |
@@ -152,8 +152,8 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   `webcheck` missions and Repository Work → Deploy Kit → "Check a deployed URL" run an HTTP check
   (status, latency, expected text, health JSON) and a browser check where Chromium exists (the VM
   worker), reported as unavailable elsewhere.
-- **Run-mode preview and automatic fixes (batch T)**: the Live preview canvas has two modes. Sanitized
-  (default) strips every script. Run in sandbox executes the generated page inside a sealed frame: an
+- **Run-mode preview and automatic fixes (batch T)**: the Live preview canvas has two modes. Preview only
+  (buttons off) strips every script. Run the page executes the generated page inside a sealed frame: an
   opaque-origin iframe with scripts on and nothing else (no network requests, no storage, no dialogs,
   no navigation, nothing reaches the app; WebRTC, which browsers offer no policy for, is shadowed by
   the shim as a best effort), with Three.js available as `import 'three'` from a vendored copy. The
@@ -203,13 +203,13 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | Tri-Processor Cortex (1/f probe, MILP selection, streaming) with self-healing model ids | Implemented (routing signal only) |
 | Heavy Mode (draft → review → synthesis) with optional per-session paid review slot | Implemented |
 | SQLite vault: per-workspace threads, 200-message windows, texturize-then-archive, artifacts | Implemented |
-| Thread-health agent with vision-digest migration | Implemented |
+| Long chats summarised into a new chat (the summary is background only, never a rule) | Implemented |
 | Repository sandbox pipeline with AST + pytest repair loop | Implemented (local) |
 | GitHub identity | The session-only push token's login, shown in the sidebar; no OAuth app |
 | 10-cloud connector fabric | Roadmap · local SQLite is the only store; stubs listed in the sidebar |
 | Background Git-Streamer | Roadmap · not implemented |
 | Live SDK Document Scraper | Roadmap · not implemented |
-| Self-Correcting Execution Sandbox for chat output | Implemented for chat pages · Run in sandbox preview with up to 2 automatic Heavy Mode fix rounds; the capability card still says partial because the repository pipeline keeps its own pytest repair loop |
+| Self-Correcting Execution Sandbox for chat output | Implemented for chat pages · Run the page preview with up to 2 automatic Heavy Mode fix rounds; the capability card still says partial because the repository pipeline keeps its own pytest repair loop |
 | Cross-thread semantic search | Implemented as long-distance memory: FTS5/BM25 over the project's other chats (summaries, digests, missions, artifact summaries) with recency decay and superseding, in every prompt and every vision digest; no embedding index |
 | Controlled chaos: the validated 1/f signal applied across routing, Heavy Mode, memory recall, and migration | Implemented · bounded nudges only, per-project gain and frequency profiles, gain 0 is deterministic |
 | Cortex 2 as an empirical learner: measured speed, Bayesian quality from verdicts, pink-wave exploration, constraint-law dynamics | Implemented · bounded terms, hard limits untouched, exploration rate verified in the outcome log |
@@ -226,13 +226,13 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 Controls: **Heavy Mode** toggle (multi-pass, more tokens, longer wait), **Artifact Lock** beside every
 code block (versioned save to SQLite), output token budget slider, per-project scope.
 
-## Threads and the thread-health agent
+## Threads and long chats
 
 Every workspace holds any number of **chats** (threads). The row at the top of each workspace lets you
 switch, start a new one, **Clear chat** (messages move to the archive and leave the context; keys are
 untouched), or **Delete chat** (the chat, its archive, and its summaries are removed after a
-confirmation; locked artifacts stay). Rename, Migrate now, and **Download this chat** (Markdown or JSON,
-with the archive, summaries, and inherited digest) live under More. Commit a download to a `transcripts/`
+confirmation; locked artifacts stay). Rename, Summarise into a new chat now, and **Download this chat** (Markdown or JSON,
+with the archive, summaries, the inherited digest, and the route facts behind every answer) live under More. Commit a download to a `transcripts/`
 folder in the repository to hand a full conversation to the assistant for an audit without pasting it.
 
 Every send is traced in the **Routing log** expander at the bottom of the page (workspace, task type, provider/model,
@@ -242,7 +242,7 @@ Each thread has its own 200-message window and its own texturized summaries.
 
 Before every send, a zero-quota **health sweep** measures the active thread: message count, estimated
 tokens in the live window, stacked summaries, repeated prompts, and error loops. When a threshold
-trips (or you press *Migrate now*), the agent:
+trips (or you press *Summarise into a new chat now*), the app:
 
 1. compresses the whole thread, archive included, into a **vision digest**: how it started, decisions
    and constraints, key facts (files, numbers), open items, locked artifacts, and the summaries;
@@ -252,7 +252,7 @@ trips (or you press *Migrate now*), the agent:
    every prompt, and marks the old thread *migrated*. Nothing raw is deleted.
 
 The result is a fresh thread that carries the original vision in a re-optimized, token-light form.
-Switch **Auto-migrate heavy threads** off in the sidebar to keep migrations manual.
+Switch **Summarise long chats automatically** off in the sidebar to keep it manual.
 
 **Long-distance memory.** Every prompt also recalls lines from the project's *other* chats: their
 texturized summaries, vision digests, pinned missions, this chat's own older summaries, and artifact
@@ -429,8 +429,17 @@ and Normal mode never uses it. Close the tab and it is gone.
   *Snapshot now* and a confirmed *Restore from bucket* in the sidebar. Chats, artifacts, the recall
   index, the outcome log, and the learner's priors carry over. Set `CHAT_JOHNSON_DEMO=1` to show the
   banner that says this copy is the front door, not the 24/7 studio.
-- **Keepalive**: the `keepalive` workflow pings `?health=1` every five minutes when the `DEPLOY_URL`
-  repository variable is set, so the in-process worker keeps ticking while session keys are held.
+- **No keepalive ping**: a `curl` of `?health=1` only fetches Streamlit's shell page and never runs the
+  script, so the old five-minute keepalive did nothing and was removed. The `post-deploy-smoke` workflow
+  drives the live app with a real browser every six hours instead (that does run the script), when the
+  `DEPLOY_URL` repository variable is set; schedules only run from the default branch.
+- **The operator is told the truth (batch U2)**: a page with scripts switches the canvas to Run the page on
+  its own; a status line under the canvas says the mode, the page size against the answer limit, repairs used
+  and the last run; a cut answer gets a box with *Continue the answer*, *Raise the limit and continue* and
+  *Ask for a smaller page*; a failed send is a row in the thread; every answer has *Why this answer came out
+  like this* (endpoint, reason, runner-up, latency, how it ended); a restart and keys from an earlier session
+  are announced; browser errors are said plainly ("the page's code stops mid-way"); `?health=1` reports the
+  process start, workers, jobs, ledger and snapshot age.
 
 ## Development
 

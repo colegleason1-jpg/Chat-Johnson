@@ -319,6 +319,28 @@ def report_summary(report: Mapping[str, Any]) -> str:
 
 
 INCOMPLETE_REASON = "the page is incomplete (its answer was cut at the length limit), not broken: it is continued, not repaired"
+SAME_ERROR_REASON = "repair stopped: the rewrite broke in the same place, which usually means the answer is being cut off"
+
+_PLAIN_SCRIPT_ERRORS = (
+    (re.compile(r"unexpected end of (input|script)|unterminated (template|string|regexp)|missing \} |unexpected token '?\}?'? *$", re.I),
+     "the page's code stops mid-way: the answer was cut off before the code finished"),
+    (re.compile(r"(\S+) is not defined", re.I), "the page calls {0}, which it never defined"),
+    (re.compile(r"cannot read propert(?:y|ies) of (?:null|undefined)|null is not an object|undefined is not an object", re.I),
+     "the page looks for an element or value that is not there"),
+    (re.compile(r"failed to resolve module|failed to fetch|importing a module script|refused to (load|connect)|blocked by content security policy", re.I),
+     "the page tries to load something from the internet, which the sandbox never allows: everything must be inline"),
+    (re.compile(r"(\S+) is not a function", re.I), "the page calls {0} as a function, but it is not one"),
+)
+
+
+def plain_script_error(message: str) -> str:
+    """The browser's words for a script error, said the operator's way; the raw message stays for the model."""
+    text = " ".join(str(message or "").split())
+    for pattern, plain in _PLAIN_SCRIPT_ERRORS:
+        match = pattern.search(text)
+        if match:
+            return plain.format(*[group for group in match.groups() if group]) if match.groups() and "{0}" in plain else plain
+    return text
 
 
 def fix_decision(
@@ -342,9 +364,9 @@ def fix_decision(
         return False, INCOMPLETE_REASON, True
     rounds = int(state.get("rounds", 0))
     if rounds >= FIX_ROUNDS:
-        return False, f"stopped: {FIX_ROUNDS} automatic rounds used; {NEXT_STEP}", True
+        return False, f"repair stopped: {FIX_ROUNDS} automatic rounds used; {NEXT_STEP}", True
     if error_signature(report) == state.get("last_signature"):
-        return False, f"stopped: the same error came back; {NEXT_STEP}", True
+        return False, f"{SAME_ERROR_REASON}; {NEXT_STEP}", True
     if not heavy:
         return False, "Heavy Mode is off, so nothing is fixed automatically", False
     if not keyed:

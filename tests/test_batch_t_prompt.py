@@ -119,7 +119,7 @@ def test_capability_card_states_run_mode_and_stays_compact():
     card = capabilities.capability_card()
     assert len(card) < 3000
     assert "- Preview canvas:" in card
-    assert "Run in sandbox" in card and "2 automatic fix rounds" in card
+    assert "Run the page" in card and "2 automatic fix rounds" in card
     for name, _ in capabilities.IMPLEMENTED:
         assert f"- {name}:" in card
     for boundary in capabilities.BOUNDARIES:

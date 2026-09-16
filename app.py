@@ -139,6 +139,7 @@ from orchestrator.sandbox_preview import (
     needs_three,
     normalize_report,
     page_hash,
+    plain_script_error,
     report_summary,
     sandbox_insert,
     strip_hazards,
@@ -171,8 +172,10 @@ from orchestrator.vault import (
     redact_secrets,
     rename_thread,
     request_cancel,
+    route_facts,
     route_stats,
     routes_csv,
+    routes_for_messages,
     save_artifact,
     save_mission_nodes,
     search_artifacts,
@@ -190,7 +193,8 @@ from orchestrator import vaultsync  # noqa: E402
 
 SANDBOX_FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "sandbox_preview")
 SANDBOX_COMPONENT = components.declare_component("chat_johnson_sandbox_preview", path=SANDBOX_FRONTEND_DIR)
-PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN = "Sanitized", "Run in sandbox"
+PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN = "Preview only (buttons off)", "Run the page"
+LEGACY_PREVIEW_MODES = {"Sanitized": PREVIEW_MODE_SANITIZED, "Run in sandbox": PREVIEW_MODE_RUN}  # names earlier builds stored
 SANDBOX_PAGE_MEMORY = 8  # per-page sandbox bookkeeping kept in the session and the vault; the oldest page is dropped first
 SANDBOX_FIX_SETTING = "sandbox_fix"  # one vault setting per scope: {page_hash: {"rounds", "last_signature"}}
 FIX_WORKSPACES = ("normal_chat", "chat_bot")  # the workspaces whose renderers dispatch a queued automatic fix
@@ -200,6 +204,18 @@ PREVIEW_STATE_MAX_CHARS = 200_000
 _PAGE_REFERENCE_RE = re.compile(
     r"\b(?:fix|broken|works?|working|still|change|update|add|remove|edit|make it|this page|the page|the preview|this preview|buttons?|canvas)\b",
     re.I,
+)
+PROCESS_STARTED = time.time()  # this container's start: a visit recorded before it means the app restarted since
+RESTART_NOTICE_SECONDS = 900
+LAST_SEEN_SETTING, KEYS_SEEN_SETTING = "last_seen", "keys_seen"  # timestamps only, never a key
+SEEN_WRITE_INTERVAL = 60.0
+CONTINUE_PROMPT = (
+    "Continue your previous answer exactly from where it was cut off. Do not repeat what you already wrote and do not "
+    "start over; finish the page or the answer."
+)
+SMALLER_PAGE_PROMPT = (
+    "Rewrite the page so it fits within the answer length limit: keep the same features and behaviour, but use fewer "
+    "lines, no comments, minimal CSS and no filler text."
 )
 
 
@@ -214,8 +230,9 @@ def persist_preview_state(scope: str) -> None:
     if len(source) > PREVIEW_STATE_MAX_CHARS:
         return
     page = st.session_state.get("canvas_page") or {}
+    mode = st.session_state.get("preview_mode_pending") or st.session_state.get("preview_mode") or PREVIEW_MODE_SANITIZED
     setting_set(scope, PREVIEW_STATE_SETTING, json.dumps({
-        "source": source, "mode": st.session_state.get("preview_mode") or PREVIEW_MODE_SANITIZED,
+        "source": source, "mode": mode,
         "complete": bool(page.get("complete", True)), "reasons": list(page.get("reasons") or []),
         "message_id": page.get("message_id"), "workspace": str(page.get("workspace") or ""), "at": time.time(),
     }))
@@ -239,8 +256,9 @@ def restore_preview_state(scope: str) -> None:
     st.session_state.preview_source = source
     st.session_state.preview_editor = source
     st.session_state.preview_cleared = False
-    if stored.get("mode") in (PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN):
-        st.session_state.preview_mode = stored["mode"]
+    mode = LEGACY_PREVIEW_MODES.get(str(stored.get("mode") or ""), stored.get("mode"))
+    if mode in (PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN):
+        st.session_state.preview_mode = mode
     st.session_state.canvas_page = {
         "hash": page_hash(source), "stripped": page_hash(strip_hazards(source)[0]), "message_id": stored.get("message_id"),
         "complete": bool(stored.get("complete", True)), "reasons": list(stored.get("reasons") or []),
@@ -258,6 +276,10 @@ def commit_canvas_page(scope: str, workspace: str, source: str, message_id: Opti
         "hash": page_hash(source), "stripped": page_hash(strip_hazards(source)[0]), "message_id": message_id,
         "complete": not reasons, "reasons": reasons, "workspace": workspace,
     }
+    if not reasons and "<script" in source.lower() and st.session_state.get("preview_mode") != PREVIEW_MODE_RUN:
+        # A page with scripts is only judged by running it; Preview only would show its buttons as dead. Applied by the
+        # canvas before its radio is built (this run's widget may already exist).
+        st.session_state["preview_mode_pending"] = PREVIEW_MODE_RUN
     persist_preview_state(scope)
 
 
@@ -272,6 +294,25 @@ def canvas_page_complete(source: str) -> bool:
 
 def _persist_preview_mode() -> None:
     persist_preview_state(str(st.session_state.project_scope))
+
+
+def canvas_status_line(source: str, run_mode: bool) -> str:
+    """One line of truth under the canvas: the mode, the page against the answer limit, repairs used, the last run."""
+    limit = int(st.session_state.get("max_tokens", 4096))
+    page = st.session_state.get("canvas_page") or {}
+    parts = [PREVIEW_MODE_RUN if run_mode else PREVIEW_MODE_SANITIZED]
+    if source.strip():
+        size = f"page {len(source):,} characters (about {len(source) // 4:,} of the {limit:,} answer limit)"
+        if not page.get("complete", True):
+            size += " · INCOMPLETE: " + "; ".join(page.get("reasons") or ["cut off"])
+        parts.append(size)
+        rounds = (_sandbox_fix_table(str(st.session_state.project_scope)).get(page_hash(strip_hazards(source)[0])) or {}).get("rounds") or 0
+        parts.append(f"repairs used {int(rounds)} of {FIX_ROUNDS}")
+    else:
+        parts.append("no page yet")
+    last = st.session_state.get("sandbox_last_report")
+    parts.append(f"last run: {last}" if last else "not run yet")
+    return " · ".join(parts)
 
 
 def app_state_block(workspace: str, budget: int) -> str:
@@ -677,11 +718,15 @@ def render_preview_panel(fallback_source: str = "", workspace: str = "") -> None
             st.session_state.preview_editor = fallback_source
     if "preview_editor" not in st.session_state:
         st.session_state.preview_editor = st.session_state.get("preview_source", "")
+    pending_mode = st.session_state.pop("preview_mode_pending", None)
+    if pending_mode in (PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN):
+        st.session_state.preview_mode = pending_mode  # a page with scripts arrived: run it, so the verdict is real
     mode = st.radio("Preview mode", [PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN], key="preview_mode", horizontal=True, on_change=_persist_preview_mode)
     run_mode = mode == PREVIEW_MODE_RUN
     if run_mode:
         st.caption(
-            "Runs the page in a sealed frame: scripts on, no network, no storage, nothing reaches the app. Errors come back here"
+            ("Run mode was switched on because this page has scripts. " if pending_mode else "")
+            + "Runs the page in a sealed frame: scripts on, no network, no storage, nothing reaches the app. Errors come back here"
             + (
                 f" and are fixed automatically, up to {FIX_ROUNDS} rounds."
                 if active_mode() == "heavy" and workspace in FIX_WORKSPACES
@@ -689,7 +734,7 @@ def render_preview_panel(fallback_source: str = "", workspace: str = "") -> None
             )
         )
     else:
-        st.caption("Scripts are removed here; choose Run in sandbox to see the page work.")
+        st.caption("Buttons and other interactive parts are switched off in this view; choose Run the page to see it work.")
     source = st.text_area(
         "Preview markup",
         key="preview_editor",
@@ -704,6 +749,7 @@ def render_preview_panel(fallback_source: str = "", workspace: str = "") -> None
         st.session_state.preview_source = source
         st.session_state.preview_cleared = not source.strip()  # an emptied box stays empty until the chat makes new markup
     committed = str(st.session_state.get("preview_source", "") or "")
+    st.caption(canvas_status_line(committed, run_mode))
     # Run mode executes only what Render or the chat committed, never the draft being typed into the box.
     effective_source = resolve_preview_source(committed if run_mode else (committed or source))
     download_col.download_button(
@@ -720,7 +766,7 @@ def render_preview_panel(fallback_source: str = "", workspace: str = "") -> None
             run_sandbox_preview(effective_source, workspace, render_clicked)
         return
     if "<script" in effective_source.lower():
-        st.caption("This page has scripts. Switch Preview mode to Run in sandbox to run them.")
+        st.caption("This page has scripts. Switch to Run the page to see them work.")
     try:
         document = safe_preview_document(effective_source)
     except Exception as exc:  # a bad paste must never take the page down with it
@@ -733,7 +779,8 @@ def sandbox_report_text(report: Dict[str, Any]) -> str:
     lines = [f"status: {report['status']}", f"elements: {report['elements']}"]
     for entry in report["errors"]:
         where = (f"line {entry['line']}" + (f" col {entry['column']}" if entry["column"] else "")) if entry["line"] else "line ?"
-        lines.append(f"error · {where}: {entry['message']}")
+        plain = plain_script_error(entry["message"])
+        lines.append(f"error · {where}: {plain}" + (f" (browser said: {entry['message']})" if plain != entry["message"] else ""))
     lines.extend(f"blocked · {item}" for item in report["blocked"])
     lines.extend(f"console · {item}" for item in report["console"])
     if report["text"]:
@@ -1607,9 +1654,9 @@ def _run_generation(
     migration = health_sweep(project_scope, ledger, workspace=workspace)
     if migration:
         st.info(
-            f"Thread health agent migrated to an optimized chat (#{migration['new_thread_id']}) before sending: "
+            f"This chat got long, so it was summarised into a new chat (#{migration['new_thread_id']}) before sending: "
             + ", ".join(migration["reasons"])
-            + f". Digest locked as artifact {migration['digest_artifact_id']} ({migration['method']})."
+            + f". The summary is locked as artifact {migration['digest_artifact_id']} ({migration['method']})."
         )
     user_message_id = append_message(project_scope, "user", clean_prompt, mode=mode, workspace=workspace, task_type=task_type)
     pinkwave.activate(project_scope)  # this send walks the scope's wave: routing jitter, Heavy schedule, recall share
@@ -1641,7 +1688,7 @@ def _run_generation(
         if 0 < wait <= CHAT_MAX_WAIT_SECONDS:
             # Paced like missions and the pipeline: a full free-tier window is a short wait, not an error.
             with live_box.container():
-                st.info(f"Free-tier window is full; sending in {int(wait) + 1} s…")
+                st.info(f"Your free allowance for this minute is used up; sending again in {int(wait) + 1} s…")
             time.sleep(wait + 0.5)
             live_box.empty()
         if request_lock.locked():
@@ -1706,7 +1753,7 @@ def _run_generation(
                 raise
             live_box.empty()
             with live_box.container():
-                st.info(f"Free-tier window is full; sending in {int(retry_wait) + 1} s…")
+                st.info(f"Your free allowance for this minute is used up; sending again in {int(retry_wait) + 1} s…")
             time.sleep(retry_wait + 0.5)
             live_box.empty()
             answer, decision = attempt_generation()
@@ -1714,11 +1761,14 @@ def _run_generation(
         live_box.empty()
         # Shown in plain words; the raw vendor body stays in the session's provider events only.
         st.session_state.setdefault("provider_events", []).append(redact_secrets(str(exc))[:600])
-        log_route(workspace, task_type, "failed", mode, started, str(exc)[:160])
+        # The thread says so too: a question with no answer used to look like the app forgot it.
+        note = f"The send failed: {plain_error(exc)}"
+        system_id = append_message(project_scope, "system", note, mode=mode, workspace=workspace, task_type=task_type, finish="failed")
+        log_route(workspace, task_type, "failed", mode, started, str(exc)[:160], "failed", message_id=system_id)
         st.error(plain_error(exc))
         with st.expander("Technical detail", expanded=False):
             st.code(redact_secrets(str(exc))[:600])
-        return None  # the user turn is stored, but no answer was produced
+        return None  # the user turn and the failure note are stored, but no answer was produced
     finally:
         if lock_held:
             request_lock.release()
@@ -1770,11 +1820,7 @@ def _run_generation(
         )
         render_output_with_artifacts(answer, project_scope, assistant_id, f"message-{assistant_id}")
     if decision.finish == "length":
-        st.warning(
-            f"This answer is still cut off at the answer length limit ({max_tokens})"
-            + (f" after {continued} continuation(s)" if continued else "")
-            + ". Raise the limit in the sidebar and send again, or ask for a smaller page."
-        )
+        render_truncation_box(workspace, assistant_id, max_tokens, continued)
     elif decision.finish == "filtered":
         st.info("The provider filtered part of this answer under its content policy.")
     if workspace in CANVAS_WORKSPACES:
@@ -1813,6 +1859,43 @@ def dispatch_chat(
     )
 
 
+def queue_send(workspace: str, text: str) -> None:
+    """A button's send goes through the workspace's chat like a typed one, on the next run."""
+    st.session_state["queued_send"] = {"workspace": workspace, "text": text}
+    st.rerun()
+
+
+def take_queued_send(workspace: str) -> Optional[ChatSubmission]:
+    queued = st.session_state.get("queued_send")
+    if not queued or queued.get("workspace") != workspace:
+        return None
+    st.session_state.pop("queued_send", None)
+    return ChatSubmission(str(queued.get("text") or ""), [])
+
+
+def render_truncation_box(workspace: Optional[str], message_id: int, limit: int, continued: int = 0) -> None:
+    """The cut said in plain words, with the three things that help as buttons; nothing is left for the operator to guess."""
+    st.warning(
+        f"This answer is cut off at the answer length limit ({int(limit):,})"
+        + (f" even after {continued} automatic continuation(s)" if continued else "")
+        + ". Continue it, raise the limit, or ask for a smaller page."
+    )
+    if workspace not in FIX_WORKSPACES:  # only the chats that can send a follow-up get the buttons
+        return
+    sidebar_limit = int(st.session_state.get("max_tokens", 4096))
+    cont, raise_col, smaller = st.columns(3, gap="small")
+    if cont.button("Continue the answer", key=f"continue_{message_id}", use_container_width=True):
+        queue_send(workspace, CONTINUE_PROMPT)
+    if raise_col.button(
+        "Raise the limit and continue", key=f"raise_{message_id}", use_container_width=True, disabled=sidebar_limit >= 8192,
+        help="Doubles the sidebar's answer length limit (up to 8,192) and continues the answer.",
+    ):
+        st.session_state["raise_limit_pending"] = min(8192, sidebar_limit * 2)
+        queue_send(workspace, CONTINUE_PROMPT)
+    if smaller.button("Ask for a smaller page", key=f"smaller_{message_id}", use_container_width=True):
+        queue_send(workspace, SMALLER_PAGE_PROMPT)
+
+
 def render_user_turn(content: str) -> None:
     """A stored user turn. An automatic fix turn carries text the page chose (the sandbox report), so it is shown as
     text, never as markdown that could render an image or a link the page planted."""
@@ -1849,12 +1932,18 @@ def render_history(project_scope: str, heading: str, workspace: Optional[str] = 
         return
     if len(rows) > limit:
         st.caption(f"Showing the last {limit} of {len(rows)} messages in the active window.")
-    for row in rows[-limit:]:
-        role = row["role"] if row["role"] in {"user", "assistant"} else "assistant"
+    shown = rows[-limit:]
+    routes = routes_for_messages(project_scope, [int(row["id"]) for row in shown if row["role"] != "user"])
+    last_id = int(shown[-1]["id"])
+    for row in shown:
+        if row["role"] == "system":
+            st.info(row["content"])  # a failed send or a migration note, said in the thread where the question is
+            continue
+        role = row["role"]
         with st.chat_message(role):
+            cut = "finish" in row.keys() and row["finish"] == "length"
             if row["provider"]:
                 task = row["task_type"] if "task_type" in row.keys() and row["task_type"] else ""
-                cut = "finish" in row.keys() and row["finish"] == "length"
                 st.caption(("Cut off at the answer length limit · " if cut else "") + f"{row['provider']} · {task or row['mode']} · {row['token_count']} estimated tokens")
             if role == "assistant":
                 render_output_with_artifacts(
@@ -1863,6 +1952,12 @@ def render_history(project_scope: str, heading: str, workspace: Optional[str] = 
                     int(row["id"]),
                     f"message-{row['id']}",
                 )
+                route = routes.get(int(row["id"]))
+                if route is not None:
+                    with st.expander("Why this answer came out like this", expanded=False):
+                        st.caption(route_facts(route))
+                if cut and int(row["id"]) == last_id:
+                    render_truncation_box(workspace, int(row["id"]), int(st.session_state.get("max_tokens", 4096)))
             else:
                 render_user_turn(row["content"])
 
@@ -1913,27 +2008,27 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
             rename_thread(int(current["id"]), new_title, project_scope)
             st.rerun()
         health = thread_health(project_scope, workspace=workspace)
-        st.progress(min(float(health["pressure"]), 1.0), text=f"Context load {min(health['pressure'], 1.0):.0%} of the migration threshold")
+        st.progress(min(float(health["pressure"]), 1.0), text=f"This chat is {min(health['pressure'], 1.0):.0%} of the way to being summarised into a new chat")
         st.caption(
-            f"gen {health['generation']} · {health['messages']} msgs · ~{health['tokens']} tokens · "
+            f"chat generation {health['generation']} · {health['messages']} messages · about {health['tokens']:,} tokens in the window · "
             f"{health['summaries']} summaries · {health['archived']} archived"
         )
-        if st.button("Migrate now", key=f"migrate_{workspace}", use_container_width=True, disabled=not health["can_migrate"],
-                     help="Compress this chat into a locked vision digest and continue in a fresh optimized chat. "
-                          "Disabled until the chat has a few real messages (or right after a migration)."):
+        if st.button("Summarise into a new chat now", key=f"migrate_{workspace}", use_container_width=True, disabled=not health["can_migrate"],
+                     help="Compress this chat into a locked summary and continue in a fresh chat that carries it as background. "
+                          "Disabled until the chat has a few real messages (or right after a summary)."):
             try:
                 if health_sweep(project_scope, ledger, force=True, workspace=workspace):
                     st.rerun()
             except ValueError as exc:
                 st.info(str(exc))
         if health["recommend_migration"]:
-            st.warning("Migration recommended: " + ", ".join(health["reasons"]))
+            st.warning("Summarising this chat is recommended: " + ", ".join(health["reasons"]))
         for note in health.get("advisories", []):
             st.info(note)
         last_migration = st.session_state.get("last_migration")
         if last_migration and int(last_migration.get("new_thread_id", -1)) == int(current["id"]):
             st.caption(
-                f"Optimized from #{last_migration['old_thread_id']} · digest artifact "
+                f"Continued from chat #{last_migration['old_thread_id']} · its summary is artifact "
                 f"{last_migration['digest_artifact_id']} · {last_migration['method']}"
             )
         st.caption("Download this chat (archive, summaries, and digest included) for review or hand-off.")
@@ -2085,6 +2180,7 @@ def render_normal_chat(project_scope: str, ledger: QuotaLedger, submission: Opti
     st.caption("A single-pass terminal for quick text, planning, and coding questions." + mode_caption())
     render_thread_bar(project_scope, "normal_chat", ledger)
     render_history(project_scope, "Conversation", workspace="normal_chat")
+    submission = submission or take_queued_send("normal_chat")
     dispatch_chat(project_scope, "normal_chat", submission, ledger)
     dispatch_sandbox_fix(project_scope, "normal_chat", ledger, submission)
 
@@ -2106,6 +2202,7 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger, submission: Optiona
         if staged:
             st.caption(f"{len(staged)} file(s) staged in memory only; they go with your next message. Use Artifact Lock to persist an output.")
     render_history(project_scope, "Developer conversation", workspace="chat_bot")
+    submission = submission or take_queued_send("chat_bot")
     files = list(submission.files) if submission and submission.files else list(staged)
     if submission is not None and files and not submission.text.strip():
         # The paperclip lets a send go out with files only; give that send an explicit request.
@@ -2119,7 +2216,7 @@ def launch_mission(project_scope: str, ledger: QuotaLedger, thread_id: int, goal
     """Queue the mission as a background job; returns (job id, the thread it landed on, which a migration may have changed)."""
     migration = health_sweep(project_scope, ledger, workspace="task_finder")
     if migration:
-        st.info(f"Thread health agent migrated to optimized chat #{migration['new_thread_id']} before launching.")
+        st.info(f"This chat got long, so it was summarised into a new chat (#{migration['new_thread_id']}) before launching.")
         thread_id = int(migration["new_thread_id"])
     task_mode = active_mode()
     append_message(project_scope, "user", f"{MISSION_PREFIX}{goal}", mode=task_mode, thread_id=thread_id, workspace="task_finder", task_type="plan")
@@ -2366,7 +2463,7 @@ def render_mission_panel(project_scope: str, ledger: QuotaLedger, thread_id: int
         per_step = heavy_pass_tokens(budget) if heavy else budget
         upto = "up to " if heavy else ""
         st.caption(
-            f"Cost preview: {model_nodes} model node(s)" + (f" + {sub_nodes} sub-mission step(s)" if sub_nodes else "")
+            f"This will make up to {calls} request(s) with your key. Detail: {model_nodes} model node(s)" + (f" + {sub_nodes} sub-mission step(s)" if sub_nodes else "")
             + f" × {upto}{passes} pass(es) = {upto}{calls} provider call(s), up to ~{(model_nodes + sub_nodes) * per_step} output tokens; "
             f"{len(plan) - model_nodes - sum(1 for step in plan if step['executor'] == 'sub_mission')} deterministic node(s) cost nothing"
             + (" · Heavy Mode: draft b/2 + critique b/3 + synthesis b per workstream" if heavy else "")
@@ -3128,10 +3225,20 @@ if "byok_keys" not in st.session_state:
 bind_session_keys(st.session_state.byok_keys)
 if "heavy_mode" not in st.session_state:
     st.session_state.heavy_mode = False
+if "output_token_budget" not in st.session_state:
+    st.session_state.output_token_budget = 4096  # the slider reads this; a button may raise it before the slider is built
+pending_limit = st.session_state.pop("raise_limit_pending", None)
+if pending_limit:
+    st.session_state.output_token_budget = int(pending_limit)
 
 if _query_value("health") == "1":
-    # Machine-readable liveness for the smoke drive and a human glance; no keys, no provider calls.
+    # Machine-readable liveness for the smoke drive and a human glance; no keys, no provider calls. It says what the
+    # process is doing (start, workers, jobs, ledger, snapshot age), not only that the script ran.
     vault_state = health_check()
+    health_ledger = get_quota_ledger()
+    sync = vaultsync.status()
+    now = time.time()
+    runner = get_runner()
     st.code(
         json.dumps(
             {
@@ -3139,16 +3246,57 @@ if _query_value("health") == "1":
                 "build": build_marker(),
                 "streamlit": st.__version__,
                 "python": platform.python_version(),
+                "process": {
+                    "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(PROCESS_STARTED)), "age_s": int(now - PROCESS_STARTED),
+                    "workers": int(runner.max_workers), "active_jobs": list(runner.active_jobs()),
+                },
                 "vault": vault_state,
-                "snapshots": {**vaultsync.status(), "startup": VAULT_RESTORE_NOTE, "demo": os.environ.get("CHAT_JOHNSON_DEMO", "").strip() == "1"},
+                "ledger": {vendor: usage_sentence(health_ledger, vendor) for vendor in health_ledger.providers()},
+                "snapshots": {
+                    **sync, "startup": VAULT_RESTORE_NOTE, "demo": os.environ.get("CHAT_JOHNSON_DEMO", "").strip() == "1",
+                    "age_s": int(now - sync["last_upload_at"]) if sync.get("last_upload_at") else None,
+                },
                 "keyed_vendors": configured_provider_names(),
-                "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             },
             indent=2,
         ),
         language="json",
     )
     st.stop()
+
+
+def render_session_notices(scope: str) -> None:
+    """Say what a reload cannot: the app restarted (defaults are back, keys are gone) or keys were pasted in an earlier
+    session. Only timestamps are recorded, never a key."""
+    now = time.time()
+    if "session_started_at" not in st.session_state:
+        st.session_state.session_started_at = now
+        try:
+            last_seen = float(setting_get(scope, LAST_SEEN_SETTING, "0") or 0.0)
+            keys_seen = float(setting_get(scope, KEYS_SEEN_SETTING, "0") or 0.0)
+        except (TypeError, ValueError):
+            last_seen = keys_seen = 0.0
+        st.session_state.restart_notice = bool(last_seen and last_seen < PROCESS_STARTED and now - PROCESS_STARTED < RESTART_NOTICE_SECONDS)
+        st.session_state.keys_notice = bool(keys_seen)
+    keyed = bool(configured_provider_names())
+    if st.session_state.get("restart_notice"):
+        st.info(
+            f"The app restarted at {time.strftime('%H:%M', time.gmtime(PROCESS_STARTED))} UTC (a redeploy or a Cloud restart). "
+            "Pasted keys are gone, and Heavy Mode, the answer length limit and the canvas mode are back at their defaults. "
+            f"Vault at startup: {VAULT_RESTORE_NOTE}."
+        )
+    elif st.session_state.get("keys_notice") and not keyed:
+        st.info("Keys were pasted in an earlier session. They are never stored, so paste them again in the sidebar to send.")
+    if now - float(st.session_state.get("seen_written_at", 0.0)) >= SEEN_WRITE_INTERVAL:
+        st.session_state.seen_written_at = now
+        try:
+            setting_set(scope, LAST_SEEN_SETTING, f"{now:.0f}")
+            if keyed:
+                setting_set(scope, KEYS_SEEN_SETTING, f"{now:.0f}")
+        except Exception:  # a notice must never break the page
+            pass
+
 
 ledger = get_quota_ledger()
 with st.sidebar:
@@ -3314,26 +3462,26 @@ with st.sidebar:
         if st.button("Rebuild quality priors from the outcome log", key="learner_rebuild"):
             folded = learner.rebuild_priors(st.session_state.project_scope)
             st.caption(f"{folded} verdict(s) folded into the priors.")
-    st.subheader("Thread health agent")
+    st.subheader("Long chats")
     st.checkbox(
-        "Auto-migrate heavy threads",
+        "Summarise long chats automatically",
         key="auto_migrate",
         value=True,
-        help="Applies to every workspace. Before each send the health agent checks the active chat's load, repetition, and "
-        "error loops. When a threshold trips, it compresses the chat into a locked vision digest and continues in a fresh "
-        "optimized chat. Thresholds: 300 messages, ~18k live tokens, 2 stacked summaries; repetition and error loops are advisories.",
+        help="Applies to every workspace. Before each send the app checks how long the active chat has grown. When it gets "
+        "too long, it is compressed into a locked summary and continued in a fresh chat that carries the summary as "
+        "background only. Thresholds: 300 messages, about 60k tokens in the window, 2 stacked summaries.",
     )
     st.caption(
-        "Each workspace has its own chats: New chat, Clear chat, Delete chat, and More (rename, context load, Migrate now). "
+        "Each workspace has its own chats: New chat, Clear chat, Delete chat, and More (rename, how full the chat is, summarise now). "
         "The chat bar at the bottom of the screen always sends to the workspace selected at the top."
     )
     st.checkbox(
         "Heavy Mode",
         key="heavy_mode",
         help="Uses a bounded draft → review → synthesis workflow. Private reasoning is not displayed; token usage and latency are higher. "
-        f"With the canvas in Run in sandbox mode, a page that throws is sent back for up to {FIX_ROUNDS} automatic fix rounds.",
+        f"With the canvas set to Run the page, a page that throws is sent back for up to {FIX_ROUNDS} automatic fix rounds.",
     )
-    st.session_state.max_tokens = st.slider("Answer length limit", 256, 8192, 4096, 256, key="output_token_budget",
+    st.session_state.max_tokens = st.slider("Answer length limit", 256, 8192, step=256, key="output_token_budget",
                                             help="About 4 characters per unit. A working web page needs 6,000 or more; pages and apps are raised automatically below.")
     st.checkbox(
         "Raise the limit automatically for pages and apps", key="auto_page_budget", value=True,
@@ -3478,6 +3626,7 @@ st.caption(
 )
 
 scope = st.session_state.project_scope
+render_session_notices(str(scope))
 workspace = render_workspace_switch()
 render_jobs_strip(scope)
 # Created at the top level on purpose: inside a column or tab the chat bar would render inline instead of pinned.

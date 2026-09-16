@@ -90,7 +90,7 @@ def seed_page(app, scope: str, page: str, workspace: str = "normal_chat"):
 def run_mode(app, heavy: bool):
     if heavy:
         app.checkbox(key="heavy_mode").check().run()
-    app.radio(key="preview_mode").set_value("Run in sandbox").run()
+    app.radio(key="preview_mode").set_value("Run the page").run()
     assert not app.exception
 
 
@@ -178,7 +178,7 @@ def test_download_button_and_data_link_decoding(app):
     seed_page(app, "visitor-download", PAGE1)
     download = next(d for d in app.download_button if d.key == "preview_download")
     assert download.label == "Download preview (.html)" and download.proto.disabled is False
-    assert any(c.startswith("Scripts are removed here") for c in captions(app))
+    assert any(c.startswith("Buttons and other interactive parts are switched off") for c in captions(app))
     assert any(c.startswith("This page has scripts.") for c in captions(app))  # PAGE1 carries a script
     link = "data:text/html," + quote("<section><h2>Decoded mockup</h2></section>", safe="")
     app.text_area(key="preview_editor").set_value(link).run()
@@ -291,7 +291,7 @@ def test_the_same_error_coming_back_stops_the_loop(app, monkeypatch):
     assert app.session_state["preview_source"] == PAGE2 and len(calls) == 1
     inject(app, PAGE2, ERROR_FOO)
     assert len(calls) == 1 and app.session_state["preview_source"] == PAGE2
-    assert any("the same error came back" in c for c in captions(app)), captions(app)
+    assert any("broke in the same place" in c for c in captions(app)), captions(app)
 
 
 def test_a_fix_that_returns_the_same_page_runs_it_again(app, monkeypatch):
@@ -305,7 +305,7 @@ def test_a_fix_that_returns_the_same_page_runs_it_again(app, monkeypatch):
     assert any(c == "The fix returned the same page; running it again." for c in captions(app)), captions(app)
     assert stored("visitor-again", PAGE1)["rounds"] == 1
     inject(app, PAGE1, ERROR_FOO, seq=2)  # the re-run reports the same error: the loop stops
-    assert len(calls) == 1 and any("the same error came back" in c for c in captions(app))
+    assert len(calls) == 1 and any("broke in the same place" in c for c in captions(app))
     inject(app, PAGE1, ERROR_BAR, seq=3)  # a different error on the same page earns the second round
     assert len(calls) == 2 and app.session_state["preview_source"] == PAGE2
 
@@ -413,7 +413,7 @@ def test_sanitized_mode_ignores_reports(app, monkeypatch):
     calls = fake_provider(monkeypatch, [fenced(PAGE2)])
     seed_page(app, "visitor-sanitized", PAGE1)
     app.checkbox(key="heavy_mode").check().run()
-    assert app.radio(key="preview_mode").value == "Sanitized"
+    assert app.radio(key="preview_mode").value == "Preview only (buttons off)"
     inject(app, PAGE1, ERROR_FOO)
     assert calls == [] and len(rows("visitor-sanitized")) == 2
     assert app.session_state["preview_source"] == PAGE1 and "sandbox_fix_pending" not in app.session_state
