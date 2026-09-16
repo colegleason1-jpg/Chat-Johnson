@@ -1944,7 +1944,10 @@ def _heavy_pipeline(
             "role": "system",
             "content": (
                 "Review the candidate answer for correctness, omissions, unsafe assumptions, "
-                "and concrete improvements. Return a concise checklist only; do not reveal "
+                "and concrete improvements. Check that it addresses the newest message first and then "
+                "finishes any earlier unfinished request. When the request asks for an interface or page, "
+                "check that the page is one complete self-contained ```html fence (inline CSS and JS, no "
+                "external URLs, no data: link). Return a concise checklist only; do not reveal "
                 "private chain-of-thought."
             ),
         },

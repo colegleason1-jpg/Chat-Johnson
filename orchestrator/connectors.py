@@ -69,7 +69,7 @@ ROADMAP_CONNECTORS: Tuple[Tuple[str, str], ...] = (
 ROADMAP_FEATURES: Tuple[Tuple[str, str, str], ...] = (
     ("Background Git-Streamer", "not_implemented", "Opt-in autosave commits to an autosave branch. No code exists; nothing is committed automatically."),
     ("Live SDK Document Scraper", "not_implemented", "Pre-prompt crawl of vendor docs for current syntax. No code exists."),
-    ("Self-Correcting Execution Sandbox", "partial", "Exists only inside the Repository Work pipeline (orchestrator/test_loop.py repair loop); chat output is not executed."),
+    ("Self-Correcting Execution Sandbox", "partial", "The chat-page Preview canvas runs a generated page in a sealed sandbox and, in Heavy Mode, feeds script errors back for automatic fix rounds; the Repository Work pipeline (orchestrator/test_loop.py repair loop) remains separate."),
     ("Cross-thread semantic search", "partial", "Long-distance memory: an FTS5/BM25 index over the project's other chats (summaries, digests, missions, artifact summaries) with recency decay, recalled into every prompt; no embedding index."),
 )
 

@@ -9,7 +9,7 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from orchestrator import jobs, vault  # noqa: E402
+from orchestrator import jobs, treasury_plan, vault  # noqa: E402
 from orchestrator.router import RouteDecision  # noqa: E402
 from orchestrator.society import academy, cycles, economy, inquiries, leisure, release, store, templates, tick  # noqa: E402
 
@@ -132,6 +132,8 @@ def test_society_tick_queues_due_cycles_runs_leisure_and_chains(db, monkeypatch)
     monkeypatch.setattr(academy, "generate_mode", lambda *a, **k: ("SOURCE: arxiv\nQUERY: tides\nWAKE_HOURS: 1", RouteDecision("fake", "m", "quick_text", "r")))
     monkeypatch.setattr(academy, "cortex_wait_seconds", lambda ledger, messages, budget: 0.0)
     monkeypatch.setattr(leisure, "inquire", lambda source, query, custom: ("https://arxiv.org/abs/1", "Tides. " * 50))
+    # The engine's plan of the day scales the leisure budget by the hour; this test is about the tick, so pin every scale to 1.0.
+    monkeypatch.setattr(tick, "day_plan", lambda scope, ledger, now: treasury_plan.DayPlan(scope, time.strftime("%Y-%m-%d", time.gmtime(now)), 0, 0.0, "error", notes=["pinned"], created_at=now))
     for agent in store.agents_for(db)[:2]:
         store.ledger_add(db, int(agent["id"]), "earn", 1000, "work")
     job_id = tick.start_tick(db, {"GEMINI_API_KEY": "AIza-fake"}, interval_s=600, leisure_cap=2)

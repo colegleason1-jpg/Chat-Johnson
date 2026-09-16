@@ -118,7 +118,25 @@ from orchestrator.missions import (
 )
 from orchestrator.connectors_nodes import CONNECTORS, validate_nodes
 from orchestrator import mcp_client
-from orchestrator.preview import extract_preview_source, looks_like_link, safe_preview_document
+from orchestrator.preview import extract_preview_source, looks_like_link, resolve_preview_source, safe_preview_document
+from orchestrator.sandbox_preview import (
+    FIX_PREFIX,
+    FIX_ROUNDS,
+    FIX_STATUSES,
+    FIX_SYSTEM,
+    FRAME_HEIGHT,
+    PREVIEW_RULES,
+    error_signature,
+    fix_decision,
+    fix_prompt,
+    fix_report_part,
+    needs_three,
+    normalize_report,
+    page_hash,
+    report_summary,
+    sandbox_insert,
+    strip_hazards,
+)
 from orchestrator.vault import (
     MESSAGE_WINDOW,
     WORKSPACES as VAULT_WORKSPACES,
@@ -154,6 +172,8 @@ from orchestrator.vault import (
     search_artifacts,
     search_messages,
     set_route_outcome,
+    setting_get,
+    setting_set,
     switch_thread,
     thread_health,
     thread_outline,
@@ -161,6 +181,39 @@ from orchestrator.vault import (
 )
 
 from orchestrator import vaultsync  # noqa: E402
+
+SANDBOX_FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "sandbox_preview")
+SANDBOX_COMPONENT = components.declare_component("chat_johnson_sandbox_preview", path=SANDBOX_FRONTEND_DIR)
+PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN = "Sanitized", "Run in sandbox"
+SANDBOX_PAGE_MEMORY = 8  # per-page sandbox bookkeeping kept in the session and the vault; the oldest page is dropped first
+SANDBOX_FIX_SETTING = "sandbox_fix"  # one vault setting per scope: {page_hash: {"rounds", "last_signature"}}
+FIX_WORKSPACES = ("normal_chat", "chat_bot")  # the workspaces whose renderers dispatch a queued automatic fix
+
+
+def _clear_widget(key: str) -> None:
+    st.session_state[key] = ""
+
+
+def clear_button(key: str, label: str = "Clear") -> bool:
+    """A Clear button bound to one text widget. The callback runs before the script, so writing the widget's own key is
+    legal, and it touches exactly that key: no Clear button anywhere empties more than its own field."""
+    return st.button(label, key=f"clear__{key}", on_click=_clear_widget, args=(key,), help="Empties this field only")
+
+
+def text_input_with_clear(label: str, key: str, ratio: Sequence[int] = (5, 1), **kwargs: Any) -> str:
+    field, tail = st.columns(list(ratio), vertical_alignment="bottom")
+    with field:
+        value = st.text_input(label, key=key, **kwargs)
+    with tail:
+        clear_button(key)
+    return value
+
+
+def text_area_with_clear(label: str, key: str, ratio: Sequence[int] = (5, 1), **kwargs: Any) -> str:
+    value = st.text_area(label, key=key, **kwargs)
+    with st.columns(list(ratio))[1]:
+        clear_button(key)
+    return value
 
 
 def _secrets_to_env() -> None:
@@ -488,35 +541,232 @@ def last_markup_in_chat(project_scope: str, workspace: str) -> str:
     return ""
 
 
-def render_preview_panel(fallback_source: str = "") -> None:
-    st.caption("HTML/CSS mockups are isolated and sanitized before rendering.")
+def _clear_preview() -> None:
+    # One canvas, three keys on purpose: the editor, the rendered copy, and the flag that keeps an emptied canvas from
+    # refilling itself from the chat. Nothing else in the app is touched.
+    st.session_state.preview_editor = ""
+    st.session_state.preview_source = ""
+    st.session_state.preview_cleared = True
+
+
+def render_preview_panel(fallback_source: str = "", workspace: str = "") -> None:
     if not st.session_state.get("preview_source") and fallback_source:
         st.session_state.preview_source = fallback_source
         if not st.session_state.get("preview_editor"):  # set before the widget is created in this run, never after
             st.session_state.preview_editor = fallback_source
     if "preview_editor" not in st.session_state:
         st.session_state.preview_editor = st.session_state.get("preview_source", "")
+    mode = st.radio("Preview mode", [PREVIEW_MODE_SANITIZED, PREVIEW_MODE_RUN], key="preview_mode", horizontal=True)
+    run_mode = mode == PREVIEW_MODE_RUN
+    if run_mode:
+        st.caption(
+            "Runs the page in a sealed frame: scripts on, no network, no storage, nothing reaches the app. Errors come back here"
+            + (
+                f" and are fixed automatically, up to {FIX_ROUNDS} rounds."
+                if active_mode() == "heavy" and workspace in FIX_WORKSPACES
+                else "; automatic fixes run in Normal Chat or Chat Bot with Heavy Mode on."
+            )
+        )
+    else:
+        st.caption("Scripts are removed here; choose Run in sandbox to see the page work.")
     source = st.text_area(
         "Preview markup",
         key="preview_editor",
         height=170,
         label_visibility="collapsed",
-        placeholder="Paste HTML/CSS here or generate an interface in Chat Bot mode…",
+        placeholder="Paste a page here, or ask Normal Chat or Chat Bot for one…",
     )
-    render_clicked = st.button("Render sanitized preview", key="render_preview", type="secondary")
+    render_col, download_col, clear_col = st.columns(3)
+    render_clicked = render_col.button("Render", key="render_preview", type="secondary", use_container_width=True)
+    clear_col.button("Clear preview", key="clear__preview_editor", on_click=_clear_preview, help="Empties the canvas only", use_container_width=True)
     if render_clicked:
         st.session_state.preview_source = source
         st.session_state.preview_cleared = not source.strip()  # an emptied box stays empty until the chat makes new markup
-    effective_source = st.session_state.get("preview_source", "") or source
+    committed = str(st.session_state.get("preview_source", "") or "")
+    # Run mode executes only what Render or the chat committed, never the draft being typed into the box.
+    effective_source = resolve_preview_source(committed if run_mode else (committed or source))
+    download_col.download_button(
+        "Download preview (.html)", data=effective_source or "", file_name="preview.html", mime="text/html",
+        key="preview_download", disabled=not effective_source, use_container_width=True,
+    )
     if looks_like_link(effective_source):
         st.info("That is a link, not markup. The canvas never fetches pages (it is a no-network sandbox); paste the HTML/CSS itself, "
                 "or ask the chat for the mockup and it lands here on its own.")
+    if run_mode:
+        if source.strip() != committed.strip():
+            st.caption("Press Render to run what is in the box.")
+        if effective_source.strip():
+            run_sandbox_preview(effective_source, workspace, render_clicked)
+        return
+    if "<script" in effective_source.lower():
+        st.caption("This page has scripts. Switch Preview mode to Run in sandbox to run them.")
     try:
         document = safe_preview_document(effective_source)
     except Exception as exc:  # a bad paste must never take the page down with it
         st.warning(f"The canvas could not render that markup ({plain_error(exc)}). Paste HTML/CSS, or clear the box.")
         return
-    st.components.v1.html(document, height=410, scrolling=True)
+    components.html(document, height=410, scrolling=True)
+
+
+def sandbox_report_text(report: Dict[str, Any]) -> str:
+    lines = [f"status: {report['status']}", f"elements: {report['elements']}"]
+    for entry in report["errors"]:
+        where = (f"line {entry['line']}" + (f" col {entry['column']}" if entry["column"] else "")) if entry["line"] else "line ?"
+        lines.append(f"error · {where}: {entry['message']}")
+    lines.extend(f"blocked · {item}" for item in report["blocked"])
+    lines.extend(f"console · {item}" for item in report["console"])
+    if report["text"]:
+        lines.append(f"text: {report['text']}")
+    return "\n".join(lines)
+
+
+def run_sandbox_preview(source: str, workspace: str, rerun: bool) -> None:
+    """Host the page in the sealed frame, show what it reported, and hand the report to the fix loop."""
+    cleaned, notes = strip_hazards(source)
+    page = page_hash(cleaned)
+    seqs: Dict[str, int] = st.session_state.setdefault("sandbox_seq", {})
+    if page not in seqs:
+        seqs[page] = 1
+    elif rerun:
+        seqs[page] += 1  # Render on the same page runs it again
+    while len(seqs) > SANDBOX_PAGE_MEMORY:
+        seqs.pop(next(iter(seqs)))
+    seq = seqs[page]
+    raw = SANDBOX_COMPONENT(
+        seq=seq, page=page, source=cleaned, insert=sandbox_insert(seq), three=needs_three(cleaned),
+        height=FRAME_HEIGHT, key="sandbox_preview", default=None,
+    )
+    injected = st.session_state.pop("sandbox_report_injected", None)  # test seam: AppTest runs no JavaScript
+    report = normalize_report(injected if injected is not None else raw)
+    if report is not None and report["page"] != page:
+        report = None  # the value Streamlit re-delivers for the previous page, not a report on this one
+    if notes:
+        st.caption("Before running, the sandbox removed " + "; ".join(notes) + ".")
+    if report is not None:
+        st.caption(f"Sandbox: {report_summary(report)}" + (f" · {report['ms']} ms" if report["ms"] else ""))
+        with st.expander("Sandbox report", expanded=False):
+            st.text(sandbox_report_text(report))  # page text is shown as text, never rendered as markdown
+    consider_sandbox_fix(report, cleaned, page, workspace)
+
+
+def _sandbox_fix_table(scope: str) -> Dict[str, Dict[str, Any]]:
+    """The scope's vault mirror: one setting holding ``{page_hash: {"rounds", "last_signature"}}``, oldest first."""
+    try:
+        stored = json.loads(setting_get(scope, SANDBOX_FIX_SETTING, "") or "{}")
+    except ValueError:
+        stored = {}
+    return {str(k): v for k, v in stored.items() if isinstance(v, dict)} if isinstance(stored, dict) else {}
+
+
+def sandbox_fix_state(scope: str, page: str) -> Dict[str, Any]:
+    """Rounds and the last error signature are mirrored in the vault: a reload refills the canvas from the chat and would
+    otherwise restart the rounds on every reload. The handled seq is per session, where the component re-delivers."""
+    session: Dict[str, Dict[str, int]] = st.session_state.setdefault("sandbox_fix", {})
+    entry = session.setdefault(page, {"handled_seq": 0})
+    while len(session) > SANDBOX_PAGE_MEMORY:
+        session.pop(next(iter(session)))
+    stored = _sandbox_fix_table(scope).get(page) or {}
+    try:
+        rounds = int(stored.get("rounds") or 0)
+    except (TypeError, ValueError):
+        rounds = 0
+    return {"rounds": rounds, "last_signature": str(stored.get("last_signature") or ""), "handled_seq": int(entry.get("handled_seq") or 0)}
+
+
+def persist_sandbox_fix_state(scope: str, page: str, rounds: int, signature: str) -> None:
+    table = _sandbox_fix_table(scope)
+    table.pop(page, None)  # re-inserted last, so the entries drop in the order they were last touched
+    table[page] = {"rounds": int(rounds), "last_signature": str(signature)}
+    while len(table) > SANDBOX_PAGE_MEMORY:
+        table.pop(next(iter(table)))
+    setting_set(scope, SANDBOX_FIX_SETTING, json.dumps(table))
+
+
+def consider_sandbox_fix(report: Optional[Dict[str, Any]], source: str, page: str, workspace: str) -> None:
+    """Decide what a fresh report earns. A report is marked handled only once it is settled (clean, capped, repeated, or
+    queued); a transient refusal leaves it open so the next run decides again, and so does a workspace that cannot run
+    the fix, so the same report is fixed after the operator switches."""
+    if report is None:
+        return
+    scope = str(st.session_state.project_scope)
+    state = sandbox_fix_state(scope, page)
+    if int(report["seq"]) <= state["handled_seq"]:
+        return
+    if report["status"] not in FIX_STATUSES:
+        st.session_state["sandbox_fix"][page]["handled_seq"] = int(report["seq"])
+        if report["blocked"]:
+            st.caption("Blocked images, fonts or connections are not fixed automatically; ask the chat to inline them.")
+        return
+    heavy = active_mode() == "heavy"
+    generating = bool(st.session_state.get("generation_running", False)) or get_task_request_lock().locked()
+    allowed, reason, settled = fix_decision(state, report, heavy, generating, keyed=bool(configured_provider_names()))
+    if settled and not allowed:
+        # Capped or repeated: no workspace can fix this page, so the report is closed wherever it arrived.
+        st.session_state["sandbox_fix"][page]["handled_seq"] = int(report["seq"])
+        st.caption(reason)
+        return
+    if workspace not in FIX_WORKSPACES:
+        st.caption("Automatic fixes run from Normal Chat or Chat Bot; switch there and this page is fixed." if heavy else reason)
+        return
+    st.caption(reason)
+    if not allowed:
+        return
+    st.session_state["sandbox_fix"][page]["handled_seq"] = int(report["seq"])
+    round_no = state["rounds"] + 1
+    st.session_state["sandbox_fix_pending"] = {
+        "workspace": workspace, "page": page, "prompt": fix_prompt(source, report, round_no), "round": round_no,
+        "signature": error_signature(report),
+    }
+    # The fix turn belongs in the workspace's chat area above the pinned bar, and run_generation assigns preview_editor,
+    # which is illegal once this run's text_area exists: queue it and start the script over.
+    st.rerun()
+
+
+def dispatch_sandbox_fix(project_scope: str, workspace: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
+    """Run the fix turn the canvas queued for this workspace. A round is spent only once the turn produced an answer:
+    a real send, a canvas that moved on, a missing key, Heavy Mode off, or a failed turn drops the fix at no cost."""
+    pending = st.session_state.get("sandbox_fix_pending")
+    if not pending or pending.get("workspace") != workspace:
+        return
+    st.session_state.pop("sandbox_fix_pending", None)
+    if submission is not None:
+        st.caption("Automatic fix dropped: your message goes first.")
+        return
+    prompt = str(pending.get("prompt") or "")
+    parent = str(pending.get("page") or "")
+    current = page_hash(strip_hazards(resolve_preview_source(str(st.session_state.get("preview_source") or "")))[0])
+    if not prompt.startswith(FIX_PREFIX) or parent != current:
+        st.caption("Automatic fix dropped: the canvas moved on.")
+        return
+    if not configured_provider_names():
+        st.caption("Automatic fix skipped: no provider key is configured.")
+        return
+    if active_mode() != "heavy":
+        st.caption("Automatic fix skipped: Heavy Mode is off.")
+        return
+    try:
+        answer_id = run_generation(
+            project_scope, prompt, classify(prompt), ledger, workspace=workspace,
+            extra_system=PREVIEW_RULES + "\n\n" + FIX_SYSTEM, fix_round=int(pending.get("round") or 0),
+        )
+    except Exception as exc:  # a script abort (BaseException) propagates; nothing was persisted yet
+        st.caption(f"Automatic fix did not complete ({plain_error(exc)}); press Render to try again.")
+        return
+    if answer_id is None:
+        st.caption("Automatic fix did not complete; press Render to try again.")
+        return
+    persist_sandbox_fix_state(project_scope, parent, int(pending.get("round") or 0), str(pending.get("signature") or ""))
+    produced = str(st.session_state.get("preview_source") or "")
+    child = page_hash(strip_hazards(produced)[0]) if produced.strip() else ""
+    if child and child != parent:
+        # The corrected page inherits the rounds spent on its parent: the cap counts the lineage, not each rewrite.
+        inherited = sandbox_fix_state(project_scope, parent)
+        if inherited["rounds"] > sandbox_fix_state(project_scope, child)["rounds"]:
+            persist_sandbox_fix_state(project_scope, child, inherited["rounds"], inherited["last_signature"])
+        return
+    seqs: Dict[str, int] = st.session_state.setdefault("sandbox_seq", {})
+    seqs[parent] = int(seqs.get(parent) or 0) + 1  # the same page runs again; a repeated error then stops the loop
+    st.caption("The fix returned the same page; running it again.")
 
 
 # =============================================================================
@@ -673,15 +923,15 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
                 if choices:
                     pick = st.selectbox("Repository", choices, key="repo_pick", help="Type to filter. Newest activity first.")
                 else:
-                    pick = st.text_input("Repository", key="repo_manual", placeholder="name, or owner/name" if push_state["login"] else "owner/repo")
+                    pick = text_input_with_clear("Repository", "repo_manual", placeholder="name, or owner/name" if push_state["login"] else "owner/repo")
                 if st.button("Refresh list", key="repo_list"):
                     st.session_state.pop("repo_choices", None)
                     st.rerun()
             else:
-                pick = st.text_input("Public repository (owner/name)", key="repo_manual", placeholder="owner/repo")
+                pick = text_input_with_clear("Public repository (owner/name)", "repo_manual", placeholder="owner/repo")
                 st.caption("Arm GitHub push in the sidebar to pick from your repositories and read private ones.")
             with st.expander("Advanced: branch, tag, or commit", expanded=False):
-                ref = st.text_input("Ref", value="", key="repo_fetch_ref", placeholder="default branch")
+                ref = text_input_with_clear("Ref", "repo_fetch_ref", placeholder="default branch")
             pick = qualify_repository(pick, push_state["login"])  # a bare name means one of yours
             valid = looks_like_owner_repo(pick)
             if pick.strip() and not valid:
@@ -697,12 +947,12 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
                 except (GitHubRepoError, GitHubPushError) as exc:
                     st.error(f"Connect failed: {exc}")
     else:
-        repo_path = st.text_input(
-            "Repository path", value="", key="repo_path",
+        repo_path = text_input_with_clear(
+            "Repository path", "repo_path",
             placeholder="Absolute path to a local git repository (never the deployed app's own checkout)",
         )
-    repo_goal = st.text_area(
-        "Requested repository change", height=100, key="repo_goal",
+    repo_goal = text_area_with_clear(
+        "Requested repository change", "repo_goal", height=100,
         placeholder="Describe a reviewable change; generated edits stay in an isolated sandbox.",
     )
     if self_hosted():
@@ -797,7 +1047,7 @@ def render_repo_work_tab(project_scope: str, ledger: QuotaLedger) -> None:
             elif push_state["armed"] and push_state["connected"]:
                 base = str(last["fetched"]["ref"])
                 default_branch = f"chat-johnson/{deliverable_slug(last['goal'])}-{str(last['fetched']['sha'])[:7]}"
-                branch = st.text_input("Branch name", value=default_branch, key="repo_push_branch")
+                branch = text_input_with_clear("Branch name", "repo_push_branch", value=default_branch)
                 if st.button(f"Push {len(pairs)} changed file(s) as a branch and open a pull request", type="primary", key="repo_push"):
                     title = f"Chat Johnson: {last['goal'][:70]}"
                     body = (
@@ -963,8 +1213,10 @@ def render_deploy_kit(project_scope: str) -> None:
         with st.container(border=True):
             st.markdown("**Check a deployed URL** · HTTP status, latency, expected text, and the health JSON; a browser check where Chromium exists.")
             u1, u2 = st.columns([0.6, 0.4])
-            check_target = u1.text_input("URL", key="webqa_url", placeholder="https://your-app.example/?health=1")
-            expect_text = u2.text_input("Expected text (optional)", key="webqa_text", placeholder="Chat Johnson Master Studio")
+            with u1:
+                check_target = text_input_with_clear("URL", "webqa_url", ratio=[3, 1], placeholder="https://your-app.example/?health=1")
+            with u2:
+                expect_text = text_input_with_clear("Expected text (optional)", "webqa_text", ratio=[3, 1], placeholder="Chat Johnson Master Studio")
             b1, b2 = st.columns(2)
             if b1.button("HTTP check", key="webqa_http", use_container_width=True, disabled=not check_target.strip()):
                 st.session_state.webqa_result = (check_url(check_target.strip(), expect_text=expect_text.strip()), None)
@@ -1014,7 +1266,7 @@ def render_kit_push(spec: KitSpec, files: Sequence[Any]) -> None:
         render_initial_commit_push(pairs, f"Add deploy kit for {spec.app_name}", "kit_init_push")
     else:
         st.markdown(f"**Push to {state['repo']}** · one commit on a new branch, then a pull request. Nothing touches the default branch.")
-        branch = st.text_input("Branch name", value=branch_name_for(spec.app_name, pairs), key="kit_branch")
+        branch = text_input_with_clear("Branch name", "kit_branch", value=branch_name_for(spec.app_name, pairs))
         if st.button(f"Push {len(files)} file(s) and open a pull request", type="primary", key="kit_push", use_container_width=True):
             title = f"Deploy kit for {spec.app_name} ({TARGETS[spec.target].split(' (')[0]})"
             body = (
@@ -1204,10 +1456,29 @@ def run_generation(
     workspace: Optional[str] = None,
     attachment_notes: Optional[Sequence[str]] = None,
     extra_system: str = "",
+    fix_round: int = 0,
+) -> Optional[int]:
+    if not prompt.strip():
+        return None
+    st.session_state["generation_running"] = True  # read by the sandbox fix guard
+    try:
+        return _run_generation(project_scope, prompt, task_type, ledger, injected_context, workspace, attachment_notes, extra_system, fix_round)
+    finally:
+        st.session_state["generation_running"] = False
+
+
+def _run_generation(
+    project_scope: str,
+    prompt: str,
+    task_type: str,
+    ledger: QuotaLedger,
+    injected_context: str,
+    workspace: Optional[str],
+    attachment_notes: Optional[Sequence[str]],
+    extra_system: str,
+    fix_round: int,
 ) -> Optional[int]:
     clean_prompt = prompt.strip()
-    if not clean_prompt:
-        return None
     mode = active_mode()
     migration = health_sweep(project_scope, ledger, workspace=workspace)
     if migration:
@@ -1221,7 +1492,11 @@ def run_generation(
     messages = build_prompt_messages(project_scope, clean_prompt, injected_context, workspace=workspace, extra_system=extra_system)
     max_tokens = int(st.session_state.get("max_tokens", 2048))
     with st.chat_message("user"):
-        st.markdown(clean_prompt)
+        if fix_round > 0:
+            st.caption(f"Automatic fix · round {fix_round} of {FIX_ROUNDS} · from the sandbox report")
+            st.text(fix_report_part(clean_prompt))  # the report only; the page it carries is on the canvas
+        else:
+            st.markdown(clean_prompt)
         for note in attachment_notes or []:
             st.caption(f"Attached · {note}")
     scroll_to_bottom(user_message_id)
@@ -1310,7 +1585,7 @@ def run_generation(
         st.error(plain_error(exc))
         with st.expander("Technical detail", expanded=False):
             st.code(redact_secrets(str(exc))[:600])
-        return user_message_id
+        return None  # the user turn is stored, but no answer was produced
     finally:
         if lock_held:
             request_lock.release()
@@ -1329,7 +1604,11 @@ def run_generation(
     log_route(workspace, task_type, f"{decision.provider}/{decision.model}", mode, started, decision.reason, decision.finish, decision=decision, message_id=assistant_id, fragility=fragility)
     with st.chat_message("assistant"):
         applied = [skill.name for skill in select_skills(clean_prompt)]
-        st.caption(f"{decision.provider}/{decision.model} · {task_type} · {mode}" + (f" · skills: {', '.join(applied)}" if applied else ""))
+        st.caption(
+            f"{decision.provider}/{decision.model} · {task_type} · {mode}"
+            + (f" · skills: {', '.join(applied)}" if applied else "")
+            + (" · automatic fix" if fix_round > 0 else "")
+        )
         render_output_with_artifacts(answer, project_scope, assistant_id, f"message-{assistant_id}")
     if decision.finish == "length":
         st.warning(
@@ -1354,6 +1633,7 @@ def dispatch_chat(
     ledger: QuotaLedger,
     injected_context: str = "",
     injection_notes: Sequence[str] = (),
+    extra_system: str = "",
 ) -> None:
     """Send what the chat bar delivered to this workspace's current chat."""
     if submission is None or not submission.text.strip():
@@ -1361,6 +1641,7 @@ def dispatch_chat(
     if not configured_provider_names():
         st.warning("Add at least one BYOK provider key in the sidebar API keys panel before sending a request.")
         return
+    rules = PREVIEW_RULES if st.session_state.get("preview_mode") == PREVIEW_MODE_RUN else ""
     run_generation(
         project_scope,
         submission.text,
@@ -1369,7 +1650,19 @@ def dispatch_chat(
         injected_context,
         workspace=workspace,
         attachment_notes=list(injection_notes),
+        extra_system="\n\n".join(part for part in (rules, extra_system) if part),
     )
+
+
+def render_user_turn(content: str) -> None:
+    """A stored user turn. An automatic fix turn carries text the page chose (the sandbox report), so it is shown as
+    text, never as markdown that could render an image or a link the page planted."""
+    if content.startswith(FIX_PREFIX):
+        st.caption("Automatic fix · from the sandbox report")
+        with st.expander("Sandbox report", expanded=False):
+            st.text(fix_report_part(content))
+        return
+    st.markdown(content)
 
 
 def render_history(project_scope: str, heading: str, workspace: Optional[str] = None, limit: int = 24) -> None:
@@ -1411,7 +1704,7 @@ def render_history(project_scope: str, heading: str, workspace: Optional[str] = 
                     f"message-{row['id']}",
                 )
             else:
-                st.markdown(row["content"])
+                render_user_turn(row["content"])
 
 
 def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -> sqlite3.Row:
@@ -1455,7 +1748,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
         st.rerun()
     with more.popover("More", use_container_width=True):
         title_key = f"thread_title_{workspace}_{current['id']}"
-        new_title = st.text_input("Rename this chat", value=current["title"], key=title_key)
+        new_title = text_input_with_clear("Rename this chat", title_key, value=current["title"])
         if st.button("Save name", key=f"save_title_{workspace}") and new_title.strip() and new_title.strip() != current["title"]:
             rename_thread(int(current["id"]), new_title, project_scope)
             st.rerun()
@@ -1493,7 +1786,7 @@ def render_thread_bar(project_scope: str, workspace: str, ledger: QuotaLedger) -
 
     with st.expander("Navigator · search this chat and jump to a turn", expanded=False):
         st.markdown("**Navigator**")
-        nav_query = st.text_input("Search this chat", key=f"nav_query_{workspace}", placeholder="keywords, any order")
+        nav_query = text_input_with_clear("Search this chat", f"nav_query_{workspace}", placeholder="keywords, any order")
         if nav_query.strip():
             hits = search_messages(project_scope, int(current["id"]), nav_query, limit=8)
             if not hits:
@@ -1633,6 +1926,7 @@ def render_normal_chat(project_scope: str, ledger: QuotaLedger, submission: Opti
     render_thread_bar(project_scope, "normal_chat", ledger)
     render_history(project_scope, "Conversation", workspace="normal_chat")
     dispatch_chat(project_scope, "normal_chat", submission, ledger)
+    dispatch_sandbox_fix(project_scope, "normal_chat", ledger, submission)
 
 
 def render_chat_bot(project_scope: str, ledger: QuotaLedger, submission: Optional[ChatSubmission]) -> None:
@@ -1658,6 +1952,7 @@ def render_chat_bot(project_scope: str, ledger: QuotaLedger, submission: Optiona
         submission = ChatSubmission("Review the attached file(s): explain what they do and flag any problems.", files)
     injected, injection_notes = uploaded_file_context(files)
     dispatch_chat(project_scope, "chat_bot", submission, ledger, injected, injection_notes)
+    dispatch_sandbox_fix(project_scope, "chat_bot", ledger, submission)
 
 
 def launch_mission(project_scope: str, ledger: QuotaLedger, thread_id: int, goal: str, plan: Sequence[Dict[str, Any]]) -> Tuple[int, int]:
@@ -1721,7 +2016,7 @@ def render_jobs_strip(project_scope: str) -> None:
                 st.progress(min(1.0, step / total) if total else 0.0, text=str(progress.get("text") or job["status"]))
                 if job["status"] == "waiting_input":
                     st.info(job["question"])
-                    answer = st.text_input("Your answer", key=f"job_answer_{job['id']}")
+                    answer = text_input_with_clear("Your answer", f"job_answer_{job['id']}")
                     if st.button("Send answer", key=f"job_answer_btn_{job['id']}") and answer.strip():
                         answer_job(job["id"], answer.strip(), project_scope)
 
@@ -1808,7 +2103,7 @@ def render_node_config(step: Dict[str, Any], thread_id: int) -> None:
         chosen = st.selectbox("Connector", names, index=names.index(current) if current in names else 0, key=f"{key}_connector",
                               format_func=lambda name: f"{name} · {CONNECTORS[name]['description']}")
         args_default = json.dumps({k: v for k, v in config.items() if k != "connector"}, indent=2) if len(config) > 1 else "{}"
-        raw = st.text_area("Arguments (JSON)", value=args_default, key=f"{key}_args", height=110,
+        raw = text_area_with_clear("Arguments (JSON)", f"{key}_args", value=args_default, height=110,
                            help=CONNECTORS[chosen]["description"])
         try:
             arguments = json.loads(raw or "{}")
@@ -1819,7 +2114,7 @@ def render_node_config(step: Dict[str, Any], thread_id: int) -> None:
             arguments = {}
         step["config"] = {"connector": chosen, **arguments}
     elif executor == "sub_mission":
-        statement = st.text_input("Sub-mission statement", value=str(config.get("statement") or ""), key=f"{key}_statement")
+        statement = text_input_with_clear("Sub-mission statement", f"{key}_statement", value=str(config.get("statement") or ""))
         sections = int(st.number_input("Sub-mission steps", min_value=1, max_value=8, value=int(config.get("sections") or 3), key=f"{key}_sections"))
         step["config"] = {"statement": statement, "sections": sections}
     elif executor == "model":
@@ -1832,8 +2127,10 @@ def render_node_config(step: Dict[str, Any], thread_id: int) -> None:
                                     help="chat: a message in this chat · artifact: locked under missions/ · both")
     step["on_failure"] = middle.selectbox("On failure", list(FAILURE_POLICIES), index=list(FAILURE_POLICIES).index(step.get("on_failure", "stop")), key=f"{key}_failure",
                                           help="stop ends the mission · skip continues · retry_once retries this node once, then stops")
-    inputs_text = right.text_input("Inputs (step numbers)", value=", ".join(str(i) for i in step.get("inputs") or []), key=f"{key}_inputs",
-                                   help="Earlier steps whose outputs are pasted in verbatim; empty means the chat history alone.")
+    with right:
+        inputs_text = st.text_input("Inputs (step numbers)", value=", ".join(str(i) for i in step.get("inputs") or []), key=f"{key}_inputs",
+                                    help="Earlier steps whose outputs are pasted in verbatim; empty means the chat history alone.")
+        clear_button(f"{key}_inputs")  # below the field: this column is already at Streamlit's nesting limit
     parsed_inputs: List[int] = []
     for token in inputs_text.replace(";", ",").split(","):
         token = token.strip()
@@ -2050,7 +2347,7 @@ def render_release_wave(project_scope: str, company_id: int, company: Dict[str, 
                 st.caption("Left out today: " + ", ".join(verdict.unfunded[:8]) + ("…" if len(verdict.unfunded) > 8 else "") + ". Raise the company's treasury share or wait for tomorrow's tokens.")
     if release and release["status"] == "board_review":
         st.info(f"Wave {wave} is with the board. Read the manuscripts under Locked artifacts (company/…/works/), then decide.")
-        note = st.text_area("Board feedback on the wave", key=f"wave_note_{company_id}", height=80)
+        note = text_area_with_clear("Board feedback on the wave", f"wave_note_{company_id}", height=80)
         ok, back = st.columns(2)
         if ok.button(f"Approve and publish all {needed}", key=f"wave_approve_{company_id}", type="primary", use_container_width=True):
             published = society.approve_release(project_scope, int(release["id"]), note)
@@ -2171,7 +2468,7 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
         if seated:
             pick_seat = st.selectbox("Edit an agent's persona", seated, format_func=lambda s: f"{s['title']} · {agents[int(s['agent_id'])]['name']}", key=f"persona_pick_{company_id}")
             agent = agents[int(pick_seat["agent_id"])]
-            persona = st.text_area("Persona (who this agent is; the seat's roles and KPIs are added automatically)", value=str(agent.get("persona") or ""), key=f"persona_text_{agent['id']}", height=90)
+            persona = text_area_with_clear("Persona (who this agent is; the seat's roles and KPIs are added automatically)", f"persona_text_{agent['id']}", value=str(agent.get("persona") or ""), height=90)
             if st.button("Save persona", key=f"save_persona_{agent['id']}") and persona.strip():
                 society_store.update("agents", int(agent["id"]), project_scope, persona=persona.strip()[:2000])
                 st.success("Persona saved.")
@@ -2193,7 +2490,10 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
             pick = st.selectbox("Open a seat's working thread", threaded, format_func=lambda s: s["title"], key="seat_thread_pick")
             for row in recent_messages(project_scope, 6, thread_id=int(pick["thread_id"])):
                 with st.chat_message("user" if row["role"] == "user" else "assistant"):
-                    st.markdown(row["content"][:1500])
+                    if row["role"] == "user":
+                        render_user_turn(str(row["content"] or "")[:1500])
+                    else:
+                        st.markdown(row["content"][:1500])
     with backlog_tab:
         st.markdown("**Catalog**")
         catalog = society_store.catalog_for(project_scope, company_id)
@@ -2239,7 +2539,7 @@ def render_company(project_scope: str, ledger: QuotaLedger, submission: Optional
                         st.download_button("⬇ Download", data=body, file_name=filename, mime="text/markdown", key=f"dl_item_{item['id']}")
                     if item.get("feedback"):
                         st.caption(f"Editor notes: {item['feedback']}")
-                    note = st.text_input("Feedback for the company", key=f"fb_{item['id']}")
+                    note = text_input_with_clear("Feedback for the company", f"fb_{item['id']}")
                     ok, back = st.columns(2)
                     if ok.button("Approve", key=f"approve_{item['id']}", use_container_width=True):
                         society_store.set_work_status(int(item["id"]), "done", feedback=note or item["feedback"])
@@ -2476,8 +2776,8 @@ def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional
         tick_minutes = int(t1.number_input("Tick every (minutes)", min_value=5, max_value=240, value=30, step=5, key="tick_minutes"))
         academy_hours = int(t2.number_input("Academy every (hours)", min_value=1, max_value=48, value=3, key="tick_academy_hours"))
         leisure_cap = int(t3.number_input("Agents exploring per tick", min_value=0, max_value=10, value=3, key="tick_leisure_cap"))
-        sources_text = st.text_area(
-            "Custom leisure sources (one per line: name = https://host/search?q={query})", key="tick_custom_sources", height=68,
+        sources_text = text_area_with_clear(
+            "Custom leisure sources (one per line: name = https://host/search?q={query})", "tick_custom_sources", height=68,
             help="Public JSON or HTML endpoints agents may spend tokens on; {query} is replaced. Headers with secrets are not supported here.",
         )
         custom_sources = parse_custom_sources(sources_text)
@@ -2520,7 +2820,7 @@ def render_academy(project_scope: str, ledger: QuotaLedger, submission: Optional
             st.caption("Hires, fires, promotions, graduations, and seat changes are logged here.")
     with dreams:
         names = {int(a["id"]): a["name"] for a in agents}
-        query = st.text_input("Search the dream bank", key="dream_query", placeholder="keywords, any order")
+        query = text_input_with_clear("Search the dream bank", "dream_query", placeholder="keywords, any order")
         rows = society_store.rows("dream_bank", project_scope, order="id DESC", limit=200)
         if query.strip():
             rows = keyword_rank(query, rows, key=lambda r: f"{r['query']} {r['findings']} {r['tags']}", limit=30)
@@ -2778,7 +3078,7 @@ with st.sidebar:
         "Bookmark the URL to come back to them."
     )
     with st.expander("Open another scope", expanded=False):
-        other_scope = st.text_input("Scope id", key="scope_switch_input", placeholder="visitor-…")
+        other_scope = text_input_with_clear("Scope id", "scope_switch_input", ratio=[3, 1], placeholder="visitor-…")
         if st.button("Open scope", key="scope_switch_button", use_container_width=True):
             if SCOPE_RE.match(other_scope.strip()):
                 st.session_state.project_scope = other_scope.strip()
@@ -2870,7 +3170,8 @@ with st.sidebar:
     st.checkbox(
         "Heavy Mode",
         key="heavy_mode",
-        help="Uses a bounded draft → review → synthesis workflow. Private reasoning is not displayed; token usage and latency are higher.",
+        help="Uses a bounded draft → review → synthesis workflow. Private reasoning is not displayed; token usage and latency are higher. "
+        f"With the canvas in Run in sandbox mode, a page that throws is sent back for up to {FIX_ROUNDS} automatic fix rounds.",
     )
     st.session_state.max_tokens = st.slider("Output token budget", 256, 8192, 2048, 256, key="output_token_budget")
     st.caption(
@@ -2884,8 +3185,8 @@ with st.sidebar:
             "Heavy Mode review pass uses it."
         )
         st.checkbox("Enable paid slot for this session", key="paid_slot_enabled", value=False)
-        st.text_input("Paid slot API key (session memory only)", key="paid_slot_key", type="password", value="")
-        st.text_input("Paid slot model", key="paid_slot_model", value="o3-mini")
+        text_input_with_clear("Paid slot API key (session memory only)", "paid_slot_key", ratio=[3, 1], type="password")
+        text_input_with_clear("Paid slot model", "paid_slot_model", ratio=[3, 1], value="o3-mini")
         slot_status = session_paid_slot().status()
         if slot_status["armed"]:
             st.warning(f"ARMED: {slot_status['model']} will be billed for Heavy Mode review passes this session.")
@@ -2900,7 +3201,7 @@ with st.sidebar:
             "when you press the button in Repository Work. The default branch is never written to."
         )
         st.checkbox("Enable GitHub push for this session", key="github_push_enabled", value=False)
-        st.text_input("GitHub token (session memory only)", key="github_push_token", type="password", value="")
+        text_input_with_clear("GitHub token (session memory only)", "github_push_token", ratio=[3, 1], type="password")
         push_state = github_push_status()
         if push_state["armed"] and push_state["login"]:
             st.caption(f"Signed in as **{push_state['login']}**.")
@@ -2957,7 +3258,7 @@ with st.sidebar:
             st.caption("A self-hosted deployment (the VM kit) sets CHAT_JOHNSON_LOCAL_ENDPOINT so Ollama, LM Studio, or vLLM serve the academy's cheap labour; on a shared host this stays off.")
     st.divider()
     st.subheader("Locked artifacts")
-    artifact_query = st.text_input("Search artifacts", key="artifact_query", placeholder="keywords, any order: name, path, or summary")
+    artifact_query = text_input_with_clear("Search artifacts", "artifact_query", ratio=[3, 1], placeholder="keywords, any order: name, path, or summary")
     artifacts = (
         search_artifacts(st.session_state.project_scope, artifact_query, 12)
         if artifact_query.strip()
@@ -3025,8 +3326,11 @@ WORKSPACE_RENDERERS[workspace](scope, ledger, submission)
 st.divider()
 # One column: a side panel squeezed the chat to a sliver at iPad width. The canvas opens itself when markup arrives.
 canvas_fallback = "" if (st.session_state.get("preview_source") or st.session_state.get("preview_cleared")) else last_markup_in_chat(scope, workspace)
-with st.expander("Live preview canvas", expanded=bool(st.session_state.get("preview_source") or canvas_fallback or st.session_state.get("scene_preview"))):
-    render_preview_panel(canvas_fallback)
+with st.expander(
+    "Live preview canvas",
+    expanded=bool(st.session_state.get("preview_source") or canvas_fallback or st.session_state.get("scene_preview") or st.session_state.get("sandbox_fix_pending")),
+):
+    render_preview_panel(canvas_fallback, workspace)
     if st.session_state.get("scene_preview"):
         st.caption("Last resolved scene (from a spatial mission).")
         components.html(scene_preview_document(st.session_state["scene_preview"]), height=440, scrolling=False)

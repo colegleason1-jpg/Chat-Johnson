@@ -563,9 +563,9 @@ a parenthetical. Keep this table current in the same commit that changes the cod
 | Four operational driving modes | narrowed | Normal and Heavy exist as modes; the workspaces (Task Finder, Repository Work, Chat Bot, Normal Chat, Company, Society, Academy) carry the rest of the intent. Cut: the other two named modes as switches. |
 | Background Git-Streamer (autosave commits) | not built | Nothing commits automatically; the session-only push slot is the only write path. |
 | Live SDK document scraper | not built | No code. |
-| Self-correcting execution sandbox | narrowed | Exists inside the Repository Work pipeline (pytest repair loop, self-hosted only). Cut: chat output is never executed. |
+| Self-correcting execution sandbox | built for chat pages | Run in sandbox preview: the generated page runs in a sealed frame (opaque origin, no network) and, in Heavy Mode, its script errors come back for up to 2 automatic fix rounds; the Repository Work pipeline keeps its pytest repair loop (self-hosted only). |
 | Repository sandbox with AST guardrail and reviewable diff | built | Worktree or copy mode, AST checks, unified diffs, GitHub fetch and push, revert PR. |
 | Deploy Kit (CI, Docker, Helm, Terraform, serverless, observability) | narrowed | Generation and offline validation only. Cut: nothing is applied or pushed. |
-| Live preview canvas | built | Sanitized HTML/CSS with a nonce CSP. |
+| Live preview canvas | built | Sanitized HTML/CSS with a nonce CSP, or Run in sandbox; Render, Download preview (.html) and Clear preview buttons; data:text/html links open as markup; every text field has its own Clear button. |
 | Two companies on Traction/EOS with an agent society, academy, leisure, dream bank | built | Seats, scorecards, L10 minutes, release waves per company, manuscripts, per-project briefs, editable roles; academy tiers, exams, allowances; leisure with custom sources. Scale is bounded by the free-tier treasury and stated as such. |
 | Manga-style illustration sub-agents for the books | not built | Noted in `docs/MONTE_CARLO_PROCTOR.md`; the shape is an image node through a BYOK endpoint storing PNG artifacts. |

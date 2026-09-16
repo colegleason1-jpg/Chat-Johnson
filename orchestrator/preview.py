@@ -8,10 +8,13 @@ allowed only as inline data: URIs; links only as in-page anchors.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import html
 import secrets
 import re
 from typing import Optional, Set
+from urllib.parse import unquote
 
 try:
     import nh3
@@ -100,6 +103,33 @@ def looks_like_link(source: str) -> bool:
     return bool(value) and not looks_like_markup(value) and bool(_BARE_LINK.match(value))
 
 
+_DATA_HTML = re.compile(r"data:text/html(?P<params>(?:;[a-z0-9-]+=[^;,\s]*|;base64)*),(?P<body>[^\s)\]>'\"]+)", re.I)
+
+
+def decode_data_link(text: str) -> str:
+    """The markup carried by the first data:text/html link in the text (base64 or percent-encoded); '' when none.
+
+    A model that "sends a preview link" sends one of these; the canvas cannot open links, so it opens the payload.
+    """
+    match = _DATA_HTML.search(text or "")
+    if not match:
+        return ""
+    body = match.group("body")
+    try:
+        if "base64" in match.group("params").lower():
+            decoded = base64.b64decode(body + "=" * (-len(body) % 4)).decode("utf-8", "replace")
+        else:
+            decoded = unquote(body)
+    except (ValueError, binascii.Error):
+        return ""
+    return decoded.strip() if looks_like_markup(decoded) else ""
+
+
+def resolve_preview_source(source: str) -> str:
+    """A pasted or generated data:text/html link becomes the markup it carries; anything else is returned as is."""
+    return decode_data_link(source) or source
+
+
 _FENCE = re.compile(r"```(?P<language>[^\n`]*)\n(?P<body>.*?)```", re.DOTALL)
 _OPEN_FENCE = re.compile(r"```(?P<language>[^\n`]*)\n(?P<body>.*)\Z", re.DOTALL)
 
@@ -118,6 +148,7 @@ def extract_preview_source(text: str) -> str:
 
     An answer cut off at the output budget leaves its fence open; that markup is taken up to the end of
     the text, so a long mockup still reaches the canvas (partial, but rendered) instead of vanishing.
+    An answer that offers a data:text/html link instead of markup is opened the same way.
     """
     for language, body in _FENCE.findall(text):
         found = _fence_source(language, body)
@@ -129,6 +160,9 @@ def extract_preview_source(text: str) -> str:
         found = _fence_source(unclosed.group("language"), unclosed.group("body"))
         if found:
             return found
+    linked = decode_data_link(text)
+    if linked:
+        return linked
     if looks_like_markup(text):
         return text.strip()
     return ""

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' data: blob:; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; worker-src blob:; connect-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'">
+<title>Chat Johnson sandbox preview</title>
+<style>
+html, body { margin: 0; padding: 0; background: #ffffff; }
+#status { box-sizing: border-box; padding: 4px 8px; font: 12px/16px system-ui, -apple-system, "Segoe UI", sans-serif; color: #444; background: #f3f3f3; border-bottom: 1px solid #ddd; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#host { display: block; width: 100%; }
+#host iframe { display: block; width: 100%; border: 0; background: #ffffff; }
+</style>
+</head>
+<body>
+<div id="status" role="status">Sandbox: waiting for a page…</div>
+<div id="host"></div>
+<script src="./main.js"></script>
+</body>
+</html>

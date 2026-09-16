@@ -32,7 +32,7 @@ approved reconstruction plan.
 
 | Path | Responsibility |
 |---|---|
-| `app.py` | Streamlit studio: sidebar control deck, six workspaces, preview canvas, SQLite vault, Artifact Lock |
+| `app.py` | Streamlit studio: sidebar control deck, six workspaces, preview canvas (sanitized, or Run in sandbox with automatic fixes), a Clear button per text field, SQLite vault, Artifact Lock |
 | `cli.py` | `status`, `chat`, `run` commands |
 | `orchestrator/router.py` | BYOK vault, Cortex 1/2/3, Heavy Mode, legacy provider routing |
 | `orchestrator/config.py` | Legacy provider registry and conservative free-tier limits |
@@ -57,6 +57,8 @@ approved reconstruction plan.
 | `orchestrator/vaultsync.py` | Vault snapshots to Supabase Storage: restore on an empty start, upload on change; the VM's offsite backup |
 | `orchestrator/dynamics.py` | Pairwise statistics between endpoint latency series (built-in or pyspi) and the bounded constraint-law modulation |
 | `orchestrator/treasury_plan.py` | Plan of the day: the daily token treasury allocated by the supply-chain resilience engine (`scrcae`, optional): most value within today's tokens, goal checked in target mode with the shortfall named, saturation budget, correlated tail risk, vendor stress fitted from the route log; fixed shares without it |
+| `orchestrator/sandbox_preview.py` | Run-mode preview contract: the sealed-frame CSP, the one-line talk-back shim that makes silent sandbox failures loud, document assembly that keeps every page line number, report normalization, the bounded fix decision and the fix prompt |
+| `frontend/sandbox_preview/` | Declared Streamlit component hosting the sealed frame (opaque origin, no network, vendored Three.js as a data: URL); it forwards the page's report and never relays its messages |
 | `orchestrator/society/` | Two companies on Traction/EOS (cycles, EOS scorecard, release waves, manuscripts) and the agent society (academy, tick, leisure) |
 | `research/project_seth_phase3.py` | Project Seth Phase 3 distribution and bias-sweep engine (research only) |
 | `docs/` | Bible, recovery audit, implementation plan, strategic outline |
@@ -150,6 +152,25 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
   `webcheck` missions and Repository Work → Deploy Kit → "Check a deployed URL" run an HTTP check
   (status, latency, expected text, health JSON) and a browser check where Chromium exists (the VM
   worker), reported as unavailable elsewhere.
+- **Run-mode preview and automatic fixes (batch T)**: the Live preview canvas has two modes. Sanitized
+  (default) strips every script. Run in sandbox executes the generated page inside a sealed frame: an
+  opaque-origin iframe with scripts on and nothing else (no network requests, no storage, no dialogs,
+  no navigation, nothing reaches the app; WebRTC, which browsers offer no policy for, is shadowed by
+  the shim as a best effort), with Three.js available as `import 'three'` from a vendored copy. The
+  shim is the first thing the page parses and reports script errors with their real line numbers,
+  blocked resources and the sandbox's otherwise silent failures (a form submit, an alert, a download)
+  back to the app, one report per run. In Heavy Mode a page that errors, renders blank, never loads,
+  tries to navigate away, or depends on an external script or stylesheet is sent back to the model
+  with that report for up to two automatic fix rounds per page (a round counts only once the fix
+  lands; the same error twice stops the loop; a real send always goes first), which is the
+  "Self-Correcting Execution Sandbox" for chat output. Blocked images or fonts alone are noted, not
+  fixed. Run mode adds PREVIEW
+  RULES to every send so the model writes pages that run there (inline everything, simulate data,
+  buttons instead of forms, pointer-event drag, no dialogs). The canvas gains Render, Download
+  preview (.html) and Clear preview buttons, and a `data:text/html` link in an answer opens as its
+  markup. Every text field outside a form has its own Clear button bound to that one field. The
+  persona now answers the newest message first and then continues an unfinished earlier request, and
+  the Heavy critique checks for both.
 - **Mission nodes, connectors, MCP, Heavy streaming (batch E)**: every Task Finder step is a node
   with an `executor` (`model`, `solver`, `webqa`, `connector`, `sub_mission`), a `config`, `inputs`
   (earlier steps pasted in verbatim), an `output` target (`chat`, `artifact` locked under
@@ -188,7 +209,7 @@ menu with Rename, context load, and Migrate now); keys are never touched by any 
 | 10-cloud connector fabric | Roadmap · local SQLite is the only store; stubs listed in the sidebar |
 | Background Git-Streamer | Roadmap · not implemented |
 | Live SDK Document Scraper | Roadmap · not implemented |
-| Self-Correcting Execution Sandbox for chat output | Roadmap · exists only inside the repository pipeline |
+| Self-Correcting Execution Sandbox for chat output | Implemented for chat pages · Run in sandbox preview with up to 2 automatic Heavy Mode fix rounds; the capability card still says partial because the repository pipeline keeps its own pytest repair loop |
 | Cross-thread semantic search | Implemented as long-distance memory: FTS5/BM25 over the project's other chats (summaries, digests, missions, artifact summaries) with recency decay and superseding, in every prompt and every vision digest; no embedding index |
 | Controlled chaos: the validated 1/f signal applied across routing, Heavy Mode, memory recall, and migration | Implemented · bounded nudges only, per-project gain and frequency profiles, gain 0 is deterministic |
 | Cortex 2 as an empirical learner: measured speed, Bayesian quality from verdicts, pink-wave exploration, constraint-law dynamics | Implemented · bounded terms, hard limits untouched, exploration rate verified in the outcome log |

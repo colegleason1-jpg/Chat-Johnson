@@ -12,23 +12,23 @@ from typing import Tuple
 from .connectors import ROADMAP_CONNECTORS, ROADMAP_FEATURES
 
 IMPLEMENTED: Tuple[Tuple[str, str], ...] = (
-    ("Normal Chat", "single-pass answers routed by a MILP solver across the operator's free-tier keys "
+    ("Normal Chat", "single-pass answers routed by a MILP solver across free-tier keys "
                     "(Gemini, Groq, Hugging Face; NVIDIA, OpenRouter, Cerebras, Mistral as fallback)"),
-    ("Chat Bot", "developer chat with explicit file attachments; fenced file blocks can be locked as versioned artifacts"),
+    ("Chat Bot", "developer chat with explicit file attachments; fenced file blocks lock as versioned artifacts"),
     ("Task Finder", "deterministic decomposition of a mission into typed workstreams run in order as a background job; "
-                    "results land in the chat as each finishes"),
+                    "results stream into the chat"),
     ("Background jobs", "missions run on worker threads with progress, cancel, and questions to the operator"),
-    ("Repository Work", "sandboxed pipeline on a GitHub repository (fetched through the API) or a local path: ingest, plan, patch, "
+    ("Repository Work", "sandboxed pipeline on a GitHub repository or a local path: ingest, plan, patch, "
                         "optional pytest repair loop, reviewable diff; pushable as a branch plus pull request through the session-only slot"),
-    ("Spatial layout", "a spatial mission turns a scene spec into a solver-resolved layout with a 3D preview"),
+    ("Spatial layout", "a scene spec becomes a solver-resolved layout with a 3D preview"),
     ("Web QA", "HTTP checks of a deployed URL (status, latency, text, health JSON); browser checks where Chromium exists"),
-    ("Mission nodes", "steps are nodes: executor model/solver/webqa/connector/sub_mission, config, inputs, output "
-                      "(chat/artifact/both), on_failure; connectors deploy_kit.generate, github.fetch/push/revert, "
-                      "repository.run, vault.export_thread/save_artifact, webqa.check, mcp.call"),
+    ("Mission nodes", "steps are nodes: executor model/solver/webqa/connector/sub_mission, output chat/artifact/both, "
+                      "on_failure; connectors deploy_kit, github (fetch/push/revert), repository, vault, webqa, mcp"),
     ("Memory", "SQLite vault, private per visitor: per-workspace chats, 200-message windows, summaries, digests, "
                "locked artifacts, exports, keyword recall from the project's other chats"),
     ("Heavy Mode", "draft, review, synthesis passes; an optional paid slot serves only the review pass, per session"),
-    ("Preview canvas", "sanitized HTML/CSS mockups"),
+    ("Preview canvas", "sanitized HTML/CSS mockups, or Run in sandbox: the page executes offline in a sealed frame and, "
+                       "in Heavy Mode, script errors come back for up to 2 automatic fix rounds"),
 )
 
 BOUNDARIES: Tuple[str, ...] = (
