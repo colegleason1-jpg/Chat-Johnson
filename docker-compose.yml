@@ -15,6 +15,12 @@ services:
       CHAT_JOHNSON_SELF_HOSTED: "1"
       CHAT_JOHNSON_LOCAL_ENDPOINT: http://ollama:11434/v1
       CHAT_JOHNSON_LOCAL_MODEL: llama3.1:8b
+      # Snapshot settings only, never provider keys: without these the app creates a fresh vault before the worker
+      # can restore the bucket, and the restore is then skipped because the vault is no longer empty.
+      CHAT_JOHNSON_SUPABASE_URL: ${CHAT_JOHNSON_SUPABASE_URL:-}
+      CHAT_JOHNSON_SUPABASE_KEY: ${CHAT_JOHNSON_SUPABASE_KEY:-}
+      CHAT_JOHNSON_VAULT_BUCKET: ${CHAT_JOHNSON_VAULT_BUCKET:-chat-johnson-vault}
+      CHAT_JOHNSON_VAULT_SNAPSHOT_MINUTES: ${CHAT_JOHNSON_VAULT_SNAPSHOT_MINUTES:-10}
     volumes:
       - data:/data
     expose:

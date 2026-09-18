@@ -1,6 +1,7 @@
 """Batch G1: shared-host lockdown, VM stack, encrypted job secrets, quota caps, job hygiene, scope, sandbox, GitHub, MCP."""
 import io
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -141,6 +142,89 @@ def test_root_vm_stack_keeps_keys_in_the_worker_and_never_serves_plain_http_to_t
     assert dk.KitSpec(target="oracle-vm", language="node", port="abc").normalized().language == "python"
     assert dk.KitSpec(port="abc").normalized().port == 8501
 
+
+
+def _env_value(path, name: str) -> str:
+    """The same read `value_of` does in the shell scripts: first assignment, comment stripped."""
+    for line in path.read_text().splitlines():
+        if line.startswith(f"{name}="):
+            return line.split("=", 1)[1].split("#")[0].strip()
+    return ""
+
+
+def _fake_bin(directory) -> None:
+    """A PATH where sudo is transparent, the firewall tools are inert, and Docker is switched by FAKE_DOCKER."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "sudo").write_text('#!/usr/bin/env bash\nexec "$@"\n')
+    for name in ("iptables", "firewall-cmd", "netfilter-persistent"):
+        (directory / name).write_text("#!/usr/bin/env bash\nexit 0\n")
+    (directory / "docker").write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "${FAKE_DOCKER:-broken}" = broken ]; then echo "permission denied" >&2; exit 1; fi\n'
+        "case \"$1\" in\n"
+        "  info) exit 0 ;;\n"
+        "  run) echo '$2a$14$AbcDefGhiJklMnOpQrStUvWxYz0123456789abcdefghijklmnop' ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    for entry in directory.iterdir():
+        entry.chmod(0o755)
+
+
+@pytest.mark.skipif(not (shutil.which("bash") and shutil.which("git")), reason="bash and git required")
+def test_vm_bootstrap_repairs_a_half_written_env_and_the_app_gets_snapshots_but_never_a_provider_key(tmp_path):
+    """A fresh VM cannot reach Docker until the next login, so the password step dies half way.
+
+    The script used to gate every write on `.env` being absent, so that failure left the file world
+    readable with no `CADDY_HASH`, and a second run skipped the block instead of repairing it; Caddy
+    then refused to start and said nothing an operator could act on.
+    """
+    compose = yaml.safe_load(open(os.path.join(ROOT, "docker-compose.yml")))
+    app_env = compose["services"]["app"]["environment"]
+    # The app restores the snapshot before it opens a vault of its own, so it needs these three and only these three.
+    assert {"CHAT_JOHNSON_SUPABASE_URL", "CHAT_JOHNSON_SUPABASE_KEY", "CHAT_JOHNSON_VAULT_BUCKET"} <= set(app_env)
+    assert not set(KEY_ENVS) & set(app_env)
+
+    source = tmp_path / "src"
+    (source / "scripts").mkdir(parents=True)
+    shutil.copy(os.path.join(ROOT, ".env.example"), source / ".env.example")
+    for script in ("vm-bootstrap.sh", "vm-update.sh"):
+        shutil.copy(os.path.join(ROOT, "scripts", script), source / "scripts" / script)
+    for command in (["init", "-q"], ["checkout", "-q", "-B", "main"], ["add", "-A"],
+                    ["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "init"]):
+        subprocess.run(["git", *command], cwd=source, check=True, capture_output=True)
+
+    _fake_bin(tmp_path / "bin")
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "FAKE_DOCKER": "broken"}
+    run = lambda: subprocess.run(  # noqa: E731
+        ["bash", str(source / "scripts" / "vm-bootstrap.sh"), str(source), "main"], cwd=home,
+        input="\noperator\nhunter2\n", text=True, capture_output=True, env=environment, timeout=180,
+    )
+
+    first = run()
+    written = home / "chat-johnson" / ".env"
+    assert written.stat().st_mode & 0o777 == 0o600  # the key is already in the file, so the mode cannot wait for the end
+    assert first.returncode == 1 and "run this script again" in first.stderr  # and the operator is told what to do
+    job_key = _env_value(written, "CHAT_JOHNSON_JOB_KEY")
+    assert job_key and not _env_value(written, "CADDY_HASH")
+
+    environment["FAKE_DOCKER"] = "ok"
+    second = run()
+    assert second.returncode == 0, second.stderr
+    assert _env_value(written, "CHAT_JOHNSON_JOB_KEY") == job_key  # a repair never rotates what already works
+    assert _env_value(written, "CADDY_HASH").replace("$$", "$").startswith("$2a$")  # compose turns $$ back into $
+    assert written.stat().st_mode & 0o777 == 0o600
+
+    # And a deploy from a .env that never got a hash stops with the remedy instead of leaving the proxy down.
+    deploy = tmp_path / "deploy"
+    (deploy / "scripts").mkdir(parents=True)
+    shutil.copy(os.path.join(ROOT, "scripts", "vm-update.sh"), deploy / "scripts" / "vm-update.sh")
+    (deploy / ".env").write_text("CADDY_USER=operator\nCADDY_HASH=\n")
+    blocked = subprocess.run(["bash", str(deploy / "scripts" / "vm-update.sh")], capture_output=True, text=True,
+                             env=environment, timeout=180)
+    assert blocked.returncode == 1 and "CADDY_HASH is empty" in blocked.stderr
 
 # ----------------------------------------------------------------------------- encrypted job secrets
 

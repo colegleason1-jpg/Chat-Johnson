@@ -35,6 +35,21 @@
   security list only if you will set a domain, then `bash scripts/vm-bootstrap.sh <repo url> <branch>`:
   it writes `.env` with a generated `CHAT_JOHNSON_JOB_KEY`, asks for the domain and the basic-auth
   password, and sets `.env` to mode 600. Add the provider keys to `.env`; they reach the worker only.
+  The script fills only the values that are still empty, so re-running it repairs a half-written `.env`
+  instead of skipping it, and it falls back to `sudo docker` because the `docker` group does not reach
+  the shell that installed Docker until the next login.
+- Snapshots on the VM: put `CHAT_JOHNSON_SUPABASE_URL`, `CHAT_JOHNSON_SUPABASE_KEY` and
+  `CHAT_JOHNSON_VAULT_BUCKET` in `.env` as well. Compose passes those three (never a provider key) into
+  the app, which restores from the bucket at start-up before the first connection; the worker keeps
+  uploading. Without them the app opens an empty vault first and the worker then declines to restore
+  over it.
+- What the app container can reach: it has no `env_file`, so its only keyed endpoint is the local
+  Ollama model (`CHAT_JOHNSON_LOCAL_ENDPOINT`, which registers `local` as a full routing endpoint).
+  Chat in the browser therefore runs on the local model; cloud free tiers answer it only when a key is
+  pasted into that session. Background and society work runs in the worker, which has every `.env` key.
+- Reading `?health=1` on the VM: `process.workers` is `0` and `keyed_vendors` lists `local` only —
+  both are the design, not a fault. The worker's two threads show up in `docker compose ps` (the
+  `worker` service `Up`) and in `jobs` moving through the health JSON.
 - Session secrets: a GitHub token or paid key pasted in the browser reaches the worker as a Fernet blob
   in `job_secrets` (encrypted with `CHAT_JOHNSON_JOB_KEY`, deleted on claim); without the key the UI
   refuses nodes that need a token. Local paths in Repository Work must sit under `CHAT_JOHNSON_REPO_ROOTS`.
