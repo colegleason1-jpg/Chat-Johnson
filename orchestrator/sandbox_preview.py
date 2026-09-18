@@ -24,6 +24,7 @@ import re
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 FIX_ROUNDS = 2
+NORMAL_FIX_ROUNDS = 1  # without Heavy Mode a page still gets one automatic repair; Heavy Mode buys the second
 FIX_PREFIX = "AUTOMATIC FIX "
 FIX_MARKER = "INSTRUCTIONS FOR THE FIX:"  # everything before it is the report the operator sees; after it, the model's brief
 FIX_STATUSES = ("error", "blocked", "blank", "timeout", "navigated")
@@ -363,17 +364,19 @@ def fix_decision(
     if not complete:
         return False, INCOMPLETE_REASON, True
     rounds = int(state.get("rounds", 0))
-    if rounds >= FIX_ROUNDS:
-        return False, f"repair stopped: {FIX_ROUNDS} automatic rounds used; {NEXT_STEP}", True
+    # Repair is no longer gated on Heavy Mode. A page that throws gets one automatic round in either mode, because a
+    # broken page is the common case and Heavy Mode is off by default; Heavy Mode buys the second round.
+    limit = FIX_ROUNDS if heavy else NORMAL_FIX_ROUNDS
+    if rounds >= limit:
+        extra = "; turn on Heavy Mode for another round" if limit < FIX_ROUNDS else ""
+        return False, f"repair stopped: {limit} automatic round(s) used{extra}; {NEXT_STEP}", True
     if error_signature(report) == state.get("last_signature"):
         return False, f"{SAME_ERROR_REASON}; {NEXT_STEP}", True
-    if not heavy:
-        return False, "Heavy Mode is off, so nothing is fixed automatically", False
     if not keyed:
         return False, "no provider key is configured, so nothing is fixed automatically", False
     if generating:
         return False, "a generation is already running; the fix waits for it", False
-    return True, f"automatic fix round {rounds + 1} of {FIX_ROUNDS}", True
+    return True, f"automatic fix round {rounds + 1} of {limit}", True
 
 
 def _status_line(report: Mapping[str, Any]) -> str:

@@ -55,15 +55,29 @@ def test_an_endpoint_that_cannot_write_the_answer_stops_hiding_the_real_wait(all
 # 3. The page critique costs nothing
 # ----------------------------------------------------------------------------
 
+CLEAN_PAGE = (
+    '<!doctype html><html><head><title>Clean</title><style>button{padding:8px}</style></head><body>'
+    '<h1>Study</h1><p>Press the button to see the next card in the deck.</p>'
+    '<button id="next" onclick="nextCard()">Next</button><div id="card">First card</div>'
+    '<script>function nextCard(){document.getElementById("card").textContent = "Another card";}</script>'
+    "</body></html>"
+)
+
+
 def test_page_review_names_what_is_wrong_and_costs_no_call():
-    complete = preview.page_review(PAGE1)
+    complete = preview.page_review(CLEAN_PAGE)
     assert "structurally complete" in complete and "do not shorten" in complete
     cut = preview.page_review(CUT_PAGE, closed=False, finish="length")
     assert "Problems that must be fixed" in cut and "```html" in cut
     cdn = preview.page_review(CDN_PAGE)
     assert "from the internet" in cdn and "cdn.tailwindcss.com" in cdn
     assert "no complete ```html page" in preview.page_review("")
-    assert preview.external_resources(CDN_PAGE) and preview.external_resources(PAGE1) == []
+    assert preview.external_resources(CDN_PAGE) and preview.external_resources(CLEAN_PAGE) == []
+    # The linter catches what the completeness check never could: a button wired to a function nobody wrote.
+    dead = CLEAN_PAGE.replace("nextCard()\">Next", "startQuiz()\">Next")
+    assert any("never defines" in problem and "startQuiz" in problem for problem in preview.page_problems(dead))
+    assert any("not in the markup" in problem for problem in preview.page_problems(CLEAN_PAGE.replace('id="card"', 'id="other"')))
+    assert preview.page_problems(CLEAN_PAGE) == []
 
 
 def test_a_heavy_page_request_spends_no_call_on_the_critique():

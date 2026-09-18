@@ -192,7 +192,7 @@ def test_download_button_and_data_link_decoding(app):
 def test_run_mode_executes_only_what_render_committed(app):
     seed_page(app, "visitor-draft", PAGE1)
     run_mode(app, heavy=False)
-    assert any(c.endswith("automatic fixes run in Normal Chat or Chat Bot with Heavy Mode on.") for c in captions(app))
+    assert any("are fixed automatically, up to 1 round(s)" in c for c in captions(app)), captions(app)
     assert not any(c == "Press Render to run what is in the box." for c in captions(app))
     app.text_area(key="preview_editor").set_value(PAGE2).run()
     assert not app.exception
@@ -212,31 +212,34 @@ def test_hazards_are_named_before_the_page_runs(app):
     assert any(c.startswith("Before running, the sandbox removed ") and "a base tag" in c and "a meta refresh" in c and c.endswith(".") for c in captions(app)), captions(app)
 
 
-def test_run_mode_without_heavy_reports_but_never_fixes(app, monkeypatch):
-    calls = fake_provider(monkeypatch, [fenced(PAGE2)])
+def test_run_mode_without_heavy_fixes_once_then_stops(app, monkeypatch):
+    """A broken page is the common case and Heavy Mode is off by default, so one round runs either way."""
+    calls = fake_provider(monkeypatch, [fenced(PAGE2), fenced(PAGE3)])
     seed_page(app, "visitor-run-normal", PAGE1)
     run_mode(app, heavy=False)
     inject(app, PAGE1, ERROR_FOO)
-    assert any("Heavy Mode is off" in c for c in captions(app)), captions(app)
     assert any("1 error(s)" in c for c in captions(app))
     assert any("foo is not defined" in t.value for t in app.text)
-    assert len(rows("visitor-run-normal")) == 2 and calls == []
-    assert "sandbox_fix_pending" not in app.session_state
-    assert vault.setting_get("visitor-run-normal", SETTING) == ""
+    assert len(calls) == 1 and app.session_state["preview_source"] == PAGE2
+    assert stored("visitor-run-normal", PAGE1)["rounds"] == 1
+    inject(app, PAGE2, ERROR_BAR)  # the second round needs Heavy Mode
+    assert len(calls) == 1
+    assert any("1 automatic round(s) used" in c and "Heavy Mode" in c for c in captions(app)), captions(app)
 
 
-def test_a_heavy_off_report_stays_open_until_heavy_is_ticked(app, monkeypatch):
-    calls = fake_provider(monkeypatch, [fenced(PAGE2)])
+def test_ticking_heavy_mode_buys_the_second_round(app, monkeypatch):
+    calls = fake_provider(monkeypatch, [fenced(PAGE2), fenced(PAGE3)])
     seed_page(app, "visitor-open", PAGE1)
     run_mode(app, heavy=False)
     inject(app, PAGE1, ERROR_FOO)
-    assert calls == [] and vault.setting_get("visitor-open", SETTING) == ""
-    assert app.session_state["sandbox_fix"][page_hash(PAGE1)]["handled_seq"] == 0
+    assert len(calls) == 1 and stored("visitor-open", PAGE1)["rounds"] == 1
+    inject(app, PAGE2, ERROR_BAR)  # capped without Heavy Mode
+    assert len(calls) == 1
     app.checkbox(key="heavy_mode").check().run()
-    assert not app.exception and calls == []
-    inject(app, PAGE1, ERROR_FOO)  # the same report, re-delivered with the same seq
-    assert len(calls) == 1 and app.session_state["preview_source"] == PAGE2
-    assert stored("visitor-open", PAGE1)["rounds"] == 1
+    assert not app.exception
+    assert vault.setting_get("visitor-open", "heavy_mode") == "1"  # and it survives a reload
+    inject(app, PAGE2, ERROR_BAR, seq=2)
+    assert len(calls) == 2 and app.session_state["preview_source"] == PAGE3
 
 
 def test_heavy_run_mode_sends_one_fix_turn(app, monkeypatch):
@@ -245,7 +248,7 @@ def test_heavy_run_mode_sends_one_fix_turn(app, monkeypatch):
     old = {f"old{i:02d}": {"rounds": 1, "last_signature": "s"} for i in range(8)}
     vault.setting_set("visitor-fix", SETTING, json.dumps(old))
     run_mode(app, heavy=True)
-    assert any(c.endswith("and are fixed automatically, up to 2 rounds.") for c in captions(app))
+    assert any("are fixed automatically, up to 2 round(s)." in c for c in captions(app)), captions(app)
     inject(app, PAGE1, ERROR_FOO)
     history = rows("visitor-fix")
     assert len(history) == 4 and len(calls) == 1
@@ -279,7 +282,7 @@ def test_two_rounds_are_the_cap(app, monkeypatch):
     calls = two_rounds(app, monkeypatch, "visitor-cap")
     inject(app, PAGE3, ERROR_BAZ)
     assert len(calls) == 2 and len(rows("visitor-cap")) == 6
-    assert any("2 automatic rounds used" in c for c in captions(app)), captions(app)
+    assert any("2 automatic round(s) used" in c for c in captions(app)), captions(app)
     assert stored("visitor-cap", PAGE3)["rounds"] == 2
 
 
@@ -333,7 +336,7 @@ def test_a_report_in_another_workspace_waits_for_a_fixing_one(app, monkeypatch):
     app.text_area(key="preview_editor").set_value(PAGE1).run()
     app.button(key="render_preview").click().run()
     run_mode(app, heavy=True)
-    assert any(c.endswith("automatic fixes run in Normal Chat or Chat Bot with Heavy Mode on.") for c in captions(app))
+    assert any(c.endswith("automatic fixes run in Normal Chat or Chat Bot.") for c in captions(app))
     inject(app, PAGE1, ERROR_FOO)
     assert calls == [] and "sandbox_fix_pending" not in app.session_state
     assert any(c == SWITCH_CAPTION for c in captions(app)), captions(app)
@@ -432,7 +435,7 @@ def test_the_vault_mirror_survives_a_fresh_session(app, monkeypatch):
     run_mode(fresh, heavy=True)
     inject(fresh, PAGE3, ERROR_BAZ)
     assert calls == [] and len(rows("visitor-mirror")) == 6
-    assert any("2 automatic rounds used" in c for c in captions(fresh)), captions(fresh)
+    assert any("2 automatic round(s) used" in c for c in captions(fresh)), captions(fresh)
 
 
 def test_a_stored_fix_turn_is_shown_as_text_never_markdown(app):

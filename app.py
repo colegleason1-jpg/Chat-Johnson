@@ -124,11 +124,12 @@ from orchestrator.missions import (
 )
 from orchestrator.connectors_nodes import CONNECTORS, validate_nodes
 from orchestrator import mcp_client
-from orchestrator.preview import extract_preview_fence, extract_preview_source, looks_like_link, page_completeness, resolve_preview_source, safe_preview_document
+from orchestrator.preview import extract_preview_fence, extract_preview_source, looks_like_link, page_completeness, page_problems, resolve_preview_source, safe_preview_document
 from orchestrator.sandbox_preview import (
     FIX_PREFIX,
     FIX_ROUNDS,
     FIX_STATUSES,
+    NORMAL_FIX_ROUNDS,
     FIX_SYSTEM,
     FRAME_HEIGHT,
     PREVIEW_RULES,
@@ -201,6 +202,7 @@ FIX_WORKSPACES = ("normal_chat", "chat_bot")  # the workspaces whose renderers d
 CANVAS_WORKSPACES = ("normal_chat", "chat_bot")  # the chats whose pages own the canvas; other workspaces never overwrite it
 PREVIEW_STATE_SETTING = "preview_state"
 PAGE_MODE_SETTING = "page_mode"  # {workspace: thread id} — the chat that is building the page on the canvas
+HEAVY_MODE_SETTING = "heavy_mode"  # remembered per scope: a reload used to switch Heavy Mode off without saying so
 PREVIEW_STATE_MAX_CHARS = 200_000
 _PAGE_REFERENCE_RE = re.compile(
     r"\b(?:fix|broken|works?|working|still|change|update|add|remove|edit|make it|this page|the page|the preview|this preview|buttons?|canvas)\b",
@@ -333,6 +335,13 @@ def canvas_page_complete(source: str) -> bool:
     return not page_completeness(source)
 
 
+def _persist_heavy_mode() -> None:
+    try:
+        setting_set(str(st.session_state.project_scope), HEAVY_MODE_SETTING, "1" if st.session_state.get("heavy_mode") else "0")
+    except Exception:  # a preference must never break a rerun
+        pass
+
+
 def _persist_preview_mode() -> None:
     persist_preview_state(str(st.session_state.project_scope))
 
@@ -353,6 +362,10 @@ def canvas_status_line(source: str, run_mode: bool) -> str:
         parts.append("no page yet")
     last = st.session_state.get("sandbox_last_report")
     parts.append(f"last run: {last}" if last else "not run yet")
+    if source.strip():
+        # The static linter, shown before the page is ever run: the operator sees why it will not work.
+        found = page_problems(source)
+        parts.append(f"{len(found)} problem(s) found: {found[0]}" if found else "no problems found by the static check")
     if building_a_page(str(st.session_state.project_scope), str(st.session_state.get("workspace_last") or "")):
         parts.append("this chat is editing this page (Clear preview ends that)")
     return " · ".join(parts)
@@ -773,9 +786,10 @@ def render_preview_panel(fallback_source: str = "", workspace: str = "") -> None
             ("Run mode was switched on because this page has scripts. " if pending_mode else "")
             + "Runs the page in a sealed frame: scripts on, no network, no storage, nothing reaches the app. Errors come back here"
             + (
-                f" and are fixed automatically, up to {FIX_ROUNDS} rounds."
-                if active_mode() == "heavy" and workspace in FIX_WORKSPACES
-                else "; automatic fixes run in Normal Chat or Chat Bot with Heavy Mode on."
+                f" and are fixed automatically, up to {FIX_ROUNDS if active_mode() == 'heavy' else NORMAL_FIX_ROUNDS} round(s)"
+                + ("." if active_mode() == "heavy" else "; Heavy Mode buys a second round.")
+                if workspace in FIX_WORKSPACES
+                else "; automatic fixes run in Normal Chat or Chat Bot."
             )
         )
     else:
@@ -975,9 +989,6 @@ def dispatch_sandbox_fix(project_scope: str, workspace: str, ledger: QuotaLedger
         return
     if not configured_provider_names():
         st.caption("Automatic fix skipped: no provider key is configured.")
-        return
-    if active_mode() != "heavy":
-        st.caption("Automatic fix skipped: Heavy Mode is off.")
         return
     try:
         answer_id = run_generation(
@@ -3356,7 +3367,11 @@ if "byok_keys" not in st.session_state:
 # Keys pasted in this browser session are bound to this script run only.
 bind_session_keys(st.session_state.byok_keys)
 if "heavy_mode" not in st.session_state:
-    st.session_state.heavy_mode = False
+    # Seeded before the sidebar builds its checkbox, so a reload keeps the mode the operator chose.
+    try:
+        st.session_state.heavy_mode = setting_get(str(st.session_state.project_scope), HEAVY_MODE_SETTING, "") == "1"
+    except Exception:
+        st.session_state.heavy_mode = False
 if "output_token_budget" not in st.session_state:
     st.session_state.output_token_budget = 4096  # the slider reads this; a button may raise it before the slider is built
 pending_limit = st.session_state.pop("raise_limit_pending", None)
@@ -3610,6 +3625,7 @@ with st.sidebar:
     st.checkbox(
         "Heavy Mode",
         key="heavy_mode",
+        on_change=_persist_heavy_mode,
         help="Uses a bounded draft → review → synthesis workflow. Private reasoning is not displayed; token usage and latency are higher. "
         f"With the canvas set to Run the page, a page that throws is sent back for up to {FIX_ROUNDS} automatic fix rounds.",
     )

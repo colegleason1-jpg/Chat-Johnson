@@ -480,6 +480,14 @@ and Normal mode never uses it. Close the tab and it is gone.
   synthesis was refused. The critique is now a deterministic structural review (fence, document, tags, script
   balance, external resources) with no provider call, and the whole window goes to writing the page. Plain answers
   keep the model critique.
+- **A page check that is actually a check (batch W)**: the old gate only asked whether the answer finished, so it
+  passed a button wired to a function nobody wrote, a script reaching for an element that is not in the markup, a
+  stylesheet loaded from a CDN the canvas blocks, a blank body, and a page holding three of the hundred items asked
+  for. Measured against eight broken pages, the old check caught two and the new linter catches all eight, with no
+  false positives on a clean page. Its findings appear on the canvas status line before the page is ever run.
+- **Repair no longer waits for Heavy Mode (batch W)**: a page that throws gets one automatic repair round in either
+  mode, because a broken page is the common case and Heavy Mode is off by default. Heavy Mode buys the second round.
+  Heavy Mode itself is now remembered per project, so a reload stops silently switching it off.
 
 ## Development
 

@@ -105,11 +105,14 @@ def test_fix_decision_matrix_and_which_refusals_are_transient():
     assert sp.fix_decision(fresh, None, True, False) == (False, "no report", True)
     assert sp.fix_decision({"handled_seq": 2}, error, True, False) == (False, "already handled", True)
     assert sp.fix_decision(fresh, sp.normalize_report({"seq": 2, "status": "ready"}), True, False) == (False, "ran clean", True)
-    assert sp.fix_decision({"rounds": 2}, error, True, False) == (False, f"repair stopped: 2 automatic rounds used; {sp.NEXT_STEP}", True)
+    assert sp.fix_decision({"rounds": 2}, error, True, False) == (False, f"repair stopped: 2 automatic round(s) used; {sp.NEXT_STEP}", True)
     same = {"rounds": 1, "last_signature": sp.error_signature(error)}
     assert sp.fix_decision(same, error, True, False) == (False, f"{sp.SAME_ERROR_REASON}; {sp.NEXT_STEP}", True)
     # Transient refusals leave the report open so the next rerun decides again.
-    assert sp.fix_decision(fresh, error, False, False) == (False, "Heavy Mode is off, so nothing is fixed automatically", False)
+    # Without Heavy Mode a page still earns one automatic round; the second is what Heavy Mode buys.
+    assert sp.fix_decision(fresh, error, False, False) == (True, "automatic fix round 1 of 1", True)
+    assert sp.fix_decision({"rounds": 1}, error, False, False)[:2] == (
+        False, f"repair stopped: 1 automatic round(s) used; turn on Heavy Mode for another round; {sp.NEXT_STEP}")
     assert sp.fix_decision(fresh, error, True, False, keyed=False) == (False, "no provider key is configured, so nothing is fixed automatically", False)
     assert sp.fix_decision(fresh, error, True, True) == (False, "a generation is already running; the fix waits for it", False)
     assert sp.fix_decision({"rounds": 1, "last_signature": "other"}, error, True, False) == (True, "automatic fix round 2 of 2", True)

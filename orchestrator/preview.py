@@ -243,7 +243,103 @@ def external_resources(source: str) -> List[str]:
     return sorted({match.group(0)[:80] for match in EXTERNAL_RESOURCE_RE.finditer(source or "")})
 
 
-def page_review(source: str, closed: bool = True, finish: str = "") -> str:
+# Browser and language globals a handler may call without the page defining them.
+_BROWSER_GLOBALS = frozenset("""
+alert confirm prompt print open close focus blur scroll scrollTo scrollBy setTimeout setInterval clearTimeout
+clearInterval requestAnimationFrame fetch console history location navigator document window parent top self
+eval parseInt parseFloat isNaN Number String Boolean Array Object JSON Math Date RegExp Promise Map Set
+encodeURIComponent decodeURIComponent encodeURI decodeURI structuredClone queueMicrotask reportValidity submit reset
+""".split())
+_HANDLER_RE = re.compile(r"""\son[a-z]+\s*=\s*["']\s*(?:javascript:)?\s*([A-Za-z_$][\w$]*)\s*\(""", re.I)
+_LISTENER_RE = re.compile(r"""addEventListener\s*\(\s*["'][^"']+["']\s*,\s*([A-Za-z_$][\w$]*)\s*[,)]""")
+_GET_BY_ID_RE = re.compile(r"""getElementById\s*\(\s*["']([^"']+)["']""")
+_QUERY_ID_RE = re.compile(r"""querySelector(?:All)?\s*\(\s*["']#([A-Za-z_][\w-]*)""")
+_ID_ATTR_RE = re.compile(r"""\bid\s*=\s*["']([^"']+)["']""", re.I)
+_SCRIPT_RE = re.compile(r"<script\b[^>]*>(.*?)</script\s*>", re.I | re.S)
+_BODY_RE = re.compile(r"<body\b[^>]*>(.*?)</body\s*>", re.I | re.S)
+_TAG_RE = re.compile(r"<[^>]+>")
+_OBJECT_RE = re.compile(r"\{[^{}]*\}")
+_WANTED_RE = re.compile(
+    r"\b(\d{1,4})\s+(?:different\s+|unique\s+|separate\s+)?"
+    r"(questions?|items?|cards?|flashcards?|rows?|entries?|terms?|words?|problems?|facts?|slides?|steps?)\b",
+    re.I,
+)
+_VISUAL_RE = re.compile(r"<(?:canvas|svg|img|video|iframe|input|select|textarea)\b", re.I)
+
+
+def _scripts(source: str) -> str:
+    return "\n".join(match.group(1) for match in _SCRIPT_RE.finditer(source or ""))
+
+
+def _defines(script: str, name: str) -> bool:
+    """Whether the page's own script defines this name in any of the ways JavaScript allows."""
+    escaped = re.escape(name)
+    return bool(re.search(
+        rf"(?:function\s+{escaped}\b|class\s+{escaped}\b|(?:const|let|var)\s+{escaped}\b"
+        rf"|{escaped}\s*=(?!=)|{escaped}\s*:\s*(?:function|\(|async))",
+        script,
+    ))
+
+
+def page_problems(source: str, closed: bool = True, finish: str = "", request: str = "") -> List[str]:
+    """Everything provably wrong with a page, without running it.
+
+    ``page_completeness`` only answers "did the answer finish". That passes a page whose buttons call functions
+    that were never written, whose script reaches for elements that are not in the markup, that loads its styling
+    from a CDN the canvas blocks, that renders nothing at all, or that holds three of the hundred items asked for.
+    Each of those is a page the operator would call broken, so each is checked here. Every check is deterministic
+    and text-based: no browser, no provider call, no false confidence.
+    """
+    body = source or ""
+    if not body.strip():
+        return ["the answer carried no page"]
+    problems = page_completeness(body, closed, finish)
+    script = _scripts(body)
+
+    outside = external_resources(body)
+    if outside:
+        problems.append(
+            f"loads {len(outside)} resource(s) from the internet, which the canvas always blocks, so they arrive dead: "
+            + "; ".join(outside[:4])
+        )
+
+    called = {name for name in _HANDLER_RE.findall(body)} | {name for name in _LISTENER_RE.findall(script)}
+    missing = sorted(n for n in called if n not in _BROWSER_GLOBALS and not _defines(script, n))
+    if missing:
+        problems.append(
+            f"{len(missing)} handler(s) call a function the page never defines, so those controls do nothing: "
+            + ", ".join(f"{name}()" for name in missing[:5])
+        )
+
+    # Pages that build their own nodes are exempt: the ids may be created at runtime.
+    if "createelement" not in body.lower():
+        present = {value.strip() for value in _ID_ATTR_RE.findall(body)}
+        wanted = {value for value in _GET_BY_ID_RE.findall(script)} | {value for value in _QUERY_ID_RE.findall(script)}
+        absent = sorted(value for value in wanted if value not in present)
+        if absent:
+            problems.append(
+                f"{len(absent)} element(s) the script reaches for are not in the markup: "
+                + ", ".join(f"#{value}" for value in absent[:5])
+            )
+
+    shown = _BODY_RE.search(body)
+    if shown:
+        text = _TAG_RE.sub(" ", _SCRIPT_RE.sub(" ", shown.group(1)))
+        if len(" ".join(text.split())) < 40 and not _VISUAL_RE.search(shown.group(1)):
+            problems.append("the body renders no visible content")
+
+    asked = _WANTED_RE.search(request or "")
+    if asked:
+        wanted_count = int(asked.group(1))
+        found = max(len(_OBJECT_RE.findall(script)), len(re.findall(r"<li\b", body, re.I)), len(re.findall(r"<option\b", body, re.I)))
+        if wanted_count >= 5 and found < wanted_count * 0.6:
+            problems.append(
+                f"the request asked for {wanted_count} {asked.group(2)} and the page appears to contain about {found}"
+            )
+    return problems
+
+
+def page_review(source: str, closed: bool = True, finish: str = "", request: str = "") -> str:
     """A deterministic review of a generated page, used in place of the model critique on a page request.
 
     A model critique costs a provider request, and on a page build every Heavy pass lands on the same endpoint, so
@@ -255,13 +351,7 @@ def page_review(source: str, closed: bool = True, finish: str = "") -> str:
             "PAGE REVIEW (automatic, no provider call): the answer carried no complete ```html page. "
             "Return the whole page as one complete ```html fence, inline CSS and JavaScript only."
         )
-    problems = list(page_completeness(source, closed, finish))
-    outside = external_resources(source)
-    if outside:
-        problems.append(
-            f"loads {len(outside)} resource(s) from the internet, which the canvas always blocks, so they arrive dead: "
-            + "; ".join(outside[:4])
-        )
+    problems = page_problems(source, closed, finish, request)
     lines = [f"PAGE REVIEW (automatic, no provider call) of {len(source)} characters:"]
     if problems:
         lines.append("Problems that must be fixed in the final answer:")
