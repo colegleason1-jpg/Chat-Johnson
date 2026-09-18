@@ -812,20 +812,26 @@ def repository_context_chars(max_tokens: int) -> int:
     return max(REPOSITORY_CONTEXT_MIN_CHARS, min(REPOSITORY_CONTEXT_MAX_CHARS, widest))
 
 
-def cortex_wait_seconds(ledger: Optional[QuotaLedger], messages: Sequence[Mapping[str, str]], max_tokens: int) -> float:
+def cortex_wait_seconds(
+    ledger: Optional[QuotaLedger], messages: Sequence[Mapping[str, str]], max_tokens: int, output_need: int = 0
+) -> float:
     """Seconds until some keyed Cortex endpoint has RPM/TPM headroom for this request; 0 when one has it now.
 
-    An endpoint that can never take the request (its whole per-minute ceiling is smaller than the
-    request, or its daily cap is reached) is left out: its "no wait" used to hide the real wait of
-    the endpoint that could take it, so the chat sent at once and failed instead of pausing.
+    An endpoint that can never take the request is left out: its "no wait" used to hide the real wait of the
+    endpoint that could take it, so the chat sent at once and failed instead of pausing. That covers a per-minute
+    ceiling smaller than the request, a spent daily cap, and -- with ``output_need`` -- an answer larger than the
+    endpoint can write at all. Without the last one a page request read "no wait" from an endpoint physically
+    unable to write the page, which turned a one-minute pause into a hard failure and left the repair rounds
+    making no calls at all.
     """
     if ledger is None:
         return 0.0
     _ensure_cortex_ledger(ledger)
     estimated = _estimate_tokens(messages) + int(max_tokens)
+    too_small = cannot_write(int(output_need))
     waits = []
     for endpoint in CORTEX_ENDPOINTS.values():
-        if not _endpoint_key(endpoint):
+        if not _endpoint_key(endpoint) or endpoint.name in too_small:
             continue
         usage = _endpoint_usage(endpoint, ledger, None)
         ceiling = usage.tpm_ceiling(endpoint)
@@ -843,16 +849,19 @@ HEADROOM_MARKERS = ("headroom", "requests used in the last minute", "would excee
 CHAT_MAX_WAIT_SECONDS = 65.0  # one free-tier window; longer waits surface as the plain error instead
 
 
-def headroom_wait_seconds(exc: BaseException, ledger: Optional[QuotaLedger], messages: Sequence[Mapping[str, str]], max_tokens: int, max_wait: float = CHAT_MAX_WAIT_SECONDS) -> float:
+def headroom_wait_seconds(
+    exc: BaseException, ledger: Optional[QuotaLedger], messages: Sequence[Mapping[str, str]], max_tokens: int,
+    max_wait: float = CHAT_MAX_WAIT_SECONDS, output_need: int = 0,
+) -> float:
     """Seconds to pause before retrying a failure that was only a full free-tier window; 0 for any other failure or a wait past ``max_wait``."""
     text = str(exc).lower()
     if not any(marker in text for marker in HEADROOM_MARKERS):
         return 0.0
-    wait = cortex_wait_seconds(ledger, messages, max_tokens)
+    wait = cortex_wait_seconds(ledger, messages, max_tokens, output_need=output_need)
     return float(wait) if 0.0 < wait <= max_wait else 0.0
 
 
-def _pacer(ledger: Optional[QuotaLedger]) -> Optional[Callable[[List[dict], int], None]]:
+def _pacer(ledger: Optional[QuotaLedger], interface: bool = False) -> Optional[Callable[[List[dict], int], None]]:
     """Before each Heavy pass: wait for a free-tier window (up to one) instead of failing the pass.
 
     Gemini allows a handful of requests per minute, so the second and third passes of one Heavy
@@ -862,7 +871,8 @@ def _pacer(ledger: Optional[QuotaLedger]) -> Optional[Callable[[List[dict], int]
         return None
 
     def pace(selected_messages: List[dict], tokens: int) -> None:
-        wait = cortex_wait_seconds(ledger, selected_messages, tokens)
+        # On a page request only an endpoint that can write the whole page counts as available.
+        wait = cortex_wait_seconds(ledger, selected_messages, tokens, output_need=tokens if interface else 0)
         if 0.0 < wait <= CHAT_MAX_WAIT_SECONDS:
             time.sleep(wait + 0.5)
 
@@ -2257,21 +2267,33 @@ def _heavy_pipeline(
         {"role": "system", "content": critique_system},
         {"role": "user", "content": json.dumps({"request": request, "context": _history_excerpt(messages), "candidate": draft})},
     ]
-    try:
-        if paid_slot is not None and paid_slot.armed:
-            critique, critique_decision = paid_slot_generate(paid_slot, critique_messages, max(256, max_tokens // 3))
-        else:
-            critique, critique_decision = run_pass(one_pass, 1, "reasoning", critique_messages, max(256, max_tokens // 3))
-    except ProviderError:
-        return draft, RouteDecision(
-            draft_decision.provider,
-            draft_decision.model,
-            task_type,
-            f"heavy draft only; critique unavailable; {draft_decision.reason}",
-            draft_decision.solver,
-            draft_decision.decision_vector,
-            finish=draft_decision.finish,
+    if interface and not (paid_slot is not None and paid_slot.armed):
+        # A page build routes every pass to the same endpoint, so a model critique spends the per-minute window the
+        # synthesis needs and its verdict is discarded when the synthesis is then refused. The structural review is
+        # deterministic, free, and never wrong, so the whole window goes to writing the page.
+        from .preview import extract_preview_fence, page_review  # local import: preview imports nothing from here
+
+        markup, closed = extract_preview_fence(draft)
+        critique = page_review(markup, closed, draft_decision.finish)
+        critique_decision = RouteDecision(
+            "local-check", "page-review", "reasoning", "deterministic page review; no provider call spent on the critique",
         )
+    else:
+        try:
+            if paid_slot is not None and paid_slot.armed:
+                critique, critique_decision = paid_slot_generate(paid_slot, critique_messages, max(256, max_tokens // 3))
+            else:
+                critique, critique_decision = run_pass(one_pass, 1, "reasoning", critique_messages, max(256, max_tokens // 3))
+        except ProviderError:
+            return draft, RouteDecision(
+                draft_decision.provider,
+                draft_decision.model,
+                task_type,
+                f"heavy draft only; critique unavailable; {draft_decision.reason}",
+                draft_decision.solver,
+                draft_decision.decision_vector,
+                finish=draft_decision.finish,
+            )
 
     synthesis_messages = _synthesis_messages(messages, request, draft, critique, interface=interface)
     try:
@@ -2342,7 +2364,7 @@ def heavy_stream(
 
     return _heavy_pipeline(
         one_pass, task_type, messages, max_tokens, paid_slot=paid_slot, final_pass=final_pass,
-        temperatures=_heavy_schedule(temperature), pace=_pacer(ledger), interface=interface,
+        temperatures=_heavy_schedule(temperature), pace=_pacer(ledger, interface), interface=interface,
     )
 
 
@@ -2439,7 +2461,7 @@ def generate_cortex_heavy(
         max_tokens,
         paid_slot=paid_slot,
         temperatures=_heavy_schedule(temperature),
-        pace=_pacer(ledger),
+        pace=_pacer(ledger, interface),
         interface=interface,
     )
 

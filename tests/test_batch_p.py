@@ -84,7 +84,7 @@ def test_heavy_stream_waits_for_a_window_between_passes(monkeypatch, keyed):
     monkeypatch.setattr(router, "cortex_available", lambda: True)
     monkeypatch.setattr(router, "cortex_generate", lambda task_type, messages, ledger=None, max_tokens=4096, temperature=0.2, system_prompt="": (f"{task_type}-text", RouteDecision("free", "m", task_type, "r")))
     monkeypatch.setattr(router, "CortexStream", FakeStream)
-    monkeypatch.setattr(router, "cortex_wait_seconds", lambda ledger, messages, max_tokens: next(waits))
+    monkeypatch.setattr(router, "cortex_wait_seconds", lambda ledger, messages, max_tokens, output_need=0: next(waits))
     monkeypatch.setattr(router.time, "sleep", lambda seconds: slept.append(seconds))
     stream, decision = router.heavy_stream("chat", [{"role": "user", "content": "q"}], quota_registry.get_quota_ledger(), max_tokens=900)
     assert "".join(stream) == "final answer" and slept == [12.5]  # only the critique pass had to wait

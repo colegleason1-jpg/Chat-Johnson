@@ -105,7 +105,7 @@ def test_heavy_pipeline_gives_a_page_the_whole_budget_and_keeps_the_cut_on_fallb
     router._heavy_pipeline(one_pass, "chat", [{"role": "user", "content": "explain tides"}], 4_096)
     assert budgets[0] == ("chat", 2_048)  # a plain answer keeps the half-budget draft
 
-    critiques = []
+    critiques, syntheses = [], []
 
     def with_critique(task_type, messages, tokens):
         if task_type == "reasoning":
@@ -113,11 +113,20 @@ def test_heavy_pipeline_gives_a_page_the_whole_budget_and_keeps_the_cut_on_fallb
             return "- incomplete", RouteDecision("fake", "m", task_type, "c")
         if "[CANDIDATE ANSWER]" not in messages[-1]["content"]:
             return F + "html\n<p>cut", RouteDecision("fake", "m", task_type, "draft", finish="length")
-        assert "COMPLETE page" in messages[0]["content"] and "never shorter" in messages[0]["content"]
+        syntheses.append("\n".join(str(m.get("content", "")) for m in messages))
         return "final", RouteDecision("fake", "m", task_type, "final")
 
+    # A page request spends no provider call on the critique: the review is deterministic, and it still tells the
+    # synthesis the draft was cut rather than designed short.
     text, _ = router._heavy_pipeline(with_critique, "chat", [{"role": "user", "content": "make a page"}], 4_096, interface=True)
+    assert text == "final" and critiques == []
+    assert "COMPLETE page" in syntheses[0] and "never shorter" in syntheses[0]
+    assert "PAGE REVIEW" in syntheses[0] and "cut at the length limit" in syntheses[0]
+    # A plain answer still gets the model critique, and it is still told a cut is a cut.
+    syntheses.clear()
+    text, _ = router._heavy_pipeline(with_critique, "chat", [{"role": "user", "content": "explain tides"}], 4_096)
     assert text == "final" and "not where a design ended" in critiques[0]
+    assert "COMPLETE page" not in syntheses[0]
 
 
 # --- vault: the cut note, memory order, decisions from the operator only, recall words, health ---------------------

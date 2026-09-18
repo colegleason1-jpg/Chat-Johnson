@@ -466,6 +466,20 @@ and Normal mode never uses it. Close the tab and it is gone.
   New chat, Clear chat, Delete, More) now render directly above the chat bar, and the preview canvas opens itself only
   for a page produced in this session, never for one restored on load: a *Show the page on the preview canvas* button
   opens it. Together that takes about a thousand pixels off the page and keeps every control in view.
+- **The chat remembers it is building a page (batch V)**: page mode belongs to the chat, not to the wording of one
+  message. Once a page lands on the canvas, every follow-up in that chat carries the page, the canvas rules and the
+  raised budget, however it is phrased. The old rule needed two separate patterns to match every message, so edits
+  like "make the header blue" or "add a timer" were not recognised as page work and the page was never attached:
+  measured at 0 times out of 13 realistic edit turns. Clearing the canvas or starting a new chat ends page mode.
+- **The pause is honest about what the answer needs (batch V)**: the wait calculation now applies each endpoint's
+  output ceiling, so an endpoint that cannot physically write the answer stops reporting "no wait" and hiding the
+  real wait of the one that can. That turned a one-minute pause into a hard failure and left the automatic repair
+  rounds making no provider calls at all.
+- **A page review that costs nothing (batch V)**: on a page request every Heavy pass routes to the same endpoint, so
+  a model critique spent the per-minute window the synthesis needed and its verdict was then discarded when the
+  synthesis was refused. The critique is now a deterministic structural review (fence, document, tags, script
+  balance, external resources) with no provider call, and the whole window goes to writing the page. Plain answers
+  keep the model critique.
 
 ## Development
 

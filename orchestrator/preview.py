@@ -232,6 +232,52 @@ def _script_balance(script: str) -> bool:
     return not stack and not quote
 
 
+EXTERNAL_RESOURCE_RE = re.compile(
+    r"""<(?:script|link|img|iframe|video|audio|source)\b[^>]*?(?:src|href)\s*=\s*["']?(?:https?:)?//[^"'\s>]+|@import\s+(?:url\()?["']?https?://""",
+    re.I,
+)
+
+
+def external_resources(source: str) -> List[str]:
+    """Every place the page reaches out to the internet; the canvas blocks all of them, so each one is a dead style or script."""
+    return sorted({match.group(0)[:80] for match in EXTERNAL_RESOURCE_RE.finditer(source or "")})
+
+
+def page_review(source: str, closed: bool = True, finish: str = "") -> str:
+    """A deterministic review of a generated page, used in place of the model critique on a page request.
+
+    A model critique costs a provider request, and on a page build every Heavy pass lands on the same endpoint, so
+    the critique spends the per-minute window the synthesis needs and its verdict is then thrown away when the
+    synthesis is refused for lack of headroom. These checks cost nothing and cannot be wrong about structure.
+    """
+    if not (source or "").strip():
+        return (
+            "PAGE REVIEW (automatic, no provider call): the answer carried no complete ```html page. "
+            "Return the whole page as one complete ```html fence, inline CSS and JavaScript only."
+        )
+    problems = list(page_completeness(source, closed, finish))
+    outside = external_resources(source)
+    if outside:
+        problems.append(
+            f"loads {len(outside)} resource(s) from the internet, which the canvas always blocks, so they arrive dead: "
+            + "; ".join(outside[:4])
+        )
+    lines = [f"PAGE REVIEW (automatic, no provider call) of {len(source)} characters:"]
+    if problems:
+        lines.append("Problems that must be fixed in the final answer:")
+        lines.extend(f"- {problem}" for problem in problems)
+        lines.append(
+            "Return the corrected page in full as one complete ```html fence. Keep everything that already works; "
+            "do not shorten the page or drop features to make it fit."
+        )
+    else:
+        lines.append(
+            "The page is structurally complete and self-contained. Keep it that way: return it in full, "
+            "improve only what the request asked for, and do not shorten it."
+        )
+    return "\n".join(lines)
+
+
 def page_completeness(source: str, closed: bool = True, finish: str = "") -> List[str]:
     """Why a page is not whole: '' entries never appear; an empty list means complete.
 

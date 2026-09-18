@@ -264,6 +264,9 @@
 - Company and academy cycles say "Waiting N s: the operator just sent a chat message": the quiet period
   (five minutes after a chat send, ten after a page request) keeps the free-tier window for the chat; the
   cycle re-queues itself for the end of it.
+- A follow-up edit is ignored or comes back smaller: check the canvas status line for "this chat is editing this
+  page". While it shows, every message in that chat carries the page and the raised budget. If it is missing, the
+  page is not on the canvas; put one there or send the request again after it renders. *Clear preview* ends page mode.
 - Buttons look dead on a tablet: check they are on screen. The page is pinned to the bottom by the chat bar, so a tall
   page pushes controls above the top edge; the chat controls sit above the chat bar for that reason and the canvas stays
   closed until you press *Show the page on the preview canvas*. If a control is visible and a tap still does nothing, the

@@ -6,7 +6,6 @@ state arrives in the payload (mode, budget, paid-slot model) or in the job's sec
 """
 from __future__ import annotations
 
-import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,7 +14,7 @@ from .errors import plain_error
 from .jobs import JobCancelled, JobContext, register_handler
 from .connectors_nodes import run_connector
 from .missions import PREVIEW_REPAIR_ROUNDS, assemble_deliverable, deliverable_slug, normalise_plan, parse_length_target, task_plan, text_measure
-from .preview import extract_preview_fence, page_completeness
+from .preview import EXTERNAL_RESOURCE_RE, extract_preview_fence, page_completeness
 from .prompting import build_prompt_messages
 from .router import PAGE_OUTPUT_TOKENS, PaidReasoningSlot, ProviderError, RouteDecision, cortex_wait_seconds, generate_mode, headroom_wait_seconds, strip_reasoning_tags
 from .sandbox_preview import strip_hazards
@@ -43,9 +42,6 @@ def _record(scope: str, task_type: str, route: str, mode: str, started: float, r
         pass
 
 
-_EXTERNAL_RE = re.compile(r"""<(?:script|link|img|iframe|video|audio|source)\b[^>]*?(?:src|href)\s*=\s*["']?(https?:)?//[^"'\s>]+|@import\s+(?:url\()?["']?https?://""", re.I)
-
-
 def newest_page(outputs: List[Tuple[str, str]], state: Dict[str, Any]) -> str:
     """The page the mission is working on: the last whole page an earlier step produced, else the one it was launched with."""
     for _, text in reversed(outputs):
@@ -59,7 +55,7 @@ def page_check(source: str) -> Tuple[List[str], str]:
     """The static verdict on a page (no browser here): completeness reasons, plus a plain report the operator can read."""
     reasons = list(page_completeness(source))
     _, hazards = strip_hazards(source)
-    external = sorted({match.group(0)[:80] for match in _EXTERNAL_RE.finditer(source)})
+    external = sorted({match.group(0)[:80] for match in EXTERNAL_RESOURCE_RE.finditer(source)})
     lines = [f"Page check (static, no browser): {len(source):,} characters, {source.lower().count('<script')} script block(s)."]
     lines.append("Structure: " + ("complete." if not reasons else "INCOMPLETE: " + "; ".join(reasons) + "."))
     if external:

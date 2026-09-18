@@ -200,6 +200,7 @@ SANDBOX_FIX_SETTING = "sandbox_fix"  # one vault setting per scope: {page_hash: 
 FIX_WORKSPACES = ("normal_chat", "chat_bot")  # the workspaces whose renderers dispatch a queued automatic fix
 CANVAS_WORKSPACES = ("normal_chat", "chat_bot")  # the chats whose pages own the canvas; other workspaces never overwrite it
 PREVIEW_STATE_SETTING = "preview_state"
+PAGE_MODE_SETTING = "page_mode"  # {workspace: thread id} — the chat that is building the page on the canvas
 PREVIEW_STATE_MAX_CHARS = 200_000
 _PAGE_REFERENCE_RE = re.compile(
     r"\b(?:fix|broken|works?|working|still|change|update|add|remove|edit|make it|this page|the page|the preview|this preview|buttons?|canvas)\b",
@@ -222,6 +223,43 @@ SMALLER_PAGE_PROMPT = (
 def refers_to_canvas(prompt: str) -> bool:
     """Whether a request is about the page already on the canvas rather than a fresh one."""
     return bool(_PAGE_REFERENCE_RE.search(prompt or ""))
+
+
+def _page_mode_table(scope: str) -> Dict[str, int]:
+    try:
+        stored = json.loads(setting_get(scope, PAGE_MODE_SETTING, "") or "{}")
+    except ValueError:
+        return {}
+    return {str(k): int(v) for k, v in stored.items() if str(v).lstrip("-").isdigit()} if isinstance(stored, dict) else {}
+
+
+def set_page_mode(scope: str, workspace: str) -> None:
+    """Remember that this chat is building a page, so its follow-ups are treated as page work however they are worded."""
+    if workspace not in CANVAS_WORKSPACES:
+        return
+    table = _page_mode_table(scope)
+    table[workspace] = int(active_thread(scope, workspace)["id"])
+    setting_set(scope, PAGE_MODE_SETTING, json.dumps(table))
+
+
+def clear_page_mode(scope: str) -> None:
+    setting_set(scope, PAGE_MODE_SETTING, "{}")
+
+
+def building_a_page(scope: str, workspace: str) -> bool:
+    """Whether this chat is in page mode: a page it produced is on the canvas and the operator has not cleared it.
+
+    Page mode is sticky per chat on purpose. The old rule asked two regexes to match the wording of every message,
+    so an edit like "make the header blue" or "add a timer" was not recognised as page work: the page was never
+    attached, the canvas rules were dropped and the budget was not raised, which is what made every follow-up
+    return a smaller, blanker page. Clearing the canvas or starting a new chat ends it.
+    """
+    if workspace not in CANVAS_WORKSPACES or not str(st.session_state.get("preview_source") or "").strip():
+        return False
+    try:
+        return _page_mode_table(scope).get(workspace) == int(active_thread(scope, workspace)["id"])
+    except Exception:  # a missing thread or an unreadable setting is simply "not in page mode"
+        return False
 
 
 def persist_preview_state(scope: str) -> None:
@@ -277,6 +315,8 @@ def commit_canvas_page(scope: str, workspace: str, source: str, message_id: Opti
         "complete": not reasons, "reasons": reasons, "workspace": workspace,
     }
     st.session_state["canvas_open"] = True  # a page produced in this session opens the canvas; a restored one does not
+    if workspace in CANVAS_WORKSPACES:
+        set_page_mode(scope, workspace)  # every follow-up in this chat is page work until the canvas is cleared
     if not reasons and "<script" in source.lower() and st.session_state.get("preview_mode") != PREVIEW_MODE_RUN:
         # A page with scripts is only judged by running it; Preview only would show its buttons as dead. Applied by the
         # canvas before its radio is built (this run's widget may already exist).
@@ -313,6 +353,8 @@ def canvas_status_line(source: str, run_mode: bool) -> str:
         parts.append("no page yet")
     last = st.session_state.get("sandbox_last_report")
     parts.append(f"last run: {last}" if last else "not run yet")
+    if building_a_page(str(st.session_state.project_scope), str(st.session_state.get("workspace_last") or "")):
+        parts.append("this chat is editing this page (Clear preview ends that)")
     return " · ".join(parts)
 
 
@@ -709,6 +751,7 @@ def _clear_preview() -> None:
     st.session_state.preview_source = ""
     st.session_state.preview_cleared = True
     st.session_state.pop("canvas_page", None)
+    clear_page_mode(str(st.session_state.project_scope))  # the chat is no longer building a page
     persist_preview_state(str(st.session_state.project_scope))
 
 
@@ -1686,14 +1729,17 @@ def _run_generation(
     user_message_id = append_message(project_scope, "user", clean_prompt, mode=mode, workspace=workspace, task_type=task_type)
     pinkwave.activate(project_scope)  # this send walks the scope's wave: routing jitter, Heavy schedule, recall share
     learner.set_workspace(workspace or "")  # momentum follows this workspace's last endpoint, not another's
-    interface = fix_round > 0 or is_interface_request(clean_prompt)
+    # Page mode is a property of the chat, not of the wording of one message: once a page is on the canvas every
+    # follow-up here edits that page, however it is phrased.
+    page_mode = fix_round == 0 and building_a_page(project_scope, workspace or "")
+    interface = fix_round > 0 or page_mode or is_interface_request(clean_prompt)
     try:
         quiet.note_chat_send(project_scope, page=interface)  # background cycles step aside for a while
     except Exception:  # a stamp must never break a send
         pass
     sidebar_budget = int(st.session_state.get("max_tokens", 4096))
     current_page = ""
-    if interface and fix_round == 0 and workspace in CANVAS_WORKSPACES and refers_to_canvas(clean_prompt):
+    if interface and fix_round == 0 and workspace in CANVAS_WORKSPACES and (page_mode or refers_to_canvas(clean_prompt)):
         current_page = str(st.session_state.get("preview_source") or "")  # the page the request is about, sent whole
     # A large page is edited, never rewritten: SEARCH/REPLACE blocks come back and are applied here.
     patch_mode = bool(current_page) and pagepatch.wants_patch_mode(clean_prompt, current_page)
@@ -1717,7 +1763,7 @@ def _run_generation(
     request_lock = get_task_request_lock()
     lock_held = False  # released only by the thread that acquired it: a mission may hold the same lock
     try:
-        wait = cortex_wait_seconds(ledger, messages, max_tokens)
+        wait = cortex_wait_seconds(ledger, messages, max_tokens, output_need=max_tokens if interface else 0)
         if 0 < wait <= CHAT_MAX_WAIT_SECONDS:
             # Paced like missions and the pipeline: a full free-tier window is a short wait, not an error.
             with live_box.container():
@@ -1784,7 +1830,7 @@ def _run_generation(
             answer, decision = attempt_generation()
         except ProviderError as exc:
             # A route refused only for a full free-tier window is a pause, not an error: wait once and send again.
-            retry_wait = headroom_wait_seconds(exc, ledger, messages, max_tokens, CHAT_MAX_WAIT_SECONDS)
+            retry_wait = headroom_wait_seconds(exc, ledger, messages, max_tokens, CHAT_MAX_WAIT_SECONDS, output_need=max_tokens if interface else 0)
             if not retry_wait:
                 raise
             live_box.empty()
